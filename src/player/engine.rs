@@ -5,15 +5,13 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 
 pub struct PlayerEngine {
-    pub sink: Sink,
-    _stream: OutputStream,
-    pub stream_handle: OutputStreamHandle,
+    pub sink: Option<Sink>,
+    pub stream_handle: Option<OutputStreamHandle>,
     pub storage: StorageManager,
     pub current_track: Option<Track>,
     pub state: PlayerStateLabel,
@@ -22,13 +20,15 @@ pub struct PlayerEngine {
 }
 
 impl PlayerEngine {
-    pub fn new(storage: StorageManager) -> Self {
-        let (stream, stream_handle) = OutputStream::try_default().expect("Failed to open output stream");
-        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
+    pub fn new(storage: StorageManager, _stream: Option<OutputStream>, stream_handle: Option<OutputStreamHandle>) -> Self {
+        let sink = if let Some(handle) = &stream_handle {
+            Sink::try_new(handle).ok()
+        } else {
+            None
+        };
         
         Self {
             sink,
-            _stream: stream,
             stream_handle,
             storage,
             current_track: None,
@@ -64,37 +64,49 @@ impl PlayerEngine {
 
     pub async fn load_and_play(&mut self, slot: &str) {
         let path = self.storage.get_active_slot_path(slot);
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            if let Ok(source) = Decoder::new(reader) {
-                self.sink.append(source);
-                self.sink.set_speed(self.speed);
-                self.sink.set_volume(self.volume);
-                self.sink.play();
-                self.state = PlayerStateLabel::Playing;
+        if let Some(sink) = &self.sink {
+            if let Ok(file) = File::open(path) {
+                let reader = BufReader::new(file);
+                if let Ok(source) = Decoder::new(reader) {
+                    sink.append(source);
+                    sink.set_speed(self.speed);
+                    sink.set_volume(self.volume);
+                    sink.play();
+                    self.state = PlayerStateLabel::Playing;
+                }
             }
         }
     }
 
     pub fn pause(&mut self) {
-        self.sink.pause();
-        self.state = PlayerStateLabel::Paused;
+        if let Some(sink) = &self.sink {
+            sink.pause();
+            self.state = PlayerStateLabel::Paused;
+        }
     }
 
     pub fn resume(&mut self) {
-        self.sink.play();
-        self.state = PlayerStateLabel::Playing;
+        if let Some(sink) = &self.sink {
+            sink.play();
+            self.state = PlayerStateLabel::Playing;
+        }
     }
 
     pub fn stop(&mut self) {
-        self.sink.stop();
-        self.sink = Sink::try_new(&self.stream_handle).expect("Failed to recreate sink");
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+        if let Some(handle) = &self.stream_handle {
+            self.sink = Sink::try_new(handle).ok();
+        }
         self.state = PlayerStateLabel::Stopped;
     }
 
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed;
-        self.sink.set_speed(speed);
+        if let Some(sink) = &self.sink {
+            sink.set_speed(speed);
+        }
     }
 
     pub async fn trigger_next(&mut self) {
