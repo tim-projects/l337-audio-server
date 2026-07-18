@@ -15,6 +15,16 @@ pub struct SpeedPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct VolumePayload {
+    pub volume: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SeekPayload {
+    pub position: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PoolSettings {
     pub max_disk_pool_bytes: u64,
 }
@@ -36,6 +46,8 @@ pub struct PlayerStatus {
     pub disk_pool_utilization_bytes: u64,
     pub next_cached: bool,
     pub prev_cached: bool,
+    pub position_sec: Option<u64>,
+    pub duration_sec: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -12,11 +12,36 @@ pub struct StorageManager {
     pub manifest: Arc<Mutex<HashMap<String, CacheManifestEntry>>>,
 }
 
+/// Default cache directory.
+///
+/// Honors the `CACHE_DIRECTORY` / `STATE_DIRECTORY` environment variables set
+/// by systemd (so a hardened service writes to the provisioned, `l337`-owned
+/// location). Falls back to `~/.cache/...`, then `./cache`.
+fn default_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CACHE_DIRECTORY") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    if let Ok(dir) = std::env::var("STATE_DIRECTORY") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("cache");
+        }
+    }
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("./cache"))
+        .join("l337")
+        .join("l337-audio-server")
+        .join("cache")
+}
+
 impl StorageManager {
-    pub async fn new(max_pool_size: u64) -> Self {
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("./cache"))
-            .join("l337player/cache");
+    /// Create a `StorageManager`.
+    ///
+    /// `cache_dir` overrides the default `~/.cache/l337/l337-audio-server/cache/`.
+    /// `max_pool_size` is the eviction cap in bytes (default 256 MiB on the caller side).
+    pub async fn new(max_pool_size: u64, cache_dir: Option<PathBuf>) -> Self {
+        let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
 
         if !cache_dir.exists() {
             fs::create_dir_all(&cache_dir).await.expect("Failed to create cache directory");
@@ -77,9 +102,13 @@ impl StorageManager {
 
         let mut manifest = self.manifest.lock().await;
         let mut entries: Vec<CacheManifestEntry> = manifest.values().cloned().collect();
-        
-        // Sort by last_accessed (oldest first) or play_count
-        entries.sort_by(|a, b| a.last_accessed.cmp(&b.last_accessed));
+
+        // Evict least-played first, then oldest (least recently accessed).
+        entries.sort_by(|a, b| {
+            a.play_count
+                .cmp(&b.play_count)
+                .then(a.last_accessed.cmp(&b.last_accessed))
+        });
 
         for entry in entries {
             if current_size + incoming_size <= self.max_pool_size {

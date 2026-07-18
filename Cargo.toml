@@ -9,12 +9,19 @@ tokio = { version = "1.43.0", features = ["full"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 rodio = { version = "0.20.1", features = ["symphonia-mp3", "symphonia-isomp4", "symphonia-flac", "symphonia-vorbis"] }
+async-trait = "0.1.86"
+libloading = "0.8.6"
 walkdir = "2.5.0"
 dirs = "6.0.0"
 chrono = { version = "0.4.39", features = ["serde"] }
 config = "0.15.7"
-reqwest = { version = "0.12.12", features = ["stream"] }
+reqwest = { version = "0.12.12", features = ["stream", "rustls-tls"] }
 futures-util = "0.3.31"
+tower = "0.5"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+rand = "0.8"
