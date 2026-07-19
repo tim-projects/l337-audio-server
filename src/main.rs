@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use rodio::OutputStream;
+use rodio::DeviceSinkBuilder;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -80,21 +80,43 @@ async fn main() {
         .unwrap_or(DEFAULT_MAX_POOL);
 
     // Initialize storage and engine
+    // `--dummy` (testing only): skip real audio hardware entirely and run
+    // without a Sink. Never enabled by config — must be an explicit flag.
+    let dummy_mode = std::env::args().any(|a| a == "--dummy");
+
+    // Initialize storage and engine. A real audio server always uses the host
+    // audio hardware (e.g. PipeWire/ALSA). Dummy mode skips it on purpose.
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
-    let (stream, stream_handle) = match OutputStream::try_default() {
-        Ok(res) => (Some(res.0), Some(res.1)),
-        Err(e) => {
-            tracing::warn!("Audio output hardware failed ({}). Running in dummy output mode.", e);
-            (None, None)
+    let (device_sink, mixer) = if dummy_mode {
+        tracing::warn!("Running in DUMMY output mode (--dummy). No audio will be produced. Testing only.");
+        (None, None)
+    } else {
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(sink) => {
+                let mixer = sink.mixer().clone();
+                (Some(sink), Some(mixer))
+            }
+            Err(e) => {
+                eprintln!(
+                    "FATAL: No audio output device available ({}). A working audio output \
+                     (e.g. PipeWire/ALSA) is required to serve audio. Re-run with --dummy \
+                     to start without audio (testing only).",
+                    e
+                );
+                std::process::exit(1);
+            }
         }
     };
 
-    let engine = PlayerEngine::new(storage, stream, stream_handle);
-    if engine.sink.is_none() && engine.stream_handle.is_some() {
-        tracing::warn!("Audio device found but could not initialize Sink. Running in dummy output mode.");
-    } else if engine.sink.is_none() {
-        tracing::info!("Running in dummy output mode.");
-    } else {
+    let engine = PlayerEngine::new(storage, device_sink, mixer);
+    if !dummy_mode {
+        if engine.player.is_none() {
+            eprintln!(
+                "FATAL: Audio device found but could not initialize a Player. A working audio \
+                 output is required. Re-run with --dummy to start without audio (testing only)."
+            );
+            std::process::exit(1);
+        }
         tracing::info!("Audio output initialized successfully.");
     }
 

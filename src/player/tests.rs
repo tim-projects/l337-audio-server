@@ -4,7 +4,7 @@ mod tests {
     use crate::api::models::PlayerStateLabel;
     use crate::player::storage::StorageManager;
     use crate::player::engine::PlayerEngine;
-    use rodio::OutputStream;
+    use rodio::DeviceSinkBuilder;
     use std::path::PathBuf;
 
     #[tokio::test]
@@ -28,8 +28,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("l337_test_cache_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
-        let (stream, stream_handle) = OutputStream::try_default().ok().map(|(s, h)| (Some(s), Some(h))).unwrap_or((None, None));
-        let engine = PlayerEngine::new(storage, stream, stream_handle);
+        let (device_sink, mixer) = DeviceSinkBuilder::open_default_sink()
+            .map(|sink| {
+                let mixer = sink.mixer().clone();
+                (Some(sink), Some(mixer))
+            })
+            .unwrap_or((None, None));
+        let engine = PlayerEngine::new(storage, device_sink, mixer);
         assert_eq!(engine.state, PlayerStateLabel::Stopped);
         let _ = std::fs::remove_dir_all(&dir);
     }

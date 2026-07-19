@@ -6,15 +6,20 @@ mod tests {
     use crate::player::storage::StorageManager;
     use axum::extract::{Json, State};
     use axum::response::IntoResponse;
-    use rodio::OutputStream;
+    use rodio::DeviceSinkBuilder;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     async fn setup_state() -> AppState {
         let storage = StorageManager::new(500 * 1024 * 1024, Some(PathBuf::from("./test_cache"))).await;
-        let (stream, stream_handle) = OutputStream::try_default().ok().map(|(s, h)| (Some(s), Some(h))).unwrap_or((None, None));
-        let engine = PlayerEngine::new(storage, stream, stream_handle);
+        let (device_sink, mixer) = DeviceSinkBuilder::open_default_sink()
+            .map(|sink| {
+                let mixer = sink.mixer().clone();
+                (Some(sink), Some(mixer))
+            })
+            .unwrap_or((None, None));
+        let engine = PlayerEngine::new(storage, device_sink, mixer);
         Arc::new(SendableEngine(Mutex::new(engine)))
     }
 

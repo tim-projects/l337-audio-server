@@ -16,6 +16,8 @@
 # Usage:
 #   sudo ./scripts/install-systemd.sh            # system service as `l337` user
 #   ./scripts/install-systemd.sh --user          # user service for $USER
+#   sudo ./scripts/install-systemd.sh --update   # in-place binary upgrade (no
+#                                               #   config/state/cache touched)
 #
 # To build the binary first (requires cargo):
 #   ./scripts/build.sh
@@ -24,7 +26,7 @@ set -euo pipefail
 USER_NAME="l337"
 GROUP_NAME="l337"
 INSTALL_DIR="/opt/l337-audio-server"
-SYSTEM_SERVICE="/etc/systemd/system/l337-audio.service"
+SYSTEM_SERVICE="/etc/systemd/system/l337-audio-server.service"
 STATE_DIR="/var/lib/l337-audio-server"
 CACHE_DIR="/var/cache/l337-audio-server"
 CONFIG_DIR="/etc/l337-audio-server"
@@ -32,11 +34,42 @@ CONFIG_DIR="/etc/l337-audio-server"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-system}"
 
+# The service was historically named `l337-audio.service` (both system and
+# user scopes). If an old unit with that name is still enabled/running, stop,
+# disable and remove it so it doesn't linger alongside the renamed
+# `l337-audio-server.service`.
+migrate_old_service_name() {
+    local old="/etc/systemd/system/l337-audio.service"
+    if [ -f "$old" ]; then
+        echo "Found legacy system unit l337-audio.service; migrating to $SYSTEM_SERVICE..."
+        systemctl disable l337-audio.service 2>/dev/null || true
+        systemctl stop l337-audio.service 2>/dev/null || true
+        rm -f "$old"
+        systemctl daemon-reload
+    fi
+
+    local old_user="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/l337-audio.service"
+    if [ -f "$old_user" ]; then
+        echo "Found legacy user unit l337-audio.service; migrating..."
+        systemctl --user disable l337-audio.service 2>/dev/null || true
+        systemctl --user stop l337-audio.service 2>/dev/null || true
+        rm -f "$old_user"
+        systemctl --user daemon-reload
+    fi
+}
+
 require_prebuilt_binary() {
     local bin="$SCRIPT_DIR/bin/l337-audio-server"
+    if [ ! -f "$bin" ]; then
+        echo "Prebuilt binary not found at: $bin" >&2
+        echo >&2
+        echo "Build it first, then re-run this installer:" >&2
+        echo "    ./scripts/build.sh            # produces ./bin/l337-audio-server" >&2
+        echo "    sudo ./scripts/install-systemd.sh --update" >&2
+        exit 1
+    fi
     if [ ! -x "$bin" ]; then
-        echo "Prebuilt binary not found at $bin" >&2
-        echo "Build it first on a machine with cargo:  ./scripts/build.sh" >&2
+        echo "Binary at $bin is not executable." >&2
         exit 1
     fi
     echo "$bin"
@@ -50,6 +83,7 @@ install_system_service() {
     fi
 
     BIN="$(require_prebuilt_binary)"
+    migrate_old_service_name
 
     echo "Creating dedicated system user '$USER_NAME' (MPD-style)..."
     if ! id "$USER_NAME" &>/dev/null; then
@@ -120,19 +154,20 @@ EOF
 
     echo "Reloading systemd and enabling service..."
     systemctl daemon-reload
-    systemctl enable l337-audio.service
-    systemctl restart l337-audio.service
+    systemctl enable l337-audio-server.service
+    systemctl restart l337-audio-server.service
     echo
     echo "L337 Audio Server installed as a system service running under user '$USER_NAME'."
-    echo "Check status with:  sudo systemctl status l337-audio.service"
-    echo "View logs with:     sudo journalctl -u l337-audio.service -f"
+    echo "Check status with:  sudo systemctl status l337-audio-server.service"
+    echo "View logs with:     sudo journalctl -u l337-audio-server.service -f"
 }
 
 install_user_service() {
     BIN="$(require_prebuilt_binary)"
+    migrate_old_service_name
 
     UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-    UNIT="$UNIT_DIR/l337-audio.service"
+    UNIT="$UNIT_DIR/l337-audio-server.service"
     mkdir -p "$UNIT_DIR"
 
     echo "Writing user unit $UNIT..."
@@ -155,16 +190,48 @@ EOF
 
     echo "Enabling + starting user service (lingering recommended for headless)..."
     systemctl --user daemon-reload
-    systemctl --user enable l337-audio.service
-    systemctl --user restart l337-audio.service
+    systemctl --user enable l337-audio-server.service
+    systemctl --user restart l337-audio-server.service
     echo
     echo "L337 Audio Server installed as a user service for '$USER'."
     echo "For headless/always-on, enable linger:  sudo loginctl enable-linger $USER"
-    echo "Check status with:  systemctl --user status l337-audio.service"
+    echo "Check status with:  systemctl --user status l337-audio-server.service"
+}
+
+update_system_service() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Updating the system service requires root (use sudo)." >&2
+        exit 1
+    fi
+
+    BIN="$(require_prebuilt_binary)"
+
+    echo "Stopping $SYSTEM_SERVICE..."
+    systemctl stop l337-audio-server.service || true
+    sleep 1
+
+    echo "Deploying new binary to $INSTALL_DIR (config/state/cache untouched)..."
+    cp "$BIN" "$INSTALL_DIR/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/l337-audio-server"
+    chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
+
+    # Keep ./bin/ in sync too (install-systemd.sh copies from there).
+    mkdir -p "$INSTALL_DIR/bin"
+    cp "$BIN" "$INSTALL_DIR/bin/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/bin/l337-audio-server"
+    chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/bin/l337-audio-server"
+
+    echo "Restarting $SYSTEM_SERVICE..."
+    systemctl daemon-reload
+    systemctl restart l337-audio-server.service
+    echo
+    echo "L337 Audio Server updated. Verify with:  sudo systemctl status l337-audio-server.service"
+    echo "View logs with:     sudo journalctl -u l337-audio-server.service -f"
 }
 
 case "$MODE" in
     --user|user) install_user_service ;;
+    --update|update) update_system_service ;;
     system|--system|"") install_system_service ;;
-    *) echo "Unknown mode: $MODE (use --user or nothing)"; exit 1 ;;
+    *) echo "Unknown mode: $MODE (use --user, --update, or nothing)"; exit 1 ;;
 esac
