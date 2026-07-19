@@ -58,6 +58,50 @@ migrate_old_service_name() {
     fi
 }
 
+write_system_unit() {
+    cat > "$SYSTEM_SERVICE" <<EOF
+[Unit]
+Description=L337 Audio Server
+Documentation=https://github.com/l337-audio-server
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER_NAME
+Group=$GROUP_NAME
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/l337-audio-server
+Restart=on-failure
+RestartSec=2
+
+# Filesystem / runtime locations (systemd creates + chowns these).
+StateDirectory=l337-audio-server
+CacheDirectory=l337-audio-server
+ConfigurationDirectory=l337-audio-server
+
+# Hardening (MPD-style, unprivileged service user).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=$STATE_DIR $CACHE_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 require_prebuilt_binary() {
     local bin="$SCRIPT_DIR/bin/l337-audio-server"
     if [ ! -f "$bin" ]; then
@@ -110,47 +154,7 @@ install_system_service() {
     chown -R "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR"
 
     echo "Writing systemd unit $SYSTEM_SERVICE..."
-    cat > "$SYSTEM_SERVICE" <<EOF
-[Unit]
-Description=L337 Audio Server
-Documentation=https://github.com/l337-audio-server
-After=network-online.target sound.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$USER_NAME
-Group=$GROUP_NAME
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/l337-audio-server
-Restart=on-failure
-RestartSec=2
-
-# Filesystem / runtime locations (systemd creates + chowns these).
-StateDirectory=l337-audio-server
-CacheDirectory=l337-audio-server
-ConfigurationDirectory=l337-audio-server
-
-# Hardening (MPD-style, unprivileged service user).
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=false
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-ReadWritePaths=$STATE_DIR $CACHE_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_system_unit
 
     echo "Reloading systemd and enabling service..."
     systemctl daemon-reload
@@ -224,8 +228,14 @@ update_system_service() {
     chmod 0755 "$INSTALL_DIR/bin/l337-audio-server"
     chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/bin/l337-audio-server"
 
+    # (Re)write the unit file so the (possibly renamed) service can start,
+    # then register + start it.
+    echo "Writing systemd unit $SYSTEM_SERVICE..."
+    write_system_unit
+
     echo "Restarting $SYSTEM_SERVICE..."
     systemctl daemon-reload
+    systemctl enable l337-audio-server.service
     systemctl restart l337-audio-server.service
     echo
     echo "L337 Audio Server updated. Verify with:  sudo systemctl status l337-audio-server.service"
