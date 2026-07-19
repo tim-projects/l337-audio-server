@@ -139,7 +139,8 @@ install_system_service() {
     echo "Installing to $INSTALL_DIR..."
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
-    cp "$SCRIPT_DIR/config.toml" "$INSTALL_DIR/"
+    # Config lives in /etc/l337-audio-server (see below) — only the binary and
+    # helper scripts go under /opt.
     cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
     cp "$BIN" "$INSTALL_DIR/l337-audio-server"
     chmod +x "$INSTALL_DIR/l337-audio-server"
@@ -148,7 +149,8 @@ install_system_service() {
     install -d -m 0755 -o "$USER_NAME" -g "$GROUP_NAME" "$STATE_DIR"
     install -d -m 0750 -o "$USER_NAME" -g "$GROUP_NAME" "$CACHE_DIR"
     install -d -m 0755 -o "$USER_NAME" -g "$GROUP_NAME" "$CONFIG_DIR"
-    [ -f "$CONFIG_DIR/config.toml" ] || cp "$SCRIPT_DIR/config.toml" "$CONFIG_DIR/config.toml"
+    # Deploy the configuration to the official location /etc/l337-audio-server.
+    cp "$SCRIPT_DIR/config.toml" "$CONFIG_DIR/config.toml"
     chown "$USER_NAME:$GROUP_NAME" "$CONFIG_DIR/config.toml"
 
     chown -R "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR"

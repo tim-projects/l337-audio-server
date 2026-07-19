@@ -62,11 +62,16 @@ async fn main() {
     // Ensure a rustls crypto provider is selected (required before building TLS).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Create a default config file if it does not exist, so a fresh install
-    // starts cleanly instead of crashing on a missing [server] section.
+    // Ensure a config file exists in the official config directory
+    // (/etc/l337-audio-server) so a fresh install starts cleanly instead of
+    // crashing on a missing [server] section.
     ensure_config_file();
 
+    // Load configuration. The official location is /etc/l337-audio-server/
+    // (systemd ConfigurationDirectory); fall back to a config.toml next to the
+    // binary (CWD) for local/dev runs. Environment vars (L337__*) win last.
     let settings = config::Config::builder()
+        .add_source(config::File::with_name("/etc/l337-audio-server/config").required(false))
         .add_source(config::File::with_name("config").required(false))
         .add_source(config::Environment::with_prefix("L337").separator("__"))
         .build()
@@ -196,15 +201,32 @@ fn generate_token() -> String {
         .collect()
 }
 
-/// Create a default `config.toml` when none exists, so the server always has a
-/// valid configuration on first run instead of panicking on a missing section.
+/// Create a default `config.toml` in the official config directory
+/// (/etc/l337-audio-server) when none exists, so the server always has a valid
+/// configuration on first run instead of panicking on a missing section. When
+/// that directory is not present (local/dev runs) it falls back to a
+/// config.toml next to the binary (CWD).
 fn ensure_config_file() {
-    let path = std::path::Path::new("config.toml");
-    if path.exists() {
+    let etc_path = std::path::Path::new("/etc/l337-audio-server/config.toml");
+    if etc_path.exists() {
         return;
     }
-    match std::fs::write(path, DEFAULT_CONFIG) {
-        Ok(()) => tracing::info!("No config.toml found; created a default at {}", path.display()),
+    if std::path::Path::new("/etc/l337-audio-server").is_dir() {
+        match std::fs::write(etc_path, DEFAULT_CONFIG) {
+            Ok(()) => {
+                tracing::info!("No config.toml found; created a default at {}", etc_path.display())
+            }
+            Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
+        }
+        return;
+    }
+
+    let cwd_path = std::path::Path::new("config.toml");
+    if cwd_path.exists() {
+        return;
+    }
+    match std::fs::write(cwd_path, DEFAULT_CONFIG) {
+        Ok(()) => tracing::info!("No config.toml found; created a default at {}", cwd_path.display()),
         Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
     }
 }
