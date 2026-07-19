@@ -1,0 +1,12 @@
+[package]
+name = "l337-plugin-linux"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+l337-audio-server = { path = "../../.." }
+async-trait = "0.1.86"
+tokio = { version = "1.43.0", features = ["full"] }
