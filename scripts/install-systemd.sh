@@ -206,6 +206,9 @@ update_system_service() {
 
     BIN="$(require_prebuilt_binary)"
 
+    # Stop any running instance (including a legacy l337-audio.service) before
+    # copying the binary, otherwise the in-use file is "Text file busy".
+    migrate_old_service_name
     echo "Stopping $SYSTEM_SERVICE..."
     systemctl stop l337-audio-server.service || true
     sleep 1
