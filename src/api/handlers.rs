@@ -58,7 +58,10 @@ pub async fn previous(State(state): State<AppState>) -> impl IntoResponse {
     StatusCode::OK.into_response()
 }
 
-pub async fn cache_next(State(state): State<AppState>, Json(track): Json<Track>) -> impl IntoResponse {
+pub async fn cache_next(
+    State(state): State<AppState>,
+    Json(track): Json<Track>,
+) -> impl IntoResponse {
     if track.track_id.is_empty() || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
@@ -66,10 +69,16 @@ pub async fn cache_next(State(state): State<AppState>, Json(track): Json<Track>)
     tokio::spawn(async move {
         let (dest, track_id) = {
             let engine = state_clone.0.lock().await;
-            (engine.storage.get_active_slot_path("next"), track.track_id.clone())
+            (
+                engine.storage.get_active_slot_path("next"),
+                track.track_id.clone(),
+            )
         };
 
-        info!("Starting background cache for track {} to next.stream", track_id);
+        info!(
+            "Starting background cache for track {} to next.stream",
+            track_id
+        );
         if let Err(e) = engine::download_stream(&track.stream_url, &dest).await {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
@@ -86,7 +95,10 @@ pub async fn cache_next(State(state): State<AppState>, Json(track): Json<Track>)
     StatusCode::ACCEPTED.into_response()
 }
 
-pub async fn cache_previous(State(state): State<AppState>, Json(track): Json<Track>) -> impl IntoResponse {
+pub async fn cache_previous(
+    State(state): State<AppState>,
+    Json(track): Json<Track>,
+) -> impl IntoResponse {
     if track.track_id.is_empty() || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
@@ -94,10 +106,16 @@ pub async fn cache_previous(State(state): State<AppState>, Json(track): Json<Tra
     tokio::spawn(async move {
         let (dest, track_id) = {
             let engine = state_clone.0.lock().await;
-            (engine.storage.get_active_slot_path("prev"), track.track_id.clone())
+            (
+                engine.storage.get_active_slot_path("prev"),
+                track.track_id.clone(),
+            )
         };
 
-        info!("Starting background cache for track {} to prev.stream", track_id);
+        info!(
+            "Starting background cache for track {} to prev.stream",
+            track_id
+        );
         if let Err(e) = engine::download_stream(&track.stream_url, &dest).await {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
@@ -114,19 +132,28 @@ pub async fn cache_previous(State(state): State<AppState>, Json(track): Json<Tra
     StatusCode::ACCEPTED.into_response()
 }
 
-pub async fn set_speed(State(state): State<AppState>, Json(payload): Json<SpeedPayload>) -> impl IntoResponse {
+pub async fn set_speed(
+    State(state): State<AppState>,
+    Json(payload): Json<SpeedPayload>,
+) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.set_speed(payload.speed);
     StatusCode::OK.into_response()
 }
 
-pub async fn set_volume(State(state): State<AppState>, Json(payload): Json<VolumePayload>) -> impl IntoResponse {
+pub async fn set_volume(
+    State(state): State<AppState>,
+    Json(payload): Json<VolumePayload>,
+) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.set_volume(payload.volume);
     StatusCode::OK.into_response()
 }
 
-pub async fn seek(State(state): State<AppState>, Json(payload): Json<SeekPayload>) -> impl IntoResponse {
+pub async fn seek(
+    State(state): State<AppState>,
+    Json(payload): Json<SeekPayload>,
+) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.seek(payload.position);
     StatusCode::OK.into_response()
@@ -138,7 +165,10 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(status).into_response()
 }
 
-pub async fn set_settings(State(state): State<AppState>, Json(settings): Json<PoolSettings>) -> impl IntoResponse {
+pub async fn set_settings(
+    State(state): State<AppState>,
+    Json(settings): Json<PoolSettings>,
+) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.storage.max_pool_size = settings.max_disk_pool_bytes;
     StatusCode::OK.into_response()
@@ -214,7 +244,9 @@ pub async fn upload_stream(
 
     let mut engine = state.0.lock().await;
     if slot == "current" {
-        engine.play_pushed(&track_id, "current", title, artist).await;
+        engine
+            .play_pushed(&track_id, "current", title, artist)
+            .await;
     } else {
         // next/prev are precached; record access so eviction accounts for them.
         if let Ok(meta) = tokio::fs::metadata(&dest).await {

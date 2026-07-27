@@ -1,4 +1,5 @@
 mod api;
+mod platform;
 mod player;
 mod security;
 
@@ -6,10 +7,9 @@ use crate::api::handlers::{self, AppState};
 use crate::player::engine::PlayerEngine;
 use crate::player::storage::StorageManager;
 use axum::{
-    routing::{get, post, put},
     Router,
+    routing::{get, post, put},
 };
-use rodio::DeviceSinkBuilder;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -53,14 +53,19 @@ const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\n";
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Ensure a rustls crypto provider is selected (required before building TLS).
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Initialize the platform-specific subsystem (runtime dirs, audio env, etc.).
+    platform::init();
 
     // Ensure a config file exists in the official config directory
     // (/etc/l337-audio-server) so a fresh install starts cleanly instead of
@@ -84,46 +89,17 @@ async fn main() {
         .max_cache_size_bytes
         .unwrap_or(DEFAULT_MAX_POOL);
 
-    // Initialize storage and engine
-    // `--dummy` (testing only): skip real audio hardware entirely and run
-    // without a Sink. Never enabled by config — must be an explicit flag.
     let dummy_mode = std::env::args().any(|a| a == "--dummy");
 
-    // Initialize storage and engine. A real audio server always uses the host
-    // audio hardware (e.g. PipeWire/ALSA). Dummy mode skips it on purpose.
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
-    let (device_sink, mixer) = if dummy_mode {
-        tracing::warn!("Running in DUMMY output mode (--dummy). No audio will be produced. Testing only.");
-        (None, None)
+    let engine = if dummy_mode {
+        tracing::warn!(
+            "Running in DUMMY output mode (--dummy). No audio will be produced. Testing only."
+        );
+        PlayerEngine::new_dummy(storage)
     } else {
-        match DeviceSinkBuilder::open_default_sink() {
-            Ok(sink) => {
-                let mixer = sink.mixer().clone();
-                (Some(sink), Some(mixer))
-            }
-            Err(e) => {
-                eprintln!(
-                    "FATAL: No audio output device available ({}). A working audio output \
-                     (e.g. PipeWire/ALSA) is required to serve audio. Re-run with --dummy \
-                     to start without audio (testing only).",
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
+        PlayerEngine::new(storage)
     };
-
-    let engine = PlayerEngine::new(storage, device_sink, mixer);
-    if !dummy_mode {
-        if engine.player.is_none() {
-            eprintln!(
-                "FATAL: Audio device found but could not initialize a Player. A working audio \
-                 output is required. Re-run with --dummy to start without audio (testing only)."
-            );
-            std::process::exit(1);
-        }
-        tracing::info!("Audio output initialized successfully.");
-    }
 
     let shared_state: AppState = Arc::new(handlers::SendableEngine(Mutex::new(engine)));
 
@@ -146,7 +122,10 @@ async fn main() {
         .route("/player/cache/next", post(handlers::cache_next))
         .route("/player/cache/next/stream", post(handlers::upload_stream))
         .route("/player/cache/previous", post(handlers::cache_previous))
-        .route("/player/cache/previous/stream", post(handlers::upload_stream))
+        .route(
+            "/player/cache/previous/stream",
+            post(handlers::upload_stream),
+        )
         .route("/player/speed", post(handlers::set_speed))
         .route("/player/volume", post(handlers::set_volume))
         .route("/player/seek", post(handlers::seek))
@@ -160,7 +139,10 @@ async fn main() {
         .parse()
         .expect("Invalid address/port in config");
 
-    match (settings.server.tls_cert.clone(), settings.server.tls_key.clone()) {
+    match (
+        settings.server.tls_cert.clone(),
+        settings.server.tls_key.clone(),
+    ) {
         (Some(cert), Some(key)) => {
             tracing::info!("L337 Audio Server listening with TLS on https://{}", addr);
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
@@ -214,7 +196,10 @@ fn ensure_config_file() {
     if std::path::Path::new("/etc/l337-audio-server").is_dir() {
         match std::fs::write(etc_path, DEFAULT_CONFIG) {
             Ok(()) => {
-                tracing::info!("No config.toml found; created a default at {}", etc_path.display())
+                tracing::info!(
+                    "No config.toml found; created a default at {}",
+                    etc_path.display()
+                )
             }
             Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
         }
@@ -226,7 +211,10 @@ fn ensure_config_file() {
         return;
     }
     match std::fs::write(cwd_path, DEFAULT_CONFIG) {
-        Ok(()) => tracing::info!("No config.toml found; created a default at {}", cwd_path.display()),
+        Ok(()) => tracing::info!(
+            "No config.toml found; created a default at {}",
+            cwd_path.display()
+        ),
         Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
     }
 }

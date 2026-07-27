@@ -44,7 +44,9 @@ impl StorageManager {
         let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
 
         if !cache_dir.exists() {
-            fs::create_dir_all(&cache_dir).await.expect("Failed to create cache directory");
+            fs::create_dir_all(&cache_dir)
+                .await
+                .expect("Failed to create cache directory");
         }
 
         let manifest_path = cache_dir.join("manifest.json");
@@ -81,12 +83,14 @@ impl StorageManager {
 
     pub async fn update_access(&self, track_id: &str, file_size: u64) {
         let mut manifest = self.manifest.lock().await;
-        let entry = manifest.entry(track_id.to_string()).or_insert(CacheManifestEntry {
-            track_id: track_id.to_string(),
-            file_size,
-            last_accessed: chrono::Utc::now().timestamp(),
-            play_count: 0,
-        });
+        let entry = manifest
+            .entry(track_id.to_string())
+            .or_insert(CacheManifestEntry {
+                track_id: track_id.to_string(),
+                file_size,
+                last_accessed: chrono::Utc::now().timestamp(),
+                play_count: 0,
+            });
         entry.last_accessed = chrono::Utc::now().timestamp();
         entry.play_count += 1;
         entry.file_size = file_size;
