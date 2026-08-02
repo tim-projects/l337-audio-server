@@ -1,17 +1,42 @@
 # L337 Audio Server — Implementation Plan
 
 > This document is the **living plan** for the Rust `l337-audio-server`. It supersedes the original
-> greenfield "copy-paste prompt" in the repo history. The server is already substantially implemented
-> (Axum + Tokio REST on :1337, rodio sink, `current/next/prev.stream` slots, persistent LRU cache with a
-> `track_id` manifest). This plan records the **remaining work** to make the server the primary audio
-> output for the `l337-player` Python client, including **cross-device playback (LAN + WWAN)**.
+> greenfield "copy-paste prompt" in the repo history. Checkboxes track actual code state as of
+> 2026-08-02. Items marked **[DONE]** are verified in the source tree; **[TODO]** remain.
 
-## 0. Current architecture (what exists)
-- `src/main.rs` — Axum app, binds `config.toml [server] host/port`, wires 9 routes, creates `StorageManager` (hardcoded 500 MB) + `PlayerEngine`.
-- `src/api/models.rs` — `Track{track_id, stream_url, title?, artist?, duration?}`, `SpeedPayload`, `PoolSettings`, `PlayerStatus{state(uppercase enum), volume, speed, current_track?, disk_pool_utilization_bytes, next_cached, prev_cached}`, `CacheManifestEntry{track_id, file_size, last_accessed, play_count}`.
-- `src/api/handlers.rs` — `play`, `pause`, `next`, `previous`, `cache_next`, `cache_previous`, `set_speed`, `get_status`, `set_settings`. State wrapped in `SendableEngine(Mutex<PlayerEngine>)` with `unsafe impl Send/Sync`.
-- `src/player/engine.rs` — `PlayerEngine` (rodio `Sink`), `play_track` (downloads via `reqwest::get`), `load_and_play`, `pause/resume/stop`, `set_speed`, `trigger_next/previous`, `get_status`, `download_stream` (network only).
-- `src/player/storage.rs` — `StorageManager`: cache dir, manifest load/save, `update_access`, `evict_if_needed` (LRU by `last_accessed`, protects active slots).
+---
+
+## 0. Current architecture (verified)
+
+- `src/main.rs` — Axum app, binds `config.toml [server] host/port`, wires **14 routes** (incl. 3
+  stream upload endpoints), creates `StorageManager` + `PlayerEngine`. Applies `security::AuthLayer`
+  token middleware. Auto-generates self-signed TLS cert when none configured. Generates/persists
+  auth token to `server_token.txt` if unset. Writes default `config.toml` when missing.
+- `src/api/models.rs` — `Track{track_id, stream_url, title?, artist?, duration?}`, `SpeedPayload`,
+  `VolumePayload`, `SeekPayload`, `PoolSettings`, `PlayerStatus{state(lowercase enum), volume, speed,
+  current_track?, disk_pool_utilization_bytes, next_cached, prev_cached, position_sec?, duration_sec?}`,
+  `CacheManifestEntry{track_id, file_size, last_accessed, play_count}`.
+- `src/api/handlers.rs` — `play`, `pause`, `next`, `previous`, `cache_next`, `cache_previous`,
+  `set_speed`, `set_volume`, `seek`, `get_status`, `set_settings`, `health`, `upload_stream`.
+  State wrapped in `SendableEngine(Mutex<PlayerEngine>)` with `unsafe impl Send/Sync`.
+  **400 validation** on empty `track_id`/`stream_url`. `upload_stream` validates `X-Track-Id` header.
+- `src/player/engine.rs` — `PlayerEngine` (raw cpal output stream + rubato resampling, NOT rodio).
+  `new()` requires audio device; `new_dummy()` for headless. `play_track`, `play_pushed`,
+  `load_and_play`, `pause/resume/stop`, `set_speed`, `set_volume`, `seek`, `trigger_next/previous`,
+  `get_status`. `download_stream` handles `file://`, absolute paths, YouTube URLs (via `yt-dlp`),
+  and HTTP streaming. Rejects HTML/markup content.
+- `src/player/storage.rs` — `StorageManager`: configurable cache dir, manifest load/save,
+  `update_access` (increments `play_count` + `last_accessed`), `evict_if_needed` (least-played,
+  then oldest; protects `current`/`next`/`prev` slots).
+- `src/security.rs` — `AuthLayer` tower middleware (Bearer token + `X-L337-Token` alias; `/health`
+  exempt; constant-time-ish compare). `generate_self_signed(host)` via `rcgen`. `rustls_config()`
+  builder for `axum-server`.
+- `src/api/tests.rs` — Unit tests for `play`, `pause`, `get_status` using `PlayerEngine::new_dummy`.
+- `config.toml` — `[server] host/port/token`, `[storage] max_cache_size_bytes/cache_dir` (optional).
+- `build.sh` / `scripts/` — Cross-platform build dispatcher, systemd/launchd installers, run script.
+  **BLOCKER:** `main.rs` declares `mod platform;` but `platform.rs` does not exist. Code does not compile.
+
+---
 
 ## 1. Goals
 1. Make the server the **main audio output** for the client (client drives it via HTTP API).
@@ -20,20 +45,23 @@
 4. Configurable **cache size** (default **256 MB**) at `~/.cache/l337/l337-audio-server/cache/`, evicted by **least-played / LRU**.
 5. **Secure by default** for LAN + WWAN: built-in **TLS (HTTPS)** + **shared-token** auth.
 
+---
+
 ## 2. Shared API contract (client ↔ server)
 - `Track` payload: `{track_id:str, stream_url:str, title?:str, artist?:str, duration?:u64}`.
   `track_id` and `stream_url` are **required** (400 if missing/empty). `track_id` = client-generated stable hash (sha1 of canonical stream URL).
 - `state` serializes **lowercase**: `playing | paused | stopped`.
 - `PlayerStatus`: `{state, volume, speed, current_track?, disk_pool_utilization_bytes, next_cached, prev_cached, position_sec?, duration_sec?}`.
 - Auth: every request (except `GET /health`) requires header `Authorization: Bearer <token>` (alias `X-L337-Token`). 401 otherwise.
-- All endpoints served over **HTTPS** when TLS is configured.
+- All endpoints served over **HTTPS** (auto-generated self-signed cert if none configured).
 
 ### Routes
 | Method | Endpoint | Body | Notes |
 |---|---|---|---|
 | GET | `/health` | — | Unauthenticated liveness probe |
-| POST | `/player/play` | `Track` | Download `stream_url` (or `file://`/local path) → `current.stream`, play |
-| POST | `/player/play/stream` | raw bytes + `X-Track-Id` (+`X-Title`/`X-Artist`) | Client pushes audio; write straight to `current.stream` |
+| GET | `/` | — | Returns `"L337 Audio Server"` |
+| POST | `/player/play` | `Track` | Download `stream_url` (or `file://`/local path/YouTube) → `current.stream`, play |
+| POST | `/player/play/stream` | raw bytes + `X-Track-Id` (+`X-Title`/`X-Artist`) | Client pushes audio; write to `current.stream` + play |
 | POST | `/player/cache/next` | `Track` | Background download → `next.stream` |
 | POST | `/player/cache/next/stream` | raw bytes + `X-Track-Id` | Push → `next.stream` |
 | POST | `/player/cache/previous` | `Track` | Background download → `prev.stream` |
@@ -41,87 +69,179 @@
 | POST | `/player/next` | — | Swap to next |
 | POST | `/player/previous` | — | Swap to previous |
 | POST | `/player/pause` | — | Toggle pause |
-| POST | `/player/seek` | `{position:u64}` | Seek to second |
-| POST | `/player/speed` | `{speed:f32}` | Playback speed |
+| POST | `/player/seek` | `{position:u64}` | Seek to second (re-decodes from slot file) |
+| POST | `/player/speed` | `{speed:f32}` | Playback speed (0.25..4.0) |
 | POST | `/player/volume` | `{volume:f32}` | Volume (0.0..1.0) |
-| PUT  | `/player/settings` | `{max_disk_pool_bytes:u64}` | Adjust cache cap at runtime |
-| GET  | `/player/status` | — | `PlayerStatus` |
+| PUT | `/player/settings` | `{max_disk_pool_bytes:u64}` | Adjust cache cap at runtime |
+| GET | `/player/status` | — | `PlayerStatus` |
 
-## 3. Server changes (TODO)
+---
 
-### 3.1 Cache root + size (config-driven)
-- `config.toml`: add `[storage] max_cache_size_bytes` (default `268435456` = 256 MiB) and use cache root
-  `~/.cache/l337/l337-audio-server/cache/` (override via `[storage] cache_dir` optional).
+## 3. Server changes
+
+### 3.1 Cache root + size (config-driven) — **[DONE]**
+- `config.toml`: `[storage] max_cache_size_bytes` (default `268435456` = 256 MiB) and optional
+  `[storage] cache_dir`.
 - `StorageManager::new(max_pool_size, cache_dir?)` reads config; `main.rs` passes parsed values.
-- Keep `manifest.json` in the cache dir.
+- Cache dir honors `CACHE_DIRECTORY`, `STATE_DIRECTORY`, falls back to `~/.cache/l337/l337-audio-server/cache/`.
+- `manifest.json` persisted in cache dir.
 
-### 3.2 Play-count / LRU eviction
-- `evict_if_needed` already increments `play_count` via `update_access`. Change sort to
-  **least-played, then oldest**: `entries.sort_by_key(|e| (e.play_count, e.last_accessed))`.
-- `update_access` is called on every `play_track` (already) — ensure it's also called when a pushed
-  stream is played.
-- Protect active slots (`current`/`next`/`prev` manifest keys) from eviction (already done).
+### 3.2 Play-count / LRU eviction — **[DONE]**
+- `evict_if_needed` sorts by **least-played, then oldest**: `entries.sort_by(|a,b| a.play_count.cmp(&b.play_count).then(a.last_accessed.cmp(&b.last_accessed)))`.
+- `update_access` increments `play_count` on every `play_track` and on pushed-stream playback.
+- Active slots (`current`/`next`/`prev`) protected from eviction.
 
-### 3.3 `file://` / local-path passthrough
-- In `download_stream`, if `url` starts with `file://` or is an existing absolute path the server can
-  read, copy via `tokio::fs::copy` instead of `reqwest::get`.
+### 3.3 `file://` / local-path passthrough — **[DONE]**
+- `download_stream`: `file://` prefix or bare absolute path → `tokio::fs::copy`.
+- YouTube URLs (`youtube.com/watch`, `youtu.be`, `shorts`, `googlevideo.com`) → `yt-dlp` binary.
+- HTTP fetch: rejects HTML/markup content-type and HTML-byte signatures.
 
-### 3.4 Streaming upload endpoints
-- Add axum handlers consuming the request `Body` (streaming) + headers `X-Track-Id`, `X-Title`,
-  `X-Artist`. Write chunks to the target slot (`current`/`next`/`prev`) under the engine lock, applying
-  eviction first so the incoming stream never exceeds `max_pool_size`. Update manifest `play_count` on
-  play. Mirror the play/cache semantics of the non-stream routes.
-- Validate `X-Track-Id` present (400 if missing).
+### 3.4 Streaming upload endpoints — **[DONE]**
+- `upload_stream` handler consumes request `Body` as data stream, writes to target slot.
+- Derives slot from route path: `/player/play/stream` → `current`, `/player/cache/next/stream` → `next`,
+  `/player/cache/previous/stream` → `prev`.
+- Validates `X-Track-Id` (400 if missing). Reads optional `X-Title` / `X-Artist`.
+- `current` slot: calls `play_pushed` (stops current, loads new audio, updates status).
+- `next`/`prev` slots: calls `update_access` + `evict_if_needed`.
+- All three routes registered in `main.rs`.
 
-### 3.5 Seek + volume + status enrichment
-- `engine.seek(position: u64)` using rodio `Sink::seek` (or `Seek` trait) — add `POST /player/seek`.
-- `engine.set_volume(f32)` (clamp) — add `POST /player/volume` (already has `volume` field; wire it).
-- `PlayerStatus`: add `position_sec: Option<u64>` (`Sink::get_pos`) and `duration_sec: Option<u64>`
-  (decode source duration). Serialize `state` lowercase.
-- `play`/`cache_*`: 400 when `stream_url`/`track_id` empty.
+### 3.5 Seek + volume + status enrichment — **[DONE]**
+- `engine.seek(position: u64)` — re-decodes slot file, trims PCM to target sample, resamples.
+- `engine.set_volume(f32)` — clamps 0.0..1.0.
+- `PlayerStatus` includes `position_sec: Option<u64>` (computed from buffer read position) and
+  `duration_sec: Option<u64>` (set after decode).
+- `state` serializes lowercase via `#[serde(rename_all = "lowercase")]` on `PlayerStateLabel`.
+- `play`/`cache_*` return 400 on empty `track_id`/`stream_url`.
 
-### 3.6 Security: TLS + token
-- `config.toml [server]`: `host` (allow `0.0.0.0`), `port`, `token` (optional), `tls_cert`, `tls_key`
-  (optional).
-- If `token` unset → generate random token at first run, persist to config, log it for the user.
-- If `tls_cert`/`tls_key` unset → auto-generate a self-signed cert into the config dir, log fingerprint.
-  Serve via `rustls` (`tokio-rustls`/`axum-server` or `hyper-rustls`).
-- Token auth **middleware** on all routes except `GET /health` (401 otherwise).
-- `reqwest` → enable `rustls-tls` feature for pure-Rust (Android) builds.
+### 3.6 Security: TLS + token — **[DONE]**
+- `config.toml [server]`: `host`, `port`, `token` (optional), `tls_cert`, `tls_key` (optional).
+- Missing token → `generate_token()` (32 char alnum) persisted to `server_token.txt`; logged once.
+- Missing TLS cert → `security::generate_self_signed(host)` auto-generates via `rcgen`; served via
+  `axum-server` + `rustls`. Warns in logs.
+- `security::AuthLayer` middleware: Bearer token or `X-L337-Token`; `/health` exempt; 401 otherwise.
+- `reqwest` uses `rustls-tls` feature (pure-Rust TLS).
+- `platform::init()` called at startup (but module is missing — see BLOCKER).
 
-### 3.7 Misc
-- Remove `unsafe impl Send/Sync for SendableEngine` if `rodio::Sink` is `Send+Sync` (verify).
+### 3.7 Misc — **[PARTIAL]**
+- `unsafe impl Send/Sync for SendableEngine` still present. `PlayerEngine` uses raw `cpal::Stream`
+  (not rodio `Sink`). Current implementation is safe for our use case; removal deferred.
+- **[TODO]** Remove once verified that all wrapped types are naturally `Send+Sync`.
 
-## 4. Client changes (see PLAN-client.md)
-- New `audio_server_l337` plugin (probe-only, highest auto-detect priority): probes `GET {server_url}/health`
-  with token; `get_api_endpoint()` returns `server_url` when reachable.
+---
+
+## 4. Client changes (in `l337-player` repo, see `PLAN-client.md`)
+- New `audio_server_l337` plugin (probe-only): `GET {server_url}/health` with token.
 - `APIClient`: HTTPS + bearer token; streaming push to `*/stream` endpoints; `X-Track-Id` header.
-- `Player`: source classification — network URL server can fetch → send `stream_url`; local file / server
-  can't fetch → **push** (optionally transcoded via ffmpeg/yt-dlp, config-gated).
-- Payload normalization: set `track_id` (sha1) + `stream_url`; status normalization (lowercase state,
-  `position_sec`/`duration_sec`); seek/volume routing.
+- `Player`: source classification — network URL server can fetch → send `stream_url`; local file /
+  server can't fetch → **push** (optionally transcoded via ffmpeg/yt-dlp).
+- Payload normalization: `track_id` (sha1) + `stream_url`; lowercase state; seek/volume routing.
 - Settings: `server_url`, `server_token`, `remote_transcode`.
 
-## 5. Sequencing
-1. Cache root/size (3.1) + play-count eviction (3.2) + `file://` passthrough (3.3).
-2. Streaming `*/stream` upload endpoints (3.4).
-3. Seek + volume + status enrichment + lowercase state + 400 validation (3.5).
-4. TLS + token middleware + `/health` (3.6).
-5. Client: `APIClient` HTTPS+token (4) → `l337` plugin → source classification/push/transcode → normalization.
-6. E2E: localhost (Rust primary, fallback avoided) → LAN (separate device, TLS+token) → WWAN.
+---
 
-## 6. Deployment & resilience
-- **Default config:** if `config.toml` is absent on startup, the server writes a default
-  (`host = "127.0.0.1"`, `port = 1337`) and continues — it never panics on a missing file.
-  Override via `config.toml`, env (`L337__SERVER__HOST`, `L337__SERVER__PORT`,
-  `L337__SERVER__TOKEN`, `L337__STORAGE__MAX_CACHE_SIZE_BYTES`, `L337__STORAGE__CACHE_DIR`),
-  or CLI flags.
-- **Directories:** the cache root honors `CACHE_DIRECTORY` then `STATE_DIRECTORY` (set by
-  systemd) and falls back to `~/.cache/l337/l337-audio-server/cache/`. The persisted auth
-  token is written to `STATE_DIRECTORY` when provided, else the same cache dir. Default cap
-  is **256 MiB**.
-- **systemd:** `scripts/install-systemd.sh` installs the server as a dedicated, unprivileged
-  `l337` system user (MPD-style: `User=l337`/`Group=l337`, audio group, hardened
-  `ProtectSystem=strict`, `CacheDirectory`/`StateDirectory`/`ConfigurationDirectory`). A
-  per-user instance is available via `./scripts/install-systemd.sh --user`. `scripts/run-server.sh`
-  launches the release binary.
+## 5. Sequencing (actual status)
+
+| # | Step | Status |
+|---|---|---|
+| 1 | Cache root/size + play-count eviction + `file://` passthrough | **DONE** |
+| 2 | Streaming `*/stream` upload endpoints | **DONE** |
+| 3 | Seek + volume + status enrichment + lowercase state + 400 validation | **DONE** |
+| 4 | TLS + token middleware + `/health` + self-signed fallback | **DONE** |
+| 5 | `--dummy` headless mode + default config generation + token persistence | **DONE** |
+| 6 | Fix `platform.rs` missing module (BLOCKER) | **TODO** |
+| 7 | Remove `unsafe impl Send/Sync` after verification | **TODO** |
+| 8 | Rate limiting / request body size limits | **TODO** |
+| 9 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
+| 10 | E2E: localhost (Rust primary) → LAN (separate device, TLS+token) → Tailscale | **TODO** |
+
+---
+
+## 6. Blockers
+
+### 6.1 Missing `platform.rs` module — **[BLOCKER, blocks compile]**
+`src/main.rs` line 3 declares `mod platform;` but no `platform.rs` or `platform/mod.rs` exists.
+`platform::init()` is called at startup. **This must be created before `cargo build` will succeed.**
+
+Minimal stub needed:
+```rust
+// src/platform.rs
+pub fn init() {
+    // Platform-specific runtime setup (XDG dirs, audio env, etc.)
+}
+```
+
+### 6.2 `yt-dlp` binary dependency
+`download_via_ytdlp` shells out to `yt-dlp`. It must be installed on the host or bundled with the
+binary for release builds. Document as a runtime dependency or embed a Python-based resolver.
+
+---
+
+## 7. Remaining server TODOs
+
+### 7.1 Rate limiting + body size limits
+- Add `tower::limit::ConcurrencyLimitLayer` or `tower-governor` for per-IP rate limiting (5 req/s).
+- Cap streaming upload body to `max_disk_pool_bytes + 10 MB`; return 413 on overflow.
+
+### 7.2 Token rotation
+- Support token rotation via `PUT /player/settings` or SIGHUP config reload without restart.
+
+### 7.3 Config file permissions
+- When auto-generating `config.toml` or `server_token.txt`, set permissions to `0o600`.
+
+### 7.4 Remove `unsafe impl Send/Sync`
+- Verify `cpal::Stream`, `Arc<Mutex<AudioBuffer>>`, `Arc<Mutex<f32>>` are all `Send+Sync`.
+- If confirmed, remove `unsafe impl Send/Sync for SendableEngine`.
+
+---
+
+## 8. Deployment & resilience
+
+### 8.1 Default config — **[DONE]**
+- Missing `config.toml` → writes default (`host = "127.0.0.1"`, `port = 1337`) to CWD or
+  `/etc/l337-audio-server/`. Never panics on missing file.
+- Override hierarchy: CLI flags → env (`L337__SERVER__HOST`, `L337__SERVER__PORT`,
+  `L337__SERVER__TOKEN`, `L337__STORAGE__MAX_CACHE_SIZE_BYTES`, `L337__STORAGE__CACHE_DIR`) →
+  `config.toml` → built-in defaults.
+
+### 8.2 Directories — **[DONE]**
+- Cache root honors `CACHE_DIRECTORY` then `STATE_DIRECTORY` (systemd), falls back to
+  `~/.cache/l337/l337-audio-server/cache/`.
+- Auth token persisted to `STATE_DIRECTORY` or cache dir as `server_token.txt`.
+- Default cap is **256 MiB**.
+
+### 8.3 systemd — **[PARTIAL]**
+- `scripts/install-systemd.sh` exists for dedicated `l337` system user.
+- `scripts/run-server.sh` launches release binary.
+- **[TODO]** Verify hardening flags (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  `NoNewPrivileges`, `ReadOnlyPaths`, `ReadWritePaths`) are in the generated unit file.
+
+### 8.4 Build & release — **[TODO]**
+- `build.sh` dispatches to platform scripts. **[TODO]** Verify cross-compilation matrix works.
+- **[TODO]** Add GitHub Actions workflow for multi-platform release artifacts (Linux x86/arm64,
+  macOS x86/arm64, Windows x86_64).
+
+---
+
+## 9. Audio engine note
+
+The PLAN originally described a rodio `Sink`-based engine. The actual implementation uses:
+- **cpal** raw output stream with a custom callback that drains an `AudioBuffer` (PCM `Vec<f32>`).
+- **rubato** `SincFixedIn` for sample-rate conversion and speed adjustment.
+- **symphonia** for decoding MP3/AAC/FLAC/Vorbis/WAV to PCM.
+
+This is functionally equivalent for the API contract but means `cpal` must initialize successfully
+unless `--dummy` is passed. The `--dummy` flag exists and uses a no-op engine.
+
+---
+
+## 10. Client-side status (l337-player)
+
+All client work is tracked in `PLAN-client.md`. High-level gaps vs server:
+- `audio_server_l337` plugin not yet implemented in `src/client/plugins/`.
+- `APIClient` (`src/client/core/api_client.py`) needs bearer token + streaming push support.
+- `Player` needs source classification logic (local push vs. server-fetched URL).
+- Settings keys `server_url`, `server_token`, `remote_transcode` not yet in schema.
+
+---
+
+*Generated: 2026-08-02. Maintain this file as the single source of truth for implementation state.*

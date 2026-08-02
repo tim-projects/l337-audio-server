@@ -1,6 +1,9 @@
 # .tasks tracking
 .tasks/
 
+# Infrastructure repos mapping
+infra-repos.md
+
 # Cargo
 target/
 Cargo.lock
