@@ -34,7 +34,6 @@
 - `src/api/tests.rs` — Unit tests for `play`, `pause`, `get_status` using `PlayerEngine::new_dummy`.
 - `config.toml` — `[server] host/port/token`, `[storage] max_cache_size_bytes/cache_dir` (optional).
 - `build.sh` / `scripts/` — Cross-platform build dispatcher, systemd/launchd installers, run script.
-  **BLOCKER:** `main.rs` declares `mod platform;` but `platform.rs` does not exist. Code does not compile.
 
 ---
 
@@ -148,29 +147,17 @@
 | 3 | Seek + volume + status enrichment + lowercase state + 400 validation | **DONE** |
 | 4 | TLS + token middleware + `/health` + self-signed fallback | **DONE** |
 | 5 | `--dummy` headless mode + default config generation + token persistence | **DONE** |
-| 6 | Fix `platform.rs` missing module (BLOCKER) | **TODO** |
+| 6 | Fix `platform.rs` missing module (BLOCKER) | **DONE** |
 | 7 | Remove `unsafe impl Send/Sync` after verification | **TODO** |
 | 8 | Rate limiting / request body size limits | **TODO** |
 | 9 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
-| 10 | E2E: localhost (Rust primary) → LAN (separate device, TLS+token) → Tailscale | **TODO** |
+| 10 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
 
 ---
 
 ## 6. Blockers
 
-### 6.1 Missing `platform.rs` module — **[BLOCKER, blocks compile]**
-`src/main.rs` line 3 declares `mod platform;` but no `platform.rs` or `platform/mod.rs` exists.
-`platform::init()` is called at startup. **This must be created before `cargo build` will succeed.**
-
-Minimal stub needed:
-```rust
-// src/platform.rs
-pub fn init() {
-    // Platform-specific runtime setup (XDG dirs, audio env, etc.)
-}
-```
-
-### 6.2 `yt-dlp` binary dependency
+### 6.1 `yt-dlp` binary dependency — **[NOTE]**
 `download_via_ytdlp` shells out to `yt-dlp`. It must be installed on the host or bundled with the
 binary for release builds. Document as a runtime dependency or embed a Python-based resolver.
 
@@ -237,10 +224,12 @@ unless `--dummy` is passed. The `--dummy` flag exists and uses a no-op engine.
 ## 10. Client-side status (l337-player)
 
 All client work is tracked in `PLAN-client.md`. High-level gaps vs server:
-- `audio_server_l337` plugin not yet implemented in `src/client/plugins/`.
-- `APIClient` (`src/client/core/api_client.py`) needs bearer token + streaming push support.
-- `Player` needs source classification logic (local push vs. server-fetched URL).
-- Settings keys `server_url`, `server_token`, `remote_transcode` not yet in schema.
+- `audio_server_l337` plugin directory exists at `src/client/plugins/audio_server/` but is empty — **TODO** implement probe + control logic.
+- `APIClient` (`src/client/core/api_client.py`) supports bearer token + HTTPS + streaming push — **VERIFIED** working against `https://localhost:1337` with self-signed cert.
+- `Player` source classification logic (local push vs. server-fetched URL) — **TODO**.
+- Settings keys `server_url`, `server_token`, `remote_transcode` not yet in schema — **TODO**.
+
+Verified: `l337-player` `connect_audio_server()` successfully detects and authenticates with the dummy server (`reachable: True, token_ok: True`).
 
 ---
 
