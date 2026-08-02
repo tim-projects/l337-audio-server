@@ -13,6 +13,10 @@
 #   ./scripts/build.sh --target aarch64-unknown-linux-gnu   # cross build
 set -e
 
+LOG_FILE="/tmp/l337-audio-server-build.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Build started"
+
 TARGET=""
 if [ "${1:-}" = "--target" ]; then
     TARGET="$2"
