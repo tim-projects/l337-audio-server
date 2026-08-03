@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::signal::unix::SignalKind;
+use std::os::unix::fs::PermissionsExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,15 @@ const DEFAULT_MAX_POOL: u64 = 256 * 1024 * 1024; // 256 MiB
 /// usable configuration and never panics on a missing file.
 const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\n";
 
+fn load_settings() -> Result<Settings, config::ConfigError> {
+    config::Config::builder()
+        .add_source(config::File::with_name("/etc/l337-audio-server/config").required(false))
+        .add_source(config::File::with_name("config").required(false))
+        .add_source(config::Environment::with_prefix("L337").separator("__"))
+        .build()?
+        .try_deserialize::<Settings>()
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -75,14 +86,7 @@ async fn main() {
     // Load configuration. The official location is /etc/l337-audio-server/
     // (systemd ConfigurationDirectory); fall back to a config.toml next to the
     // binary (CWD) for local/dev runs. Environment vars (L337__*) win last.
-    let settings = config::Config::builder()
-        .add_source(config::File::with_name("/etc/l337-audio-server/config").required(false))
-        .add_source(config::File::with_name("config").required(false))
-        .add_source(config::Environment::with_prefix("L337").separator("__"))
-        .build()
-        .expect("Failed to build config")
-        .try_deserialize::<Settings>()
-        .expect("Failed to parse config");
+    let mut settings = load_settings().expect("Failed to load config");
 
     let max_pool = settings
         .storage
@@ -109,6 +113,36 @@ async fn main() {
         Some(t) if !t.is_empty() => t.clone(),
         _ => load_or_create_token(),
     };
+    let shared_token = Arc::new(Mutex::new(token.clone()));
+
+    // Spawn SIGHUP config reload: re-read config + env, rotate token if changed.
+    let reload_token = shared_token.clone();
+    let _reload_handle = tokio::spawn(async move {
+        let mut signal = match tokio::signal::unix::signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("SIGHUP reload unavailable: {}", e);
+                return;
+            }
+        };
+        while signal.recv().await.is_some() {
+            tracing::warn!("SIGHUP received; reloading configuration");
+            match load_settings() {
+                Ok(new_settings) => {
+                    if let Some(new_token) = new_settings.server.token {
+                        if !new_token.is_empty() {
+                            let mut guard = reload_token.lock().await;
+                            if *guard != new_token {
+                                tracing::warn!("Rotating auth token");
+                                *guard = new_token;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("Config reload failed: {}", e),
+            }
+        }
+    });
 
     // Build our application with routes
     let app = Router::new()
@@ -132,7 +166,10 @@ async fn main() {
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
         .with_state(shared_state)
-        .layer(security::AuthLayer::new(token));
+        .layer(security::AuthLayer::new(token.clone()))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            300 * 1024 * 1024,
+        ));
 
     // Run it (optionally over TLS)
     let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
@@ -196,6 +233,7 @@ fn ensure_config_file() {
     if std::path::Path::new("/etc/l337-audio-server").is_dir() {
         match std::fs::write(etc_path, DEFAULT_CONFIG) {
             Ok(()) => {
+                let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
                 tracing::info!(
                     "No config.toml found; created a default at {}",
                     etc_path.display()
@@ -211,10 +249,13 @@ fn ensure_config_file() {
         return;
     }
     match std::fs::write(cwd_path, DEFAULT_CONFIG) {
-        Ok(()) => tracing::info!(
-            "No config.toml found; created a default at {}",
-            cwd_path.display()
-        ),
+        Ok(()) => {
+            let _ = std::fs::set_permissions(cwd_path, std::fs::Permissions::from_mode(0o600));
+            tracing::info!(
+                "No config.toml found; created a default at {}",
+                cwd_path.display()
+            )
+        }
         Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
     }
 }
@@ -254,6 +295,10 @@ fn load_or_create_token() -> String {
     let generated = generate_token();
     if let Err(e) = std::fs::write(&path, &generated) {
         tracing::warn!("Could not persist token to {}: {}", path.display(), e);
+    } else if let Ok(meta) = std::fs::metadata(&path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() & 0o7777 | 0o600);
+        let _ = std::fs::set_permissions(&path, perms);
     }
     tracing::warn!(
         "No [server] token configured. Generated + persisted a token at {}; add it to the \

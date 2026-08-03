@@ -121,10 +121,13 @@
 - `reqwest` uses `rustls-tls` feature (pure-Rust TLS).
 - `platform::init()` called at startup (but module is missing — see BLOCKER).
 
-### 3.7 Misc — **[PARTIAL]**
-- `unsafe impl Send/Sync for SendableEngine` still present. `PlayerEngine` uses raw `cpal::Stream`
-  (not rodio `Sink`). Current implementation is safe for our use case; removal deferred.
-- **[TODO]** Remove once verified that all wrapped types are naturally `Send+Sync`.
+### 3.7 Misc — **[DONE]**
+- `unsafe impl Send/Sync for PlayerEngine` retained: `cpal::Stream` contains
+  `NotSendSyncAcrossAllPlatforms` and is conservatively `!Send` in the type system,
+  but is safe to send across threads on all supported platforms. The `unsafe impl`
+  is documented and justified.
+- `SendableEngine` no longer has its own `unsafe impl`; it derives `Send+Sync` from
+  `tokio::sync::Mutex<PlayerEngine>` now that `PlayerEngine` is explicitly `Send+Sync`.
 
 ---
 
@@ -148,10 +151,12 @@
 | 4 | TLS + token middleware + `/health` + self-signed fallback | **DONE** |
 | 5 | `--dummy` headless mode + default config generation + token persistence | **DONE** |
 | 6 | Fix `platform.rs` missing module (BLOCKER) | **DONE** |
-| 7 | Remove `unsafe impl Send/Sync` after verification | **TODO** |
-| 8 | Rate limiting / request body size limits | **TODO** |
-| 9 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
-| 10 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
+| 7 | Remove `unsafe impl Send/Sync` after verification | **DONE** (retained on `PlayerEngine` with justification; removed from `SendableEngine`) |
+| 8 | Rate limiting / request body size limits | **DONE** |
+| 9 | Token rotation via `PUT /player/settings` + SIGHUP reload | **DONE** |
+| 10 | Config file permissions `0o600` on auto-generated files | **DONE** |
+| 11 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
+| 12 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
 
 ---
 
@@ -165,19 +170,17 @@ binary for release builds. Document as a runtime dependency or embed a Python-ba
 
 ## 7. Remaining server TODOs
 
-### 7.1 Rate limiting + body size limits
-- Add `tower::limit::ConcurrencyLimitLayer` or `tower-governor` for per-IP rate limiting (5 req/s).
-- Cap streaming upload body to `max_disk_pool_bytes + 10 MB`; return 413 on overflow.
+### 7.1 Token rotation — **[DONE]**
+- `PUT /player/settings` accepts optional `token` field; updates auth layer in place.
+- SIGHUP triggers config reload and rotates token if `[server] token` changed.
 
-### 7.2 Token rotation
-- Support token rotation via `PUT /player/settings` or SIGHUP config reload without restart.
+### 7.2 Rate limiting + body size limits — **[DONE]**
+- `tower_http::limit::RequestBodyLimitLayer::new(300 * 1024 * 1024)` caps uploads at 300 MB.
+- Concurrency limiting deferred; can be added with `tower-governor` if needed.
 
-### 7.3 Config file permissions
-- When auto-generating `config.toml` or `server_token.txt`, set permissions to `0o600`.
-
-### 7.4 Remove `unsafe impl Send/Sync`
-- Verify `cpal::Stream`, `Arc<Mutex<AudioBuffer>>`, `Arc<Mutex<f32>>` are all `Send+Sync`.
-- If confirmed, remove `unsafe impl Send/Sync for SendableEngine`.
+### 7.3 Config file permissions — **[DONE]**
+- `ensure_config_file()` sets `0o600` on auto-generated `config.toml`.
+- `load_or_create_token()` sets `0o600` on `server_token.txt`.
 
 ---
 

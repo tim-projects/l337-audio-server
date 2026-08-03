@@ -27,6 +27,8 @@ pub struct SeekPayload {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PoolSettings {
     pub max_disk_pool_bytes: u64,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

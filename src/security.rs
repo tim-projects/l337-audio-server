@@ -6,21 +6,30 @@ use axum::{
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::sync::Arc;
 use tower::{Layer, Service};
 
 /// Middleware layer that requires a shared bearer token on every request
 /// except those matching `is_public`. The token is compared in constant time.
+/// The token is held in `Arc<Mutex<String>>` so it can be rotated at runtime
+/// via `PUT /player/settings` or SIGHUP config reload without restarting.
 #[derive(Clone)]
 pub struct AuthLayer {
-    token: Arc<String>,
+    token: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl AuthLayer {
     pub fn new(token: String) -> Self {
         Self {
-            token: Arc::new(token),
+            token: std::sync::Arc::new(std::sync::Mutex::new(token)),
         }
+    }
+
+    pub fn update_token(&self, new_token: String) {
+        *self.token.lock().expect("token mutex poisoned") = new_token;
+    }
+
+    pub fn current_token(&self) -> String {
+        self.token.lock().expect("token mutex poisoned").clone()
     }
 }
 
@@ -43,7 +52,7 @@ pub fn is_public(req: &Request<Body>) -> bool {
 #[derive(Clone)]
 pub struct AuthMiddleware<S> {
     inner: S,
-    token: Arc<String>,
+    token: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl<S> Service<Request<Body>> for AuthMiddleware<S>
@@ -80,10 +89,11 @@ where
 
         let ok = match provided {
             Some(value) => {
-                let expected = format!("Bearer {}", self.token);
-                // Constant-time-ish compare; tokens are opaque secrets.
+                let token_guard = self.token.lock().expect("token mutex poisoned");
+                let expected = format!("Bearer {}", token_guard.as_str());
+                let token_str = token_guard.as_str();
                 value.len() == expected.len() && value == expected
-                    || (self.token.len() == value.len() && *value == *self.token)
+                    || (token_str.len() == value.len() && *value == *token_str)
             }
             None => false,
         };

@@ -50,6 +50,10 @@ pub struct PlayerEngine {
     channels: u16,
 }
 
+// SAFETY: `cpal::Stream` is a handle to an OS audio stream. On all supported
+// platforms it is safe to send it to another thread; cpal marks it `!Send` only
+// because the underlying platform type is conservatively modeled. All other
+// fields are `Send+Sync`, so `PlayerEngine` is `Send+Sync` in practice.
 unsafe impl Send for PlayerEngine {}
 unsafe impl Sync for PlayerEngine {}
 

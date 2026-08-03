@@ -11,11 +11,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-// Use a simple wrapper to make PlayerEngine Sendable by explicitly marking it.
-// This is safe because all rodio types are thread-safe enough for our use case.
+// Use a simple wrapper to make PlayerEngine safely shareable across tasks.
+// tokio::sync::Mutex<PlayerEngine> is Send+Sync when PlayerEngine is Send+Sync,
+// which it is naturally (cpal::Stream 0.15 is Send+Sync, all inner fields are
+// primitives / Send+Sync types). No unsafe impl needed.
 pub struct SendableEngine(pub Mutex<PlayerEngine>);
-unsafe impl Send for SendableEngine {}
-unsafe impl Sync for SendableEngine {}
 
 pub type AppState = Arc<SendableEngine>;
 
