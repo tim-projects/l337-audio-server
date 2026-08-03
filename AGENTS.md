@@ -21,6 +21,18 @@ When implementing new features:
 - Regularly audit binary size with `size -a ./bin/l337-audio-server` and `cargo bloat`
 - Remember our core mission: an efficient, lightweight audio server - every feature should justify its cost
 
+## Security
+
+The audio server must take security very seriously in all aspects:
+- Authentication and authorization are required for all sensitive endpoints
+- Input validation and sanitization prevent injection and traversal attacks
+- Output encoding avoids XSS and injection vulnerabilities
+- Secure defaults for cryptographic operations and random number generation
+- Regular dependency auditing with `cargo audit`
+- Minimizing attack surface by disabling unnecessary features
+- Following the principle of least privilege in all components
+- Regular security reviews and threat modeling
+
 ## Dummy mode (no soundcard)
 
 This server requires a soundcard at runtime. On headless / CI / dev boxes without audio hardware, run with `--dummy`:

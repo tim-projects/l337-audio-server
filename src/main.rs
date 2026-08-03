@@ -23,6 +23,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct Settings {
     server: ServerSettings,
     #[serde(default)]
+    dummy: bool,
+    #[serde(default)]
     storage: StorageSettings,
 }
 
@@ -48,17 +50,38 @@ struct StorageSettings {
 
 const DEFAULT_MAX_POOL: u64 = 256 * 1024 * 1024; // 256 MiB
 
-/// Default `config.toml` written when none exists, so the server always has a
+/// Default `server.ini` written when none exists, so the server always has a
 /// usable configuration and never panics on a missing file.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\n";
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
-    config::Config::builder()
+    let mut builder = config::Config::builder();
+    builder = builder
         .add_source(config::File::with_name("/etc/l337-audio-server/config").required(false))
-        .add_source(config::File::with_name("config").required(false))
-        .add_source(config::Environment::with_prefix("L337").separator("__"))
-        .build()?
-        .try_deserialize::<Settings>()
+        .add_source(
+            config::File::from(std::path::Path::new("/etc/l337-audio-server/server.ini"))
+                .format(config::FileFormat::Ini)
+                .required(false),
+        );
+
+    if let Some(config_dir) = dirs::config_dir() {
+        let xdg_path = config_dir.join("l337-audio-server").join("server.ini");
+        builder = builder.add_source(
+            config::File::from(xdg_path)
+                .format(config::FileFormat::Ini)
+                .required(false),
+        );
+    }
+
+    builder = builder
+        .add_source(
+            config::File::from(std::path::Path::new("server.ini"))
+                .format(config::FileFormat::Ini)
+                .required(false),
+        )
+        .add_source(config::Environment::with_prefix("L337").separator("__"));
+
+    builder.build()?.try_deserialize::<Settings>()
 }
 
 #[tokio::main]
@@ -84,8 +107,9 @@ async fn main() {
     ensure_config_file();
 
     // Load configuration. The official location is /etc/l337-audio-server/
-    // (systemd ConfigurationDirectory); fall back to a config.toml next to the
-    // binary (CWD) for local/dev runs. Environment vars (L337__*) win last.
+    // (systemd ConfigurationDirectory); fall back to XDG ~/.config/
+    // then to a server.ini next to the binary (CWD) for local/dev runs.
+    // Environment vars (L337__*) win last.
     let mut settings = load_settings().expect("Failed to load config");
 
     let max_pool = settings
@@ -93,7 +117,7 @@ async fn main() {
         .max_cache_size_bytes
         .unwrap_or(DEFAULT_MAX_POOL);
 
-    let dummy_mode = std::env::args().any(|a| a == "--dummy");
+    let dummy_mode = settings.dummy || std::env::args().any(|a| a == "--dummy");
 
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
     let engine = if dummy_mode {
@@ -220,13 +244,13 @@ fn generate_token() -> String {
         .collect()
 }
 
-/// Create a default `config.toml` in the official config directory
+/// Create a default `server.ini` in the official config directory
 /// (/etc/l337-audio-server) when none exists, so the server always has a valid
 /// configuration on first run instead of panicking on a missing section. When
-/// that directory is not present (local/dev runs) it falls back to a
-/// config.toml next to the binary (CWD).
+/// that directory is not present (local/dev runs) it falls back to the XDG
+/// config directory, then to `server.ini` next to the binary (CWD).
 fn ensure_config_file() {
-    let etc_path = std::path::Path::new("/etc/l337-audio-server/config.toml");
+    let etc_path = std::path::Path::new("/etc/l337-audio-server/server.ini");
     if etc_path.exists() {
         return;
     }
@@ -235,16 +259,30 @@ fn ensure_config_file() {
             Ok(()) => {
                 let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
                 tracing::info!(
-                    "No config.toml found; created a default at {}",
+                    "No server.ini found; created a default at {}",
                     etc_path.display()
                 )
             }
-            Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
+            Err(e) => tracing::warn!("Could not create default server.ini: {}", e),
         }
         return;
     }
 
-    let cwd_path = std::path::Path::new("config.toml");
+    if let Some(config_dir) = dirs::config_dir() {
+        let xdg_path = config_dir.join("l337-audio-server").join("server.ini");
+        if !xdg_path.exists() {
+            let _ = std::fs::create_dir_all(xdg_path.parent().unwrap());
+            let _ = std::fs::write(&xdg_path, DEFAULT_CONFIG);
+            let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
+            tracing::info!(
+                "No server.ini found; created a default at {}",
+                xdg_path.display()
+            );
+            return;
+        }
+    }
+
+    let cwd_path = std::path::Path::new("server.ini");
     if cwd_path.exists() {
         return;
     }
@@ -252,11 +290,11 @@ fn ensure_config_file() {
         Ok(()) => {
             let _ = std::fs::set_permissions(cwd_path, std::fs::Permissions::from_mode(0o600));
             tracing::info!(
-                "No config.toml found; created a default at {}",
+                "No server.ini found; created a default at {}",
                 cwd_path.display()
             )
         }
-        Err(e) => tracing::warn!("Could not create default config.toml: {}", e),
+        Err(e) => tracing::warn!("Could not create default server.ini: {}", e),
     }
 }
 
