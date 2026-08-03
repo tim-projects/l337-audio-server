@@ -12,6 +12,15 @@ CARGO_HOME=/tmp/cargo-home ./scripts/build.sh
 
 The script sets `CARGO_TARGET_DIR=/tmp/l337-build` and copies the finished binary to `bin/l337-audio-server` for deployment.
 
+## Development Guidelines
+
+When implementing new features:
+- Seek implementations that are both feature-complete and reduce binary size through better abstraction
+- Prefer generic solutions over duplicated logic (monomorphization can share more code than expected)
+- Use Cargo features to make components optionally compilable
+- Regularly audit binary size with `size -a ./bin/l337-audio-server` and `cargo bloat`
+- Remember our core mission: an efficient, lightweight audio server - every feature should justify its cost
+
 ## Dummy mode (no soundcard)
 
 This server requires a soundcard at runtime. On headless / CI / dev boxes without audio hardware, run with `--dummy`:
