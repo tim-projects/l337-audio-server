@@ -2,15 +2,36 @@
 
 ## Build
 
-Disk space is tight. All cargo artifacts (registry, target dir, build cache) must live under `/tmp` to keep the in-repo `target/` small. Do not let cargo write into `./target`.
+**Disk space is tight.** All cargo artifacts (registry, target dir, build cache) must live under `/tmp`. The in-repo `target/` must not be used for builds. Do not run `cargo build`, `cargo check`, or `cargo test` directly — they will write large temp files into `./target` and exhaust disk space.
 
-Always use the project build script. Do not run cargo directly and do not background builds:
+Always use the project build script. Do not background builds:
 
 ```bash
 CARGO_HOME=/tmp/cargo-home ./scripts/build.sh
 ```
 
-The script sets `CARGO_TARGET_DIR=/tmp/l337-build` and copies the finished binary to `bin/l337-audio-server` for deployment.
+The script sets `CARGO_TARGET_DIR=/tmp/l337-build` and copies the finished binary to `bin/l337-audio-server` for deployment. `cargo check` is acceptable because it does not produce a linked binary and uses far less disk.
+
+If you need to verify code compiles without producing a binary, use:
+```bash
+CARGO_HOME=/tmp/cargo-home cargo check
+```
+
+Do not create a `.cargo/config.toml` in the repo. The build script already handles `CARGO_TARGET_DIR` via environment variable.
+
+## Disk space hygiene
+
+Before building, check available space:
+```bash
+df -h /tmp
+```
+
+If `/tmp` is low, clean build artifacts:
+```bash
+rm -rf /tmp/l337-build /tmp/cargo-home
+```
+
+Never let cargo write into `./target/`. If a `target/` directory already exists in the repo, it should be moved to `/tmp` or removed.
 
 ## Development Guidelines
 

@@ -38,6 +38,8 @@ struct ServerSettings {
     tls_cert: Option<PathBuf>,
     #[serde(default)]
     tls_key: Option<PathBuf>,
+    #[serde(default)]
+    transport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -50,9 +52,27 @@ struct StorageSettings {
 
 const DEFAULT_MAX_POOL: u64 = 256 * 1024 * 1024; // 256 MiB
 
+/// Path to the Unix domain socket used for local IPC.
+fn socket_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("l337")
+        .join("l337-audio-server")
+        .join("l337.sock")
+}
+
+/// Remove a stale Unix socket file if it exists.
+fn remove_stale_socket(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn parse_transport_cli() -> Option<String> {
+    std::env::args().find_map(|a| a.strip_prefix("--transport=").map(|v| v.to_string()))
+}
+
 /// Default `server.ini` written when none exists, so the server always has a
 /// usable configuration and never panics on a missing file.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\n";
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
     let mut builder = config::Config::builder();
@@ -119,6 +139,18 @@ async fn main() {
 
     let dummy_mode = settings.dummy || std::env::args().any(|a| a == "--dummy");
 
+    // Determine transport: CLI flag > config file > default "auto"
+    let cli_transport = parse_transport_cli();
+    let effective_transport = cli_transport
+        .or_else(|| settings.server.transport.clone())
+        .unwrap_or_else(|| "auto".to_string());
+    let use_socket = match effective_transport.as_str() {
+        "socket" => true,
+        "http" => false,
+        "auto" => cfg!(unix),
+        _ => cfg!(unix),
+    };
+
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
     let engine = if dummy_mode {
         tracing::warn!(
@@ -133,6 +165,7 @@ async fn main() {
 
     // Resolve the auth token: reuse configured value, else load/persist a stable
     // generated token so the client only needs to copy it once.
+    // For Unix socket mode, auth is skipped (socket file permissions provide security).
     let token = match &settings.server.token {
         Some(t) if !t.is_empty() => t.clone(),
         _ => load_or_create_token(),
@@ -169,7 +202,7 @@ async fn main() {
     });
 
     // Build our application with routes
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(handlers::health))
         .route("/", get(|| async { "L337 Audio Server" }))
         .route("/player/play", post(handlers::play))
@@ -189,48 +222,76 @@ async fn main() {
         .route("/player/seek", post(handlers::seek))
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
-        .with_state(shared_state)
-        .layer(security::AuthLayer::new(token.clone()))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            300 * 1024 * 1024,
-        ));
+        .with_state(shared_state);
 
-    // Run it (optionally over TLS)
-    let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
-        .parse()
-        .expect("Invalid address/port in config");
+    // Skip auth layer for Unix socket mode (file permissions provide security).
+    if !use_socket {
+        app = app.layer(security::AuthLayer::new(token.clone()));
+    }
+    app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
+        300 * 1024 * 1024,
+    ));
 
-    match (
-        settings.server.tls_cert.clone(),
-        settings.server.tls_key.clone(),
-    ) {
-        (Some(cert), Some(key)) => {
-            tracing::info!("L337 Audio Server listening with TLS on https://{}", addr);
-            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-                .await
-                .expect("invalid TLS cert/key");
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service())
-                .await
-                .unwrap();
+    // Serve over Unix socket or TCP/HTTPS.
+    if use_socket {
+        let path = socket_path();
+        remove_stale_socket(&path);
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let listener =
+            std::os::unix::net::UnixListener::bind(&path).expect("Failed to bind Unix socket");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
         }
-        _ => {
-            // No TLS configured: auto-generate a self-signed cert so the server is
-            // encrypted by default (works for LAN + WWAN). The client must trust
-            // the fingerprint / disable verification for self-signed.
-            let host = settings.server.host.clone();
-            let certified = security::generate_self_signed(&host);
-            let tls = security::rustls_config(certified);
-            tracing::warn!(
-                "No TLS cert configured. Auto-generated a self-signed certificate; \
-                 server is available at https://{}. Configure a trusted cert in \
-                 [server] tls_cert/tls_key for production.",
-                addr
-            );
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service())
-                .await
-                .unwrap();
+        tracing::info!("L337 Audio Server listening on Unix socket {}", path.display());
+        axum_server::from_unix(listener)
+            .expect("Failed to create axum server from Unix listener")
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    } else {
+        // Run it (optionally over TLS)
+        let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
+            .parse()
+            .expect("Invalid address/port in config");
+
+        match (
+            settings.server.tls_cert.clone(),
+            settings.server.tls_key.clone(),
+        ) {
+            (Some(cert), Some(key)) => {
+                tracing::info!("L337 Audio Server listening with TLS on https://{}", addr);
+                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .expect("invalid TLS cert/key");
+                axum_server::bind_rustls(addr, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                // No TLS configured: auto-generate a self-signed cert so the server is
+                // encrypted by default (works for LAN + WWAN). The client must trust
+                // the fingerprint / disable verification for self-signed.
+                let host = settings.server.host.clone();
+                let certified = security::generate_self_signed(&host);
+                let tls = security::rustls_config(certified);
+                tracing::warn!(
+                    "No TLS cert configured. Auto-generated a self-signed certificate; \
+                     server is available at https://{}. Configure a trusted cert in \
+                     [server] tls_cert/tls_key for production.",
+                    addr
+                );
+                axum_server::bind_rustls(addr, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            }
         }
     }
 }
