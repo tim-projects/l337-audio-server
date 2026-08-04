@@ -19,6 +19,11 @@ pub struct SendableEngine(pub Mutex<PlayerEngine>);
 
 pub type AppState = Arc<SendableEngine>;
 
+pub async fn setup(axum::Extension(token): axum::Extension<Arc<std::sync::Mutex<String>>>) -> impl IntoResponse {
+    let token = token.lock().expect("token mutex poisoned");
+    Json(token.clone())
+}
+
 fn track_id_missing() -> impl IntoResponse {
     (
         StatusCode::BAD_REQUEST,

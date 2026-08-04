@@ -9,6 +9,7 @@ use crate::player::storage::StorageManager;
 use axum::{
     Router,
     routing::{get, post, put},
+    Extension,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -204,6 +205,7 @@ async fn main() {
     // Build our application with routes
     let mut app = Router::new()
         .route("/health", get(handlers::health))
+        .route("/setup", get(handlers::setup))
         .route("/", get(|| async { "L337 Audio Server" }))
         .route("/player/play", post(handlers::play))
         .route("/player/play/stream", post(handlers::upload_stream))
@@ -222,7 +224,8 @@ async fn main() {
         .route("/player/seek", post(handlers::seek))
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
-        .with_state(shared_state);
+        .with_state(shared_state)
+        .layer(Extension(shared_token.clone()));
 
     // Skip auth layer for Unix socket mode (file permissions provide security).
     if !use_socket {
