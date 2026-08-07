@@ -24,8 +24,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct Settings {
     server: ServerSettings,
     #[serde(default)]
-    dummy: bool,
-    #[serde(default)]
     storage: StorageSettings,
 }
 
@@ -41,6 +39,8 @@ struct ServerSettings {
     tls_key: Option<PathBuf>,
     #[serde(default)]
     transport: Option<String>,
+    #[serde(default)]
+    dummy: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -138,7 +138,7 @@ async fn main() {
         .max_cache_size_bytes
         .unwrap_or(DEFAULT_MAX_POOL);
 
-    let dummy_mode = settings.dummy || std::env::args().any(|a| a == "--dummy");
+    let dummy_mode = settings.server.dummy || std::env::args().any(|a| a == "--dummy");
 
     // Determine transport: CLI flag > config file > default "auto"
     let cli_transport = parse_transport_cli();
@@ -159,7 +159,17 @@ async fn main() {
         );
         PlayerEngine::new_dummy(storage)
     } else {
-        PlayerEngine::new(storage)
+        match PlayerEngine::new(storage) {
+            Ok(engine) => engine,
+            Err(e) => {
+                tracing::error!("Failed to initialize audio device: {}", e);
+                tracing::warn!(
+                    "Falling back to no-audio mode. Pass --dummy to suppress this warning."
+                );
+                let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
+                PlayerEngine::new_dummy(storage)
+            }
+        }
     };
 
     let shared_state: AppState = Arc::new(handlers::SendableEngine(Mutex::new(engine)));
@@ -219,6 +229,7 @@ async fn main() {
             "/player/cache/previous/stream",
             post(handlers::upload_stream),
         )
+        .route("/player/cache/lookup", post(handlers::cache_lookup))
         .route("/player/speed", post(handlers::set_speed))
         .route("/player/volume", post(handlers::set_volume))
         .route("/player/seek", post(handlers::seek))

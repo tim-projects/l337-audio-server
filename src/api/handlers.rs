@@ -12,9 +12,9 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 // Use a simple wrapper to make PlayerEngine safely shareable across tasks.
-// tokio::sync::Mutex<PlayerEngine> is Send+Sync when PlayerEngine is Send+Sync,
-// which it is naturally (cpal::Stream 0.15 is Send+Sync, all inner fields are
-// primitives / Send+Sync types). No unsafe impl needed.
+// tokio::sync::Mutex<PlayerEngine> is Send+Sync because PlayerEngine has an
+// explicit unsafe impl for Send+Sync (cpal::Stream is conservatively !Send
+// even though the underlying OS handle is safe to move between threads).
 pub struct SendableEngine(pub Mutex<PlayerEngine>);
 
 pub type AppState = Arc<SendableEngine>;
@@ -34,11 +34,21 @@ fn track_id_missing() -> impl IntoResponse {
 
 pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> impl IntoResponse {
     if track.track_id.is_empty() || track.stream_url.is_empty() {
-        return track_id_missing().into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "track_id and stream_url are required"})),
+        )
+            .into_response();
     }
     let mut engine = state.0.lock().await;
-    engine.play_track(track).await;
-    StatusCode::OK.into_response()
+    match engine.play_track(track).await {
+        Ok(()) => Json(serde_json::json!({"ok": true, "state": engine.state})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
@@ -180,8 +190,24 @@ pub async fn set_settings(
 }
 
 /// Unauthenticated liveness probe used by clients to detect server reachability.
+///
+/// Returns JSON so clients can also discover server capabilities (for example,
+/// whether yt-dlp is installed and available for URL resolution).
 pub async fn health() -> impl IntoResponse {
-    StatusCode::OK
+    let has_ytdlp = std::process::Command::new("yt-dlp")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "capabilities": {
+            "yt_dlp": has_ytdlp,
+        }
+    })).into_response()
 }
 
 /// Streaming upload of raw audio bytes into an active slot. The client pushes
@@ -260,4 +286,32 @@ pub async fn upload_stream(
         }
     }
     StatusCode::OK.into_response()
+}
+
+/// Look up which of the requested track_ids are present in the cache.
+///
+/// Request body: `{"track_ids": ["<sha1>", ...]}`
+/// Response: `{"cached": ["<sha1>", ...]}`
+pub async fn cache_lookup(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let track_ids = payload
+        .get("track_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let engine = state.0.lock().await;
+    let manifest = engine.storage.manifest.lock().await;
+    let cached: Vec<String> = track_ids
+        .into_iter()
+        .filter(|id| manifest.contains_key(id))
+        .collect();
+
+    Json(serde_json::json!({"cached": cached})).into_response()
 }

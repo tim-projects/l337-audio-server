@@ -50,6 +50,7 @@ pub struct PlayerStatus {
     pub prev_cached: bool,
     pub position_sec: Option<u64>,
     pub duration_sec: Option<u64>,
+    pub audio_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

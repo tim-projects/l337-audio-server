@@ -58,13 +58,13 @@ unsafe impl Send for PlayerEngine {}
 unsafe impl Sync for PlayerEngine {}
 
 impl PlayerEngine {
-    pub fn new(storage: StorageManager) -> Self {
-        let (stream, device_sample_rate) = Self::init_audio_device();
+    pub fn new(storage: StorageManager) -> Result<Self, String> {
+        let (stream, device_sample_rate) = Self::init_audio_device()?;
 
         let buffer = Arc::new(Mutex::new(AudioBuffer::new(device_sample_rate, 0)));
         let volume = Arc::new(Mutex::new(1.0));
 
-        Self {
+        Ok(Self {
             stream,
             audio_buffer: buffer,
             volume: volume.clone(),
@@ -77,7 +77,7 @@ impl PlayerEngine {
             position_sec: 0,
             file_sample_rate: 0,
             channels: 0,
-        }
+        })
     }
 
     pub fn new_dummy(storage: StorageManager) -> Self {
@@ -97,31 +97,23 @@ impl PlayerEngine {
         }
     }
 
-    fn init_audio_device() -> (Option<cpal::Stream>, u32) {
-        let device = match cpal::default_host().default_output_device() {
-            Some(d) => d,
-            None => {
-                eprintln!(
-                    "FATAL: No audio output device available. A working audio output \
-                     (e.g. PipeWire/ALSA) is required to serve audio. Re-run with --dummy \
-                     to start without audio (testing only)."
-                );
-                std::process::exit(1);
-            }
-        };
+    fn init_audio_device() -> Result<(Option<cpal::Stream>, u32), String> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| {
+                "No audio output device available. A working audio output \
+                 (e.g. PipeWire/ALSA) is required to serve audio. Re-run with --dummy \
+                 to start without audio (testing only).".to_string()
+            })?;
 
-        let mut supported = match device.supported_output_configs() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("FATAL: Failed to query audio output configs: {}", e);
-                std::process::exit(1);
-            }
-        };
+        let mut supported = device
+            .supported_output_configs()
+            .map_err(|e| format!("Failed to query audio output configs: {}", e))?;
 
         let config = supported
             .find(|c| c.sample_format() == cpal::SampleFormat::F32)
             .or_else(|| supported.next())
-            .expect("no supported audio output config");
+            .ok_or_else(|| "no supported audio output config".to_string())?;
 
         let sample_rate = config.max_sample_rate().0;
         let _sample_format = config.sample_format();
@@ -165,22 +157,28 @@ impl PlayerEngine {
                 if let Err(e) = s.play() {
                     error!("Failed to start audio stream: {}", e);
                 }
-                (Some(s), sample_rate)
+                Ok((Some(s), sample_rate))
             }
-            Err(e) => {
-                eprintln!(
-                    "FATAL: Audio device found but could not initialize a stream ({}). A working audio \
-                     output is required. Re-run with --dummy to start without audio (testing only).",
-                    e
-                );
-                std::process::exit(1);
-            }
+            Err(e) => Err(
+                format!("Audio device found but could not initialize a stream ({}). A working audio \
+                      output is required. Re-run with --dummy to start without audio (testing only).", e)
+            ),
         }
     }
 
-    pub async fn play_track(&mut self, track: Track) {
+    pub async fn play_track(&mut self, track: Track) -> Result<(), String> {
         self.stop();
         self.current_track = Some(track.clone());
+
+        let cached_path = self.storage.get_path_for_track(&track.track_id);
+        if cached_path.exists() {
+            info!("play_track: cache hit for {}", track.track_id);
+            let slot = self.storage.get_active_slot_path("current");
+            let _ = fs::copy(&cached_path, &slot).await;
+            self.load_and_play("current").await;
+            self.storage.update_access(&track.track_id, 0).await;
+            return Ok(());
+        }
 
         let path = self.storage.get_active_slot_path("current");
         info!(
@@ -191,7 +189,7 @@ impl PlayerEngine {
 
         if let Err(e) = download_stream(&track.stream_url, &path).await {
             error!("Failed to download track: {}", e);
-            return;
+            return Err(format!("Failed to download track: {}", e));
         }
 
         match tokio::fs::metadata(&path).await {
@@ -200,11 +198,15 @@ impl PlayerEngine {
                 meta.len(),
                 path.display()
             ),
-            Err(e) => error!("play_track: slot file missing after download: {}", e),
+            Err(e) => {
+                error!("play_track: slot file missing after download: {}", e);
+                return Err(format!("Slot file missing after download: {}", e));
+            }
         }
 
         self.load_and_play("current").await;
         self.persist_slot(&track.track_id, &path).await;
+        Ok(())
     }
 
     pub async fn play_pushed(
@@ -477,6 +479,7 @@ impl PlayerEngine {
             prev_cached,
             position_sec,
             duration_sec: self.duration_sec,
+            audio_available: self.stream.is_some(),
         }
     }
 }
