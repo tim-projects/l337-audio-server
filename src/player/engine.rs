@@ -7,10 +7,12 @@ use rubato::SincInterpolationParameters;
 use rubato::SincInterpolationType;
 use rubato::WindowFunction;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tracing::{error, info};
 
 struct AudioBuffer {
@@ -35,6 +37,12 @@ impl AudioBuffer {
     }
 }
 
+struct StreamingPlayback {
+    download_handle: tokio::task::JoinHandle<()>,
+    decode_handle: tokio::task::JoinHandle<()>,
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct PlayerEngine {
     stream: Option<cpal::Stream>,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
@@ -48,6 +56,7 @@ pub struct PlayerEngine {
     pub position_sec: u64,
     file_sample_rate: u32,
     channels: u16,
+    streaming: Option<StreamingPlayback>,
 }
 
 // SAFETY: `cpal::Stream` is a handle to an OS audio stream. On all supported
@@ -77,6 +86,7 @@ impl PlayerEngine {
             position_sec: 0,
             file_sample_rate: 0,
             channels: 0,
+            streaming: None,
         })
     }
 
@@ -94,6 +104,7 @@ impl PlayerEngine {
             position_sec: 0,
             file_sample_rate: 0,
             channels: 0,
+            streaming: None,
         }
     }
 
@@ -177,6 +188,20 @@ impl PlayerEngine {
             let _ = fs::copy(&cached_path, &slot).await;
             self.load_and_play("current").await;
             self.storage.update_access(&track.track_id, 0).await;
+            return Ok(());
+        }
+
+        if is_youtube_url(&track.stream_url) {
+            info!("play_track: YouTube streaming for {}", track.stream_url);
+            if let Err(e) = self.start_streaming_playback(&track.stream_url).await {
+                error!("YouTube streaming failed, falling back to download: {}", e);
+                let path = self.storage.get_active_slot_path("current");
+                if let Err(e) = download_stream(&track.stream_url, &path).await {
+                    return Err(format!("Failed to download track: {}", e));
+                }
+                self.load_and_play("current").await;
+                self.persist_slot(&track.track_id, &path).await;
+            }
             return Ok(());
         }
 
@@ -334,12 +359,53 @@ impl PlayerEngine {
         if let Some(stream) = self.stream.take() {
             drop(stream);
         }
+        if let Some(streaming) = self.streaming.take() {
+            streaming.cancel.store(true, Ordering::SeqCst);
+            streaming.download_handle.abort();
+            streaming.decode_handle.abort();
+        }
         let mut buf = self.audio_buffer.lock().unwrap();
         buf.pcm.clear();
         buf.read_pos = 0;
         drop(buf);
         self.position_sec = 0;
         self.state = PlayerStateLabel::Stopped;
+    }
+
+    async fn start_streaming_playback(&mut self, url: &str) -> Result<(), String> {
+        let path = self.storage.get_active_slot_path("current");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let direct_url = resolve_youtube_stream_url(url)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let dl_path = path.clone();
+        let dl_url = direct_url.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let download_cancel = cancel.clone();
+
+        let download_handle = tokio::spawn(async move {
+            let _ = stream_http_to_file(&dl_url, &dl_path, download_cancel).await;
+        });
+
+        let audio_buffer = self.audio_buffer.clone();
+        let decode_path = path.clone();
+        let decode_cancel = cancel.clone();
+        let decode_handle = tokio::task::spawn_blocking(move || {
+            if let Err(e) = streaming_decode_sync(decode_path, audio_buffer, decode_cancel) {
+                error!("streaming decode task failed: {}", e);
+            }
+        });
+
+        self.streaming = Some(StreamingPlayback {
+            download_handle,
+            decode_handle,
+            cancel,
+        });
+
+        self.state = PlayerStateLabel::Playing;
+        Ok(())
     }
 
     pub fn set_speed(&mut self, speed: f32) {
@@ -355,6 +421,11 @@ impl PlayerEngine {
     }
 
     pub fn seek(&mut self, position: u64) {
+        if self.streaming.is_some() {
+            tracing::warn!("seek ignored during streaming playback");
+            return;
+        }
+
         let path = self.storage.get_active_slot_path("current");
 
         let bytes = match std::fs::read(&path) {
@@ -609,9 +680,10 @@ pub async fn download_stream(
     }
 
     if is_youtube_url(url) {
-        return download_via_ytdlp(url, dest)
+        let direct_url = resolve_youtube_stream_url(url).await?;
+        return stream_http_to_file(&direct_url, dest, Arc::new(AtomicBool::new(false)))
             .await
-            .map_err(|e| format!("yt-dlp resolution failed for {url}: {e}").into());
+            .map_err(|e| format!("yt-dlp stream failed for {url}: {e}").into());
     }
 
     let response = reqwest::get(url).await?;
@@ -694,3 +766,239 @@ async fn download_via_ytdlp(
     }
     Ok(())
 }
+
+/// Use `yt-dlp -g` to resolve a YouTube watch URL to a direct audio stream URL.
+async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let output = Command::new("yt-dlp")
+        .arg("--no-config")
+        .arg("--no-warnings")
+        .arg("-g")
+        .arg("-f")
+        .arg("bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio")
+        .arg("--no-playlist")
+        .arg(url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err("yt-dlp -g failed".into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stream_url = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("yt-dlp -g returned empty output")?
+        .trim()
+        .to_string();
+
+    Ok(stream_url)
+}
+
+/// Stream an HTTP response directly to `dest`, supporting cancellation.
+async fn stream_http_to_file(
+    url: &str,
+    dest: &PathBuf,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use futures_util::StreamExt;
+
+    let response = reqwest::get(url).await?;
+    if !response.status().is_success() {
+        return Err(format!("fetch failed ({}): {}", response.status(), url).into());
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest)
+        .await?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(item) = stream.next().await {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let chunk = item?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+/// Adapter that lets Symphonia read from a standard file as a `MediaSource`.
+struct FileSource {
+    file: std::fs::File,
+}
+
+impl std::io::Read for FileSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Seek for FileSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+impl symphonia::core::io::MediaSource for FileSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.file.metadata().ok().map(|m| m.len())
+    }
+}
+
+/// Synchronous decode loop for streaming playback.
+///
+/// Waits for the download to produce data, then incrementally decodes packets
+/// and appends PCM into `audio_buffer` for the cpal callback to consume.
+fn streaming_decode_sync(
+    path: PathBuf,
+    audio_buffer: Arc<Mutex<AudioBuffer>>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut file_size: u64 = 0;
+    let mut stall_cycles: u32 = 0;
+
+    for _ in 0..120 {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            file_size = meta.len();
+            if file_size > 0 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    if file_size == 0 {
+        return Err("stream file never received data".into());
+    }
+
+    let mut probed = None;
+    for attempt in 0..60 {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let source = FileSource { file };
+        let mss = symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
+        let hint = symphonia::core::probe::Hint::new();
+        match symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &Default::default(),
+            &Default::default(),
+        ) {
+            Ok(p) => {
+                probed = Some(p);
+                break;
+            }
+            Err(_) if attempt < 59 => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => return Err(format!("format probe failed after retries: {e}")),
+        }
+    }
+
+    let probed = probed.unwrap();
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or("no default track in stream")?;
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let decoder_opts = Default::default();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &decoder_opts)
+        .map_err(|e| format!("decoder init: {e}"))?;
+
+    let mut sample_buf = None;
+    let mut last_file_size = file_size;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        match format.next_packet() {
+            Ok(packet) => {
+                if packet.track_id() != track_id {
+                    continue;
+                }
+
+                match decoder.decode(&packet) {
+                    Ok(audio_buf) => {
+                        let spec = *audio_buf.spec();
+                        if sample_buf.is_none() {
+                            sample_buf = Some(symphonia::core::audio::SampleBuffer::<f32>::new(
+                                audio_buf.capacity() as u64,
+                                spec,
+                            ));
+                            let mut ab = audio_buffer.lock().unwrap();
+                            ab.channels = spec.channels.count() as u16;
+                            ab.file_sample_rate = spec.rate;
+                        }
+
+                        if let Some(buf) = &mut sample_buf {
+                            buf.copy_interleaved_ref(audio_buf);
+                            let samples = buf.samples();
+                            let mut ab = audio_buffer.lock().unwrap();
+                            ab.pcm.extend_from_slice(samples);
+                        }
+
+                        stall_cycles = 0;
+                    }
+                    Err(symphonia::core::errors::Error::IoError(_)) => {
+                        stall_cycles += 1;
+                        if stall_cycles > 20 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    Err(symphonia::core::errors::Error::ResetRequired) => {
+                        let decoder_opts = Default::default();
+                        decoder = symphonia::default::get_codecs()
+                            .make(&codec_params, &decoder_opts)
+                            .map_err(|e| format!("decoder reset: {e}"))?;
+                    }
+                    Err(e) => {
+                        error!("streaming decode error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            Err(symphonia::core::errors::Error::IoError(_)) => {
+                let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if current_size > last_file_size {
+                    last_file_size = current_size;
+                    stall_cycles = 0;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                } else if stall_cycles > 20 {
+                    break;
+                } else {
+                    stall_cycles += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            Err(e) => {
+                error!("streaming packet error: {:?}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+

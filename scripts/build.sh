@@ -65,3 +65,14 @@ cp -f "$SRC" bin/l337-audio-server
 chmod +x bin/l337-audio-server
 
 echo "Build complete. Binary available at bin/l337-audio-server"
+
+# Run a fast compilation check to catch breakage before deployment.
+if [ -n "$TARGET" ]; then
+    echo "Running cargo check for target $TARGET ..."
+    cargo check --target "$TARGET"
+else
+    echo "Running cargo check ..."
+    cargo check
+fi
+
+echo "[OK] Build and check complete"
