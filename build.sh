@@ -7,9 +7,12 @@
 # Usage:
 #   ./build.sh                                          # native build (Linux/macOS)
 #   ./build.sh --debug                                  # debug build with symbols
+#   ./build.sh --release-debuginfo                      # release + debug symbols
+#   ./build.sh --no-check                               # skip cargo check
 #   ./build.sh --target aarch64-unknown-linux-gnu        # cross-build
 #   ./build.sh --cargo-home /path/to/cargo               # use existing cargo
 #   ./build.sh --cargo-bin /path/to/cargo/bin            # add cargo to PATH
+#   ./build.sh --target-dir /path/to/target              # override cargo target dir
 #   ./build.sh --help
 set -euo pipefail
 
@@ -22,8 +25,11 @@ Usage: $0 [OPTIONS]
 Options:
   --target TARGET        Cross-build for TARGET (passed to cargo)
   --debug                Build debug binary with symbols
+  --release-debuginfo    Release build with debug symbols
+  --no-check             Skip post-build cargo check
   --cargo-home DIR       Use existing CARGO_HOME instead of /tmp/cargo
   --cargo-bin DIR        Add cargo bin dir to PATH
+  --target-dir DIR       Override cargo target directory
   -h, --help             Show this help message
 
 Platforms:
@@ -36,14 +42,20 @@ EOF
 TARGET=""
 CARGO_HOME_ARG=""
 CARGO_BIN_ARG=""
+TARGET_DIR_ARG=""
 DEBUG_BUILD=0
+RELEASE_DEBUGINFO=0
+NO_CHECK=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
         --debug) DEBUG_BUILD=1; shift ;;
+        --release-debuginfo) RELEASE_DEBUGINFO=1; shift ;;
+        --no-check) NO_CHECK=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
+        --target-dir) TARGET_DIR_ARG="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -70,11 +82,20 @@ case "$OS" in
         if [ "$DEBUG_BUILD" -eq 1 ]; then
             BUILD_ARGS+=(--debug)
         fi
+        if [ "$RELEASE_DEBUGINFO" -eq 1 ]; then
+            BUILD_ARGS+=(--release-debuginfo)
+        fi
+        if [ "$NO_CHECK" -eq 1 ]; then
+            BUILD_ARGS+=(--no-check)
+        fi
         if [ -n "$CARGO_HOME_ARG" ]; then
             BUILD_ARGS+=(--cargo-home "$CARGO_HOME_ARG")
         fi
         if [ -n "$CARGO_BIN_ARG" ]; then
             BUILD_ARGS+=(--cargo-bin "$CARGO_BIN_ARG")
+        fi
+        if [ -n "$TARGET_DIR_ARG" ]; then
+            BUILD_ARGS+=(--target-dir "$TARGET_DIR_ARG")
         fi
         "$BUILD_SCRIPT" "${BUILD_ARGS[@]}"
         ;;

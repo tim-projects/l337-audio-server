@@ -11,9 +11,12 @@
 # Usage:
 #   ./scripts/build.sh                                       # native release build
 #   ./scripts/build.sh --debug                               # debug build with symbols
+#   ./scripts/build.sh --release-debuginfo                   # release + debug symbols
+#   ./scripts/build.sh --no-check                            # skip cargo check
 #   ./scripts/build.sh --target aarch64-unknown-linux-gnu     # cross build
 #   ./scripts/build.sh --cargo-home /path/to/cargo            # use existing cargo
 #   ./scripts/build.sh --cargo-bin /path/to/cargo/bin         # add cargo to PATH
+#   ./scripts/build.sh --target-dir /path/to/target           # override cargo target dir
 set -e
 
 LOG_FILE="/tmp/l337-audio-server-build.log"
@@ -23,14 +26,20 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Build started"
 TARGET=""
 CARGO_HOME_ARG=""
 CARGO_BIN_ARG=""
+TARGET_DIR_ARG=""
 DEBUG_BUILD=0
+RELEASE_DEBUGINFO=0
+NO_CHECK=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
         --debug) DEBUG_BUILD=1; shift ;;
+        --release-debuginfo) RELEASE_DEBUGINFO=1; shift ;;
+        --no-check) NO_CHECK=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
+        --target-dir) TARGET_DIR_ARG="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -47,8 +56,8 @@ if [ -n "$CARGO_BIN_ARG" ]; then
 fi
 
 # Build into /tmp so we never depend on an in-tree ./target (which can be a
-# broken mount on some shared setups).
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/l337-build}"
+# broken mount on some shared setups). Caller can override with --target-dir.
+export CARGO_TARGET_DIR="${TARGET_DIR_ARG:-/tmp/l337-build}"
 
 # If cargo is not on PATH, install a minimal toolchain into /tmp/cargo/.
 if ! command -v cargo >/dev/null 2>&1; then
@@ -78,6 +87,10 @@ else
         echo "Building L337 Audio Server (debug) in $CARGO_TARGET_DIR ..."
         cargo build
         SRC="$CARGO_TARGET_DIR/debug/l337-audio-server"
+    elif [ "$RELEASE_DEBUGINFO" -eq 1 ]; then
+        echo "Building L337 Audio Server (release with debuginfo) in $CARGO_TARGET_DIR ..."
+        RUSTFLAGS="${RUSTFLAGS:-} -C debuginfo=1" cargo build --release
+        SRC="$CARGO_TARGET_DIR/release/l337-audio-server"
     else
         echo "Building L337 Audio Server (release) in $CARGO_TARGET_DIR ..."
         cargo build --release
@@ -97,12 +110,15 @@ chmod +x bin/l337-audio-server
 echo "Build complete. Binary available at bin/l337-audio-server"
 
 # Run a fast compilation check to catch breakage before deployment.
-if [ -n "$TARGET" ]; then
-    echo "Running cargo check for target $TARGET ..."
-    cargo check --target "$TARGET"
+if [ "$NO_CHECK" -ne 1 ]; then
+    if [ -n "$TARGET" ]; then
+        echo "Running cargo check for target $TARGET ..."
+        cargo check --target "$TARGET"
+    else
+        echo "Running cargo check ..."
+        cargo check
+    fi
+    echo "[OK] Build and check complete"
 else
-    echo "Running cargo check ..."
-    cargo check
+    echo "[OK] Build complete (check skipped)"
 fi
-
-echo "[OK] Build and check complete"
