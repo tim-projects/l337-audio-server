@@ -6,6 +6,7 @@
 #
 # Usage:
 #   ./build.sh                                          # native build (Linux/macOS)
+#   ./build.sh --debug                                  # debug build with symbols
 #   ./build.sh --target aarch64-unknown-linux-gnu        # cross-build
 #   ./build.sh --cargo-home /path/to/cargo               # use existing cargo
 #   ./build.sh --cargo-bin /path/to/cargo/bin            # add cargo to PATH
@@ -20,6 +21,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --target TARGET        Cross-build for TARGET (passed to cargo)
+  --debug                Build debug binary with symbols
   --cargo-home DIR       Use existing CARGO_HOME instead of /tmp/cargo
   --cargo-bin DIR        Add cargo bin dir to PATH
   -h, --help             Show this help message
@@ -34,10 +36,12 @@ EOF
 TARGET=""
 CARGO_HOME_ARG=""
 CARGO_BIN_ARG=""
+DEBUG_BUILD=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
+        --debug) DEBUG_BUILD=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
         -h|--help) usage ;;
@@ -62,6 +66,9 @@ case "$OS" in
         BUILD_ARGS=()
         if [ -n "$TARGET" ]; then
             BUILD_ARGS+=(--target "$TARGET")
+        fi
+        if [ "$DEBUG_BUILD" -eq 1 ]; then
+            BUILD_ARGS+=(--debug)
         fi
         if [ -n "$CARGO_HOME_ARG" ]; then
             BUILD_ARGS+=(--cargo-home "$CARGO_HOME_ARG")

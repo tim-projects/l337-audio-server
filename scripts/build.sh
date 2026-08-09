@@ -10,6 +10,7 @@
 #
 # Usage:
 #   ./scripts/build.sh                                       # native release build
+#   ./scripts/build.sh --debug                               # debug build with symbols
 #   ./scripts/build.sh --target aarch64-unknown-linux-gnu     # cross build
 #   ./scripts/build.sh --cargo-home /path/to/cargo            # use existing cargo
 #   ./scripts/build.sh --cargo-bin /path/to/cargo/bin         # add cargo to PATH
@@ -22,10 +23,12 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Build started"
 TARGET=""
 CARGO_HOME_ARG=""
 CARGO_BIN_ARG=""
+DEBUG_BUILD=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
+        --debug) DEBUG_BUILD=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -71,9 +74,15 @@ if [ -n "$TARGET" ]; then
     cargo build --release --target "$TARGET"
     SRC="$CARGO_TARGET_DIR/$TARGET/release/l337-audio-server"
 else
-    echo "Building L337 Audio Server (release) in $CARGO_TARGET_DIR ..."
-    cargo build --release
-    SRC="$CARGO_TARGET_DIR/release/l337-audio-server"
+    if [ "$DEBUG_BUILD" -eq 1 ]; then
+        echo "Building L337 Audio Server (debug) in $CARGO_TARGET_DIR ..."
+        cargo build
+        SRC="$CARGO_TARGET_DIR/debug/l337-audio-server"
+    else
+        echo "Building L337 Audio Server (release) in $CARGO_TARGET_DIR ..."
+        cargo build --release
+        SRC="$CARGO_TARGET_DIR/release/l337-audio-server"
+    fi
 fi
 
 if [ ! -f "$SRC" ]; then
