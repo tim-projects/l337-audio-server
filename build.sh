@@ -5,8 +5,10 @@
 # script under scripts/.
 #
 # Usage:
-#   ./build.sh                       # native build (Linux/macOS)
-#   ./build.sh --target aarch64-unknown-linux-gnu   # cross-build
+#   ./build.sh                                          # native build (Linux/macOS)
+#   ./build.sh --target aarch64-unknown-linux-gnu        # cross-build
+#   ./build.sh --cargo-home /path/to/cargo               # use existing cargo
+#   ./build.sh --cargo-bin /path/to/cargo/bin            # add cargo to PATH
 #   ./build.sh --help
 set -euo pipefail
 
@@ -18,6 +20,8 @@ Usage: $0 [OPTIONS]
 
 Options:
   --target TARGET        Cross-build for TARGET (passed to cargo)
+  --cargo-home DIR       Use existing CARGO_HOME instead of /tmp/cargo
+  --cargo-bin DIR        Add cargo bin dir to PATH
   -h, --help             Show this help message
 
 Platforms:
@@ -27,9 +31,15 @@ EOF
     exit 0
 }
 
+TARGET=""
+CARGO_HOME_ARG=""
+CARGO_BIN_ARG=""
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
+        --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
+        --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -49,11 +59,17 @@ case "$OS" in
         if [ ! -x "$BUILD_SCRIPT" ]; then
             fail "Build script not found or not executable: $BUILD_SCRIPT"
         fi
-        if [ -n "${TARGET:-}" ]; then
-            "$BUILD_SCRIPT" --target "$TARGET"
-        else
-            "$BUILD_SCRIPT"
+        BUILD_ARGS=()
+        if [ -n "$TARGET" ]; then
+            BUILD_ARGS+=(--target "$TARGET")
         fi
+        if [ -n "$CARGO_HOME_ARG" ]; then
+            BUILD_ARGS+=(--cargo-home "$CARGO_HOME_ARG")
+        fi
+        if [ -n "$CARGO_BIN_ARG" ]; then
+            BUILD_ARGS+=(--cargo-bin "$CARGO_BIN_ARG")
+        fi
+        "$BUILD_SCRIPT" "${BUILD_ARGS[@]}"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         info "Detected Windows. Please run the PowerShell build script instead:"
