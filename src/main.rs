@@ -62,9 +62,28 @@ fn socket_path() -> PathBuf {
         .join("l337.sock")
 }
 
-/// Remove a stale Unix socket file if it exists.
-fn remove_stale_socket(path: &std::path::Path) {
+/// Check whether a Unix socket at `path` is actively accepting connections.
+#[cfg(unix)]
+fn socket_is_active(path: &std::path::Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    UnixStream::connect(path).is_ok()
+}
+
+/// Remove a stale Unix socket file if it exists and is not actively in use.
+///
+/// Returns `true` if the file was removed, `false` if it was actively serving.
+#[cfg(unix)]
+fn remove_stale_socket(path: &std::path::Path) -> bool {
+    if path.exists() && socket_is_active(path) {
+        return false;
+    }
     let _ = std::fs::remove_file(path);
+    true
+}
+
+#[cfg(not(unix))]
+fn remove_stale_socket(_path: &std::path::Path) -> bool {
+    true
 }
 
 fn parse_transport_cli() -> Option<String> {
@@ -122,6 +141,17 @@ async fn main() {
     // Initialize the platform-specific subsystem (runtime dirs, audio env, etc.).
     platform::init();
 
+    // Acquire the single-instance lock before loading config or opening audio.
+    // The guard is held for the lifetime of the process; dropping it on exit
+    // removes the lock file.
+    let _instance_guard = match platform::single_instance::InstanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::error!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Ensure a config file exists in the official config directory
     // (/etc/l337-audio-server) so a fresh install starts cleanly instead of
     // crashing on a missing [server] section.
@@ -155,7 +185,7 @@ async fn main() {
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
     let engine = if dummy_mode {
         tracing::warn!(
-            "Running in DUMMY output mode (--dummy). No audio will be produced. Testing only."
+            "Running in DUMMY output mode. No audio will be produced. Testing only."
         );
         PlayerEngine::new_dummy(storage)
     } else {
@@ -163,11 +193,7 @@ async fn main() {
             Ok(engine) => engine,
             Err(e) => {
                 tracing::error!("Failed to initialize audio device: {}", e);
-                tracing::warn!(
-                    "Falling back to no-audio mode. Pass --dummy to suppress this warning."
-                );
-                let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
-                PlayerEngine::new_dummy(storage)
+                std::process::exit(1);
             }
         }
     };
@@ -249,7 +275,14 @@ async fn main() {
     // Serve over Unix socket or TCP/HTTPS.
     if use_socket {
         let path = socket_path();
-        remove_stale_socket(&path);
+        if !remove_stale_socket(&path) {
+            tracing::error!(
+                "Unix socket {} is actively in use by another server. \
+                 Refusing to remove it to prevent connection interception.",
+                path.display()
+            );
+            std::process::exit(1);
+        }
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let listener =
             std::os::unix::net::UnixListener::bind(&path).expect("Failed to bind Unix socket");
@@ -273,6 +306,15 @@ async fn main() {
         let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
             .parse()
             .expect("Invalid address/port in config");
+
+        if !tcp_port_available(addr) {
+            tracing::error!(
+                "TCP port {} is already in use. Another instance may be running, \
+                 or another service is bound to that port.",
+                addr
+            );
+            std::process::exit(1);
+        }
 
         match (
             settings.server.tls_cert.clone(),
@@ -420,4 +462,9 @@ fn load_or_create_token() -> String {
         generated
     );
     generated
+}
+
+/// Probe whether `addr` can be bound. Returns `true` if the port is available.
+fn tcp_port_available(addr: SocketAddr) -> bool {
+    std::net::TcpListener::bind(addr).is_ok()
 }

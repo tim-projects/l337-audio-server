@@ -11,6 +11,7 @@
 /// - `windows` — Windows / service (placeholder)
 
 pub mod common;
+pub mod single_instance;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

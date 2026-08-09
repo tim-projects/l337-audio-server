@@ -1214,6 +1214,7 @@ dependencies = [
  "cpal",
  "dirs",
  "futures-util",
+ "libc",
  "libloading",
  "rand 0.8.7",
  "rcgen",
