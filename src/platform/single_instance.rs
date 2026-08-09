@@ -50,6 +50,13 @@ impl InstanceLock {
 
     #[cfg(unix)]
     fn try_acquire_at(lock_path: &PathBuf) -> Result<Self, AcquireError> {
+        if let Some(parent) = lock_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::debug!("Lock path {}: cannot create parent dir: {}", lock_path.display(), e);
+                return Err(AcquireError::Unavailable);
+            }
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -83,6 +90,13 @@ impl InstanceLock {
 
     #[cfg(target_os = "windows")]
     fn try_acquire_at(lock_path: &PathBuf) -> Result<Self, AcquireError> {
+        if let Some(parent) = lock_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::debug!("Lock path {}: cannot create parent dir: {}", lock_path.display(), e);
+                return Err(AcquireError::Unavailable);
+            }
+        }
+
         use std::os::windows::fs::OpenOptionsExt;
 
         let file = OpenOptions::new()
