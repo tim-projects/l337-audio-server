@@ -6,18 +6,23 @@
 # cargo/rustc). This keeps the install free of build toolchains, so target
 # systems without cargo can still run the server.
 #
-# Two modes are supported:
+# Three modes are supported:
 #   1. System service (default)  - runs as a dedicated, unprivileged `l337`
 #      system user (MPD-style), managed by root. Best for an always-on box that
-#      serves audio to clients on the LAN/WWAN.
+#      serves audio to clients on the LAN/WWAN. Detects PipeWire (system) or
+#      falls back to ALSA.
 #   2. User service              - a per-user instance under `systemd --user`,
 #      owned by whichever user enables it (e.g. the `l337` user after linger).
+#      Recommended for desktop machines with a PipeWire session.
+#   3. Auto (--auto)             - detects the audio backend and chooses the
+#      appropriate service type automatically.
 #
 # Usage:
-#   sudo ./scripts/install-systemd.sh            # system service as `l337` user
+#   sudo ./scripts/install-systemd.sh            # system service (auto-detect backend)
 #   ./scripts/install-systemd.sh --user          # user service for $USER
 #   sudo ./scripts/install-systemd.sh --update   # in-place binary upgrade (no
 #                                               #   config/state/cache touched)
+#   ./scripts/install-systemd.sh --auto          # auto-detect and choose service type
 #
 # To build the binary first (requires cargo):
 #   ./scripts/build.sh
@@ -38,12 +43,61 @@ VERIFICATION_WAS_MISSING_PACTL=false
 VERIFICATION_WAS_MISSING_PWCLI=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${1:-system}"
+MODE="${1:-auto}"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+
+# ── Audio backend detection ──────────────────────────────────────────────
+
+has_desktop_session() {
+    [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
+}
+
+check_desktop_pipewire() {
+    if ! has_desktop_session; then
+        return 1
+    fi
+    if [ -n "${SUDO_USER:-}" ]; then
+        local real_user="${SUDO_USER}"
+        local real_uid
+        real_uid=$(id -u "$real_user" 2>/dev/null || echo "")
+        if [ -z "$real_uid" ]; then
+            return 1
+        fi
+        local runtime_dir="/run/user/$real_uid"
+        if [ ! -d "$runtime_dir" ]; then
+            return 1
+        fi
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" \
+            PIPEWIRE_RUNTIME_DIR="$runtime_dir" \
+            pactl info &>/dev/null 2>&1
+    else
+        command -v pactl &>/dev/null && pactl info &>/dev/null 2>&1
+    fi
+}
+
+check_system_pipewire() {
+    systemctl is-active --quiet pipewire.service 2>/dev/null
+}
+
+check_alsa_available() {
+    [ -d /dev/snd ] && ls /dev/snd/pcmC* 2>/dev/null | grep -q .
+}
+
+detect_audio_backend() {
+    if check_desktop_pipewire; then
+        echo "desktop-pipewire"
+    elif check_system_pipewire; then
+        echo "pipewire-system"
+    elif check_alsa_available; then
+        echo "alsa"
+    else
+        echo "none"
+    fi
+}
 
 # The service was historically named `l337-audio.service` (both system and
 # user scopes). If an old unit with that name is still enabled/running, stop,
@@ -70,20 +124,34 @@ migrate_old_service_name() {
 }
 
 write_system_unit() {
+    local audio_backend="${1:-alsa}"
+
+    local after_pipewire=""
+    local env_runtime=""
+    local exec_start_pre=""
+
+    if [ "$audio_backend" = "pipewire-system" ]; then
+        after_pipewire="After=pipewire.service
+Wants=pipewire.service"
+        env_runtime="Environment=XDG_RUNTIME_DIR=/run/l337-audio-server"
+        exec_start_pre="ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh"
+    fi
+
     cat > "$SYSTEM_SERVICE" <<EOF
 [Unit]
 Description=L337 Audio Server
 Documentation=https://github.com/l337-audio-server
 After=network-online.target sound.target
 Wants=network-online.target
+${after_pipewire}
 
 [Service]
 Type=simple
 User=$USER_NAME
 Group=$GROUP_NAME
 WorkingDirectory=$INSTALL_DIR
-Environment=XDG_RUNTIME_DIR=/run/l337-audio-server
-ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh
+${env_runtime}
+${exec_start_pre}
 ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
@@ -388,6 +456,7 @@ test_audio_playback() {
 }
 
 verify_installation() {
+    local audio_backend="${1:-pipewire-system}"
     echo "---------------------------------------------------------------------"
     echo "POST-INSTALL VERIFICATION"
     echo "---------------------------------------------------------------------"
@@ -423,24 +492,34 @@ verify_installation() {
     echo "---------------------------------------------------------------------"
     echo
 
-    if command -v pactl &>/dev/null; then
-        echo "Checking PipeWire sinks (as $USER_NAME)..."
-        if sudo -u "$USER_NAME" pactl list sinks 2>/dev/null | grep -q .; then
-            ok "PipeWire sinks found:"
-            sudo -u "$USER_NAME" pactl list sinks 2>/dev/null | head -20
+    if [ "$audio_backend" = "pipewire-system" ]; then
+        if command -v pactl &>/dev/null; then
+            echo "Checking PipeWire sinks (as $USER_NAME)..."
+            if sudo -u "$USER_NAME" pactl list sinks 2>/dev/null | grep -q .; then
+                ok "PipeWire sinks found:"
+                sudo -u "$USER_NAME" pactl list sinks 2>/dev/null | head -20
+            else
+                warn "No PipeWire sinks found. Audio may still work via ALSA or other backends."
+            fi
+        elif command -v pw-cli &>/dev/null; then
+            echo "Checking PipeWire nodes (as $USER_NAME)..."
+            if sudo -u "$USER_NAME" pw-cli ls Node 2>/dev/null | grep -q .; then
+                ok "PipeWire nodes found:"
+                sudo -u "$USER_NAME" pw-cli ls Node 2>/dev/null | head -20
+            else
+                warn "No PipeWire nodes found. Audio may still work via ALSA or other backends."
+            fi
         else
-            warn "No PipeWire sinks found. Audio may still work via ALSA or other backends."
+            warn "Neither pactl nor pw-cli found after install. Cannot verify PipeWire audio node."
         fi
-    elif command -v pw-cli &>/dev/null; then
-        echo "Checking PipeWire nodes (as $USER_NAME)..."
-        if sudo -u "$USER_NAME" pw-cli ls Node 2>/dev/null | grep -q .; then
-            ok "PipeWire nodes found:"
-            sudo -u "$USER_NAME" pw-cli ls Node 2>/dev/null | head -20
+    elif [ "$audio_backend" = "alsa" ]; then
+        echo "Checking ALSA devices..."
+        if [ -d /dev/snd ] && ls /dev/snd/ 2>/dev/null | grep -q .; then
+            ok "ALSA devices found:"
+            ls -la /dev/snd/ 2>/dev/null | head -10
         else
-            warn "No PipeWire nodes found. Audio may still work via ALSA or other backends."
+            warn "No ALSA devices found in /dev/snd/. Audio may not work."
         fi
-    else
-        warn "Neither pactl nor pw-cli found after install. Cannot verify PipeWire audio node."
     fi
 
     echo
@@ -459,10 +538,12 @@ verify_installation() {
     echo "VERIFICATION COMPLETE"
     echo "---------------------------------------------------------------------"
     echo
+    echo "Audio backend: $audio_backend"
     echo "If you encounter issues, check:"
-    echo "  1. PipeWire is installed:   pacman -S pipewire wireplumber"
-    echo "  2. The runtime dir exists:  ls -la /run/l337-audio-server"
-    echo "  3. Logs for errors:         sudo journalctl -u l337-audio-server.service -f"
+    echo "  1. Service status:        sudo systemctl status l337-audio-server.service"
+    echo "  2. Recent logs:           sudo journalctl -u l337-audio-server.service -n 50"
+    echo "  3. Runtime dir (PipeWire): ls -la /run/l337-audio-server"
+    echo "  4. ALSA devices:          ls -la /dev/snd/"
     echo
 
     remove_verification_tools
@@ -517,6 +598,16 @@ update_system_service() {
     systemctl stop l337-audio-server.service || true
     sleep 1
 
+    local audio_backend
+    audio_backend=$(detect_audio_backend)
+    info "Detected audio backend for update: $audio_backend"
+
+    if [ "$audio_backend" = "desktop-pipewire" ]; then
+        warn "Desktop PipeWire session detected during update."
+        warn "System service may conflict with desktop audio."
+        audio_backend="alsa"
+    fi
+
     echo "Deploying new binary to $INSTALL_DIR (config/state/cache untouched)..."
     cp "$BIN" "$INSTALL_DIR/l337-audio-server"
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
@@ -528,7 +619,7 @@ update_system_service() {
     chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/bin/l337-audio-server"
 
     echo "Writing systemd unit $SYSTEM_SERVICE..."
-    write_system_unit
+    write_system_unit "$audio_backend"
 
     echo "Setting up configuration..."
     setup_config
@@ -538,7 +629,7 @@ update_system_service() {
     systemctl enable l337-audio-server.service
     systemctl restart l337-audio-server.service
     echo
-    verify_installation
+    verify_installation "$audio_backend"
 }
 
 setup_config() {
@@ -665,6 +756,38 @@ install_system_service() {
     BIN="$(require_prebuilt_binary)"
     migrate_old_service_name
 
+    # ── Detect audio backend ─────────────────────────────────────────────
+    local audio_backend
+    audio_backend=$(detect_audio_backend)
+    info "Detected audio backend: $audio_backend"
+
+    if [ "$audio_backend" = "desktop-pipewire" ]; then
+        warn "A desktop PipeWire session is active on this machine."
+        warn "The system service starts its own PipeWire instance, which"
+        warn "conflicts with the desktop session's exclusive access to the soundcard."
+        echo
+        read -p "Install as a user service instead? [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            install_user_service
+            return
+        fi
+        warn "Proceeding with system service and ALSA fallback (no dedicated PipeWire)."
+        audio_backend="alsa"
+    fi
+
+    if [ "$audio_backend" = "none" ]; then
+        fail "No audio backend detected (no PipeWire, no ALSA devices)." \
+             "Install audio hardware, or run with --dummy for testing."
+    fi
+
+    if [ "$audio_backend" = "alsa" ]; then
+        warn "No PipeWire detected — configuring system service for ALSA fallback."
+        warn "Audio will work via ALSA directly. PipeWire mixer integration"
+        warn "and desktop volume keys will not be available for this service."
+    fi
+    # ── End detection ────────────────────────────────────────────────────
+
     echo "Creating dedicated system user '$USER_NAME' (MPD-style)..."
     if ! id "$USER_NAME" &>/dev/null; then
         useradd --system --no-create-home --shell /usr/sbin/nologin \
@@ -689,7 +812,7 @@ install_system_service() {
     chown -R "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR"
 
     echo "Writing systemd unit $SYSTEM_SERVICE..."
-    write_system_unit
+    write_system_unit "$audio_backend"
 
     echo "Reloading systemd and enabling service..."
     systemctl daemon-reload
@@ -699,15 +822,42 @@ install_system_service() {
     echo "L337 Audio Server installed as a system service running under user '$USER_NAME'."
     echo "Check status with:  sudo systemctl status l337-audio-server.service"
     echo "View logs with:     sudo journalctl -u l337-audio-server.service -f"
-    check_pipewire_dependency
+
+    if [ "$audio_backend" = "pipewire-system" ]; then
+        check_pipewire_dependency
+    else
+        info "Skipping PipeWire dependency check (audio backend: $audio_backend)."
+    fi
     echo
-    verify_installation
+    verify_installation "$audio_backend"
+}
+
+install_auto() {
+    local audio_backend
+    audio_backend=$(detect_audio_backend)
+    info "Auto-detected audio backend: $audio_backend"
+
+    case "$audio_backend" in
+        desktop-pipewire)
+            info "Desktop PipeWire session detected — installing as user service."
+            install_user_service
+            ;;
+        pipewire-system|alsa)
+            info "System PipeWire/ALSA detected — installing as system service."
+            install_system_service
+            ;;
+        none)
+            fail "No audio backend detected (no PipeWire, no ALSA devices)." \
+                 "Install audio hardware, or run with --dummy for testing."
+            ;;
+    esac
 }
 
 case "$MODE" in
 
     --user|user) install_user_service ;;
     --update|update) update_system_service ;;
+    --auto|auto) install_auto ;;
     system|--system|"") install_system_service ;;
-    *) echo "Unknown mode: $MODE (use --user, --update, or nothing)"; exit 1 ;;
+    *) echo "Unknown mode: $MODE (use --user, --update, --auto, or nothing)"; exit 1 ;;
 esac

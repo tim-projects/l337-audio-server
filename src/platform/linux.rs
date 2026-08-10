@@ -8,8 +8,15 @@ use crate::platform::common::{audio_env, ensure_runtime_dir};
 /// - systemd service paths
 pub fn init() {
     ensure_runtime_dir();
-    for (key, value) in audio_env() {
-        unsafe { std::env::set_var(key, value) };
+    let defaults = audio_env();
+    for (key, value) in &defaults {
+        if std::env::var(key).is_err() {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+    if std::env::var("XDG_RUNTIME_DIR").is_ok() && std::env::var("PIPEWIRE_RUNTIME_DIR").is_err() {
+        let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap();
+        unsafe { std::env::set_var("PIPEWIRE_RUNTIME_DIR", xdg) };
     }
 }
 

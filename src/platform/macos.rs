@@ -7,7 +7,9 @@ use crate::platform::common::{audio_env, runtime_dir};
 pub fn init() {
     let _dir = runtime_dir();
     for (key, value) in audio_env() {
-        unsafe { std::env::set_var(key, value) };
+        if std::env::var(key).is_err() {
+            unsafe { std::env::set_var(key, value) };
+        }
     }
     // TODO: Ensure launchd plist directory exists
 }
