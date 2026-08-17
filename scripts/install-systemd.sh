@@ -99,27 +99,19 @@ detect_audio_backend() {
     fi
 }
 
-# The service was historically named `l337-audio.service` (both system and
-# user scopes). If an old unit with that name is still enabled/running, stop,
-# disable and remove it so it doesn't linger alongside the renamed
-# `l337-audio-server.service`.
-migrate_old_service_name() {
-    local old="/etc/systemd/system/l337-audio.service"
-    if [ -f "$old" ]; then
-        echo "Found legacy system unit l337-audio.service; migrating to $SYSTEM_SERVICE..."
-        systemctl disable l337-audio.service 2>/dev/null || true
-        systemctl stop l337-audio.service 2>/dev/null || true
-        rm -f "$old"
-        systemctl daemon-reload
+# Check if PipeWire is available for a given user
+check_pipewire_for_user() {
+    local user="$1"
+    local uid
+    uid=$(id -u "$user" 2>/dev/null) || return 1
+    local runtime_dir="/run/user/$uid"
+    if [ ! -d "$runtime_dir" ]; then
+        return 1
     fi
-
-    local old_user="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/l337-audio.service"
-    if [ -f "$old_user" ]; then
-        echo "Found legacy user unit l337-audio.service; migrating..."
-        systemctl --user disable l337-audio.service 2>/dev/null || true
-        systemctl --user stop l337-audio.service 2>/dev/null || true
-        rm -f "$old_user"
-        systemctl --user daemon-reload
+    if [ "$user" = "$USER" ]; then
+        XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
+    else
+        sudo -u "$user" XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
     fi
 }
 
@@ -663,55 +655,140 @@ verify_installation() {
     echo "  4. ALSA devices:          ls -la /dev/snd/"
     echo
 
-    remove_verification_tools
+remove_verification_tools
+ }
+
+ # Check if PipeWire is available for a given user
+ check_pipewire_for_user() {
+     local user="$1"
+     local uid
+     uid=$(id -u "$user" 2>/dev/null) || return 1
+     local runtime_dir="/run/user/$uid"
+     if [ ! -d "$runtime_dir" ]; then
+         return 1
+     fi
+     if [ "$user" = "$USER" ]; then
+         XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
+     else
+         sudo -u "$user" XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
+     fi
 }
 
-install_user_service() {
+install_hybrid_service() {
     BIN="$(require_prebuilt_binary)"
-    migrate_old_service_name
+    
+    # We are running via sudo, so SUDO_USER is set
+    REAL_USER="${SUDO_USER}"
+    
+    # Check for PipeWire for the real user
+    if ! check_pipewire_for_user "$REAL_USER"; then
+        fail "PipeWire is not available for user '$REAL_USER'. Please ensure PipeWire is running and the user has an active desktop session."
+    fi
+    
+    REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    if [ -z "$REAL_HOME" ]; then
+        # Fallback to $HOME if getent fails (should not happen)
+        REAL_HOME="$HOME"
+    fi
 
-    USER_INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/l337-audio-server"
-    mkdir -p "$USER_INSTALL_DIR/scripts"
+    # Install to /opt/l337-audio-server (system-wide, owned by root)
+    INSTALL_DIR="/opt/l337-audio-server"
+    BIN_DIR="$INSTALL_DIR"
+    SCRIPTS_DIR="$INSTALL_DIR/scripts"
 
-    echo "Installing binary to $USER_INSTALL_DIR..."
-    cp "$BIN" "$USER_INSTALL_DIR/l337-audio-server"
-    chmod +x "$USER_INSTALL_DIR/l337-audio-server"
+    echo "Installing to $INSTALL_DIR..."
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
+    mkdir -p "$SCRIPTS_DIR"
+    cp "$BIN" "$BIN_DIR/l337-audio-server"
+    chmod +x "$BIN_DIR/l337-audio-server"
+    cp -r "$SCRIPT_DIR/scripts" "$SCRIPTS_DIR/"
+    chmod -R +rx "$SCRIPTS_DIR"
+    chown -R root:root "$INSTALL_DIR"
 
-    echo "Copying scripts..."
-    cp -r "$SCRIPT_DIR/scripts" "$USER_INSTALL_DIR/"
-
-    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    # Set up user systemd service for REAL_USER
+    UNIT_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/systemd/user"
     UNIT="$UNIT_DIR/l337-audio-server.service"
     mkdir -p "$UNIT_DIR"
 
+    # We know PipeWire is available for the user (checked above)
+    local env_runtime="Environment=XDG_RUNTIME_DIR=/run/user/$(id -u "$REAL_USER")"
+    local exec_start_pre="ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh"
+
     echo "Writing user unit $UNIT..."
-    cat > "$UNIT" <<EOF
+    {
+        cat <<EOF
 [Unit]
-Description=L337 Audio Server (user)
+Description=L337 Audio Server (hybrid: system-wide binaries, user service)
+Documentation=https://github.com/l337-audio-server
 After=network-online.target sound.target
 Wants=network-online.target
+After=pipewire.service
+Wants=pipewire.service
 
 [Service]
 Type=simple
-WorkingDirectory=$USER_INSTALL_DIR
-ExecStart=$USER_INSTALL_DIR/l337-audio-server
+User=$REAL_USER
+Group=$REAL_USER
+WorkingDirectory=$INSTALL_DIR
+${env_runtime}
+${exec_start_pre}
+ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
+
+# Filesystem / runtime locations (systemd creates + chowns these).
+StateDirectory=l337-audio-server
+CacheDirectory=l337-audio-server
+ConfigurationDirectory=l337-audio-server
+RuntimeDirectory=l337-audio-server
+RuntimeDirectoryMode=0700
+
+# Hardening (unprivileged service user).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/l337-audio-server /var/cache/l337-audio-server
 
 [Install]
 WantedBy=default.target
 EOF
+    } > "$UNIT"
 
-    echo "Enabling + starting user service (lingering recommended for headless)..."
-    systemctl --user daemon-reload
-    systemctl --user enable l337-audio-server.service
-    systemctl --user restart l337-audio-server.service
+# Reload user systemd for REAL_USER and enable/start the service
+     echo "Enabling + starting user service for $REAL_USER..."
+     # We need to run systemctl --user as the real user
+     sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user daemon-reload
+     sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user enable l337-audio-server.service
+     sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user restart l337-audio-server.service
+
     echo
-    echo "L337 Audio Server installed as a user service for '$USER'."
-    echo "For headless/always-on, enable linger:  sudo loginctl enable-linger $USER"
+    echo "L337 Audio Server installed as a hybrid service:"
+    echo "  - Binaries and scripts installed to $INSTALL_DIR (owned by root)"
+    echo "  - Service runs as user '$REAL_USER' (for PipeWire access)"
+    echo "  - State/cache/config in /var/lib/l337-audio-server etc. (owned by $REAL_USER)"
+    echo
     echo "Check status with:  systemctl --user status l337-audio-server.service"
+    echo "View logs with:     journalctl --user -u l337-audio-server.service -f"
     echo
-    echo "Installed binary: $USER_INSTALL_DIR/l337-audio-server"
+    echo "Installed binary: $INSTALL_DIR/l337-audio-server"
+
+    # We do not run setup_config or verification for hybrid service by default.
+    # The user can configure the server via its configuration file or command line.
+    echo "Note: Configuration is not set up automatically. Please configure the server"
+    echo "      via its configuration file or command line as needed."
+    echo
 }
 
 update_system_service() {
@@ -877,105 +954,19 @@ except ImportError:
     fi
 }
 
-install_system_service() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "System service install requires root (use sudo). For a per-user" >&2
-        echo "instance run: $0 --user" >&2
-        exit 1
-    fi
-
-    BIN="$(require_prebuilt_binary)"
-    migrate_old_service_name
-
-    # ── Detect audio backend ─────────────────────────────────────────────
-    local audio_backend
-    audio_backend=$(detect_audio_backend)
-    info "Detected audio backend: $audio_backend"
-
-    if [ "$audio_backend" = "desktop-pipewire" ]; then
-        warn "A desktop PipeWire session is active on this machine."
-        warn "The system service starts its own PipeWire instance, which"
-        warn "conflicts with the desktop session's exclusive access to the soundcard."
-        echo
-        read -p "Install as a user service instead? [Y/n] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            install_user_service
-            return
-        fi
-        warn "Proceeding with system service and ALSA fallback (no dedicated PipeWire)."
-        audio_backend="alsa"
-    fi
-
-    if [ "$audio_backend" = "none" ]; then
-        fail "No audio backend detected (no PipeWire, no ALSA devices)." \
-             "Install audio hardware, or run with --dummy for testing."
-    fi
-
-    if [ "$audio_backend" = "alsa" ]; then
-        warn "No PipeWire detected — configuring system service for ALSA fallback."
-        warn "Audio will work via ALSA directly. PipeWire mixer integration"
-        warn "and desktop volume keys will not be available for this service."
-    fi
-    # ── End detection ────────────────────────────────────────────────────
-
-    echo "Creating dedicated system user '$USER_NAME' (MPD-style)..."
-    if ! id "$USER_NAME" &>/dev/null; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --comment "L337 Audio Server" "$USER_NAME"
-    fi
-
-    echo "Installing to $INSTALL_DIR..."
-    rm -rf "$INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR"
-    cp -r "$SCRIPT_DIR/scripts" "$INSTALL_DIR/"
-    cp "$BIN" "$INSTALL_DIR/l337-audio-server"
-    chmod +x "$INSTALL_DIR/l337-audio-server"
-
-    echo "Creating state/cache/config directories owned by $USER_NAME..."
-    install -d -m 0755 -o "$USER_NAME" -g "$GROUP_NAME" "$STATE_DIR"
-    install -d -m 0750 -o "$USER_NAME" -g "$GROUP_NAME" "$CACHE_DIR"
-    install -d -m 0755 -o "$USER_NAME" -g "$GROUP_NAME" "$CONFIG_DIR"
-
-    echo "Setting up configuration..."
-    setup_config
-
-    chown -R "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR"
-
-    echo "Writing systemd unit $SYSTEM_SERVICE..."
-    write_system_unit "$audio_backend"
-
-    echo "Reloading systemd and enabling service..."
-    systemctl daemon-reload
-    systemctl enable l337-audio-server.service
-    systemctl restart l337-audio-server.service
-    echo
-    echo "L337 Audio Server installed as a system service running under user '$USER_NAME'."
-    echo "Check status with:  sudo systemctl status l337-audio-server.service"
-    echo "View logs with:     sudo journalctl -u l337-audio-server.service -f"
-    echo
-    echo "Installed binary: $INSTALL_DIR/l337-audio-server"
-
-    if [ "$audio_backend" = "pipewire-system" ]; then
-        check_pipewire_dependency
-    else
-        info "Skipping PipeWire dependency check (audio backend: $audio_backend)."
-    fi
-    echo
-    verify_installed_files
-    verify_installation "$audio_backend"
-}
-
 install_auto() {
-    info "Installing as system service to /opt/l337-audio-server..."
-    install_system_service
+    if [ -n "${SUDO_USER:-}" ]; then
+        info "Installing via sudo detected. Installing files to /opt/l337-audio-server and setting up user service for $SUDO_USER..."
+        install_hybrid_service
+    else
+        fail "This script must be run with sudo to install binaries to /opt/l337-audio-server. Please run: sudo $0"
+    fi
 }
 
 case "$MODE" in
 
-    --user|user) install_user_service ;;
     --update|update) update_system_service ;;
     --auto|auto) install_auto ;;
-    system|--system|"") install_system_service ;;
-    *) echo "Unknown mode: $MODE (use --user, --update, --auto, or nothing)"; exit 1 ;;
+    "") install_auto ;;  # Default to auto mode
+    *) echo "Unknown mode: $MODE (use --update, --auto, or nothing)"; exit 1 ;;
 esac

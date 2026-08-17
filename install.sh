@@ -141,11 +141,11 @@ fi
 case "$OS_TYPE" in
     linux)
         if [ "$UNINSTALL" = true ]; then
-            UNINSTALL_SCRIPT="$SCRIPT_DIR/uninstall-systemd.sh"
-            if [ ! -x "$UNINSTALL_SCRIPT" ]; then
-                fail "Uninstaller script not found or not executable: $UNINSTALL_SCRIPT"
-            fi
-            UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --auto"
+UNINSTALL_SCRIPT="$SCRIPT_DIR/uninstall-systemd.sh"
+        if [ ! -x "$UNINSTALL_SCRIPT" ]; then
+            fail "Uninstaller script not found or not executable: $UNINSTALL_SCRIPT"
+        fi
+        UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --user"
         else
             INSTALL_SCRIPT="$SCRIPT_DIR/install-systemd.sh"
             if [ ! -x "$INSTALL_SCRIPT" ]; then
