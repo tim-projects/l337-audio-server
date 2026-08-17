@@ -967,24 +967,8 @@ install_system_service() {
 }
 
 install_auto() {
-    local audio_backend
-    audio_backend=$(detect_audio_backend)
-    info "Auto-detected audio backend: $audio_backend"
-
-    case "$audio_backend" in
-        desktop-pipewire)
-            info "Desktop PipeWire session detected — installing as user service."
-            install_user_service
-            ;;
-        pipewire-system|alsa)
-            info "System PipeWire/ALSA detected — installing as system service."
-            install_system_service
-            ;;
-        none)
-            fail "No audio backend detected (no PipeWire, no ALSA devices)." \
-                 "Install audio hardware, or run with --dummy for testing."
-            ;;
-    esac
+    info "Installing as system service to /opt/l337-audio-server..."
+    install_system_service
 }
 
 case "$MODE" in
