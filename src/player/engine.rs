@@ -7,12 +7,13 @@ use rubato::SincInterpolationParameters;
 use rubato::SincInterpolationType;
 use rubato::WindowFunction;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tracing::{error, info};
 
 struct AudioBuffer {
@@ -680,6 +681,9 @@ pub async fn download_stream(
     }
 
     if is_youtube_url(url) {
+        if !yt_dlp_available() {
+            return Err("yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into());
+        }
         let direct_url = resolve_youtube_stream_url(url).await?;
         return stream_http_to_file(&direct_url, dest, Arc::new(AtomicBool::new(false)))
             .await
@@ -735,15 +739,29 @@ fn is_youtube_url(url: &str) -> bool {
         || url.contains("googlevideo.com/videoplayback")
 }
 
+fn yt_dlp_available() -> bool {
+    Command::new("yt-dlp")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 async fn download_via_ytdlp(
     url: &str,
     dest: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::process::Command;
 
+    if !yt_dlp_available() {
+        return Err("yt-dlp is not installed. Install yt-dlp to download YouTube URLs.".into());
+    }
+
     let _ = tokio::fs::remove_file(dest).await;
 
-    let status = Command::new("yt-dlp")
+    let status = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
         .arg("-f")
@@ -769,7 +787,11 @@ async fn download_via_ytdlp(
 
 /// Use `yt-dlp -g` to resolve a YouTube watch URL to a direct audio stream URL.
 async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let output = Command::new("yt-dlp")
+    if !yt_dlp_available() {
+        return Err("yt-dlp is not installed. Install yt-dlp to play YouTube URLs.".into());
+    }
+
+    let output = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
         .arg("-g")
