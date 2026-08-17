@@ -583,6 +583,8 @@ EOF
     echo "L337 Audio Server installed as a user service for '$USER'."
     echo "For headless/always-on, enable linger:  sudo loginctl enable-linger $USER"
     echo "Check status with:  systemctl --user status l337-audio-server.service"
+    echo
+    echo "Installed binary: $BIN"
 }
 
 update_system_service() {
@@ -628,6 +630,8 @@ update_system_service() {
     systemctl daemon-reload
     systemctl enable l337-audio-server.service
     systemctl restart l337-audio-server.service
+    echo
+    echo "Binary updated at: $INSTALL_DIR/l337-audio-server"
     echo
     verify_installation "$audio_backend"
 }
@@ -822,6 +826,8 @@ install_system_service() {
     echo "L337 Audio Server installed as a system service running under user '$USER_NAME'."
     echo "Check status with:  sudo systemctl status l337-audio-server.service"
     echo "View logs with:     sudo journalctl -u l337-audio-server.service -f"
+    echo
+    echo "Installed binary: $INSTALL_DIR/l337-audio-server"
 
     if [ "$audio_backend" = "pipewire-system" ]; then
         check_pipewire_dependency

@@ -7,11 +7,13 @@
 # Usage:
 #   ./install.sh                        # install (Linux → systemd)
 #   ./install.sh --dry-run              # show what would happen
+#   ./install.sh --uninstall            # remove installed service/files
 #   ./install.sh --help
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
 DRY_RUN=false
+UNINSTALL=false
 
 usage() {
     cat <<EOF
@@ -19,6 +21,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --dry-run              Show what would happen without making changes
+  --uninstall, -u        Uninstall the service and remove installed files
   -h, --help             Show this help message
 
 Platforms:
@@ -32,6 +35,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
+        --uninstall|-u) UNINSTALL=true; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -130,29 +134,52 @@ run_install() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-check_deps
+if [ "$UNINSTALL" = false ]; then
+    check_deps
+fi
 
 case "$OS_TYPE" in
     linux)
-        INSTALL_SCRIPT="$SCRIPT_DIR/install-systemd.sh"
-        if [ ! -x "$INSTALL_SCRIPT" ]; then
-            fail "Installer script not found or not executable: $INSTALL_SCRIPT"
+        if [ "$UNINSTALL" = true ]; then
+            UNINSTALL_SCRIPT="$SCRIPT_DIR/uninstall-systemd.sh"
+            if [ ! -x "$UNINSTALL_SCRIPT" ]; then
+                fail "Uninstaller script not found or not executable: $UNINSTALL_SCRIPT"
+            fi
+            UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --auto"
+        else
+            INSTALL_SCRIPT="$SCRIPT_DIR/install-systemd.sh"
+            if [ ! -x "$INSTALL_SCRIPT" ]; then
+                fail "Installer script not found or not executable: $INSTALL_SCRIPT"
+            fi
+            INSTALL_CMD="\"$INSTALL_SCRIPT\" --auto"
         fi
-        INSTALL_CMD="sudo \"$INSTALL_SCRIPT\""
         ;;
     macos)
-        INSTALL_SCRIPT="$SCRIPT_DIR/install-launchd.sh"
-        if [ ! -x "$INSTALL_SCRIPT" ]; then
-            fail "macOS installer not found or not executable: $INSTALL_SCRIPT"
+        if [ "$UNINSTALL" = true ]; then
+            UNINSTALL_SCRIPT="$SCRIPT_DIR/uninstall-launchd.sh"
+            if [ ! -x "$UNINSTALL_SCRIPT" ]; then
+                fail "Uninstaller script not found or not executable: $UNINSTALL_SCRIPT"
+            fi
+            UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\""
+        else
+            INSTALL_SCRIPT="$SCRIPT_DIR/install-launchd.sh"
+            if [ ! -x "$INSTALL_SCRIPT" ]; then
+                fail "macOS installer not found or not executable: $INSTALL_SCRIPT"
+            fi
+            INSTALL_CMD="\"$INSTALL_SCRIPT\""
         fi
-        INSTALL_CMD="\"$INSTALL_SCRIPT\""
         ;;
     windows)
-        info "Windows detected. Please run the PowerShell installer instead:"
-        info "  scripts\\install.ps1"
+        info "Windows detected. Please run the PowerShell installer/uninstaller instead."
         exit 0
         ;;
 esac
 
-run_install
-ok "Installation complete"
+if [ "$UNINSTALL" = true ]; then
+    info "Running uninstaller: $UNINSTALL_CMD"
+    eval "$UNINSTALL_CMD"
+    ok "Uninstallation complete"
+else
+    run_install
+    ok "Installation complete"
+fi
