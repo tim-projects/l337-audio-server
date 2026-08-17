@@ -91,6 +91,76 @@ uninstall_system_service() {
     ok "System service uninstall complete"
 }
 
+uninstall_hybrid_service() {
+    local real_user="${SUDO_USER:-${USER}}"
+    local real_uid
+    real_uid=$(id -u "$real_user" 2>/dev/null || echo "")
+    local runtime_dir="/run/user/$real_uid"
+
+    info "Uninstalling hybrid service (user: $real_user)..."
+
+    # Stop and disable the user service first
+    if [ -n "$runtime_dir" ] && [ -d "$runtime_dir" ]; then
+        info "Stopping user service for $real_user..."
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user stop l337-audio-server.service 2>/dev/null || true
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user disable l337-audio-server.service 2>/dev/null || true
+    else
+        warn "Could not determine runtime dir for $real_user; skipping user service stop"
+    fi
+
+    # Remove user unit file
+    local unit_dir="${XDG_CONFIG_HOME:-/home/$real_user/.config}/systemd/user"
+    local unit="$unit_dir/l337-audio-server.service"
+    if [ -f "$unit" ]; then
+        rm -f "$unit"
+        if [ -n "$runtime_dir" ] && [ -d "$runtime_dir" ]; then
+            sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user daemon-reload 2>/dev/null || true
+        fi
+        ok "User unit removed"
+    else
+        warn "User unit not found at $unit"
+    fi
+
+    # Remove system-wide install dir
+    if [ -d "$INSTALL_DIR" ]; then
+        info "Removing $INSTALL_DIR..."
+        rm -rf "$INSTALL_DIR"
+        ok "Removed $INSTALL_DIR"
+    else
+        warn "$INSTALL_DIR not found"
+    fi
+
+    # Remove data directories
+    for d in "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"; do
+        if [ -d "$d" ]; then
+            info "Removing $d..."
+            rm -rf "$d"
+            ok "Removed $d"
+        else
+            warn "$d not found"
+        fi
+    done
+
+    # Remove system user/group
+    if id "$USER_NAME" &>/dev/null; then
+        info "Removing system user '$USER_NAME'..."
+        userdel "$USER_NAME" 2>/dev/null || true
+        ok "System user removed"
+    else
+        warn "User $USER_NAME not found"
+    fi
+
+    if getent group "$GROUP_NAME" &>/dev/null; then
+        info "Removing group '$GROUP_NAME'..."
+        groupdel "$GROUP_NAME" 2>/dev/null || true
+        ok "Group removed"
+    else
+        warn "Group $GROUP_NAME not found"
+    fi
+
+    ok "Hybrid service uninstall complete"
+}
+
 uninstall_user_service() {
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     local unit="$unit_dir/l337-audio-server.service"
@@ -128,5 +198,6 @@ uninstall_user_service() {
 case "$MODE" in
     system|--system|"") uninstall_system_service ;;
     user|--user)        uninstall_user_service ;;
-    *) echo "Unknown mode: $MODE (use --user or run as root for system service)"; exit 1 ;;
+    hybrid|--hybrid)    uninstall_hybrid_service ;;
+    *) echo "Unknown mode: $MODE (use --user, --hybrid, or run as root for system service)"; exit 1 ;;
 esac

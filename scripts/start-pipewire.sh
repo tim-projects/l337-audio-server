@@ -16,14 +16,16 @@ if [ ! -d "${XDG_RUNTIME_DIR}" ]; then
     fi
 fi
 
-# Start PipeWire in the background.
+# Start PipeWire in the background only if it's not already running.
 # Use nohup + & so it survives after ExecStartPre returns.
-if ! /usr/bin/pipewire -d >/dev/null 2>&1; then
+if ! pgrep -x pipewire >/dev/null 2>&1; then
     nohup /usr/bin/pipewire >/dev/null 2>&1 &
 fi
 
-# Start WirePlumber (session manager) in the background.
-nohup /usr/bin/wireplumber >/dev/null 2>&1 &
+# Start WirePlumber (session manager) in the background only if not already running.
+if ! pgrep -x wireplumber >/dev/null 2>&1; then
+    nohup /usr/bin/wireplumber >/dev/null 2>&1 &
+fi
 
 # Brief pause so the session is up before the server opens its stream.
 sleep 1

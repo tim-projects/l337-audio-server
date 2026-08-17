@@ -655,23 +655,7 @@ verify_installation() {
     echo "  4. ALSA devices:          ls -la /dev/snd/"
     echo
 
-remove_verification_tools
- }
-
- # Check if PipeWire is available for a given user
- check_pipewire_for_user() {
-     local user="$1"
-     local uid
-     uid=$(id -u "$user" 2>/dev/null) || return 1
-     local runtime_dir="/run/user/$uid"
-     if [ ! -d "$runtime_dir" ]; then
-         return 1
-     fi
-     if [ "$user" = "$USER" ]; then
-         XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
-     else
-         sudo -u "$user" XDG_RUNTIME_DIR="$runtime_dir" PIPEWIRE_RUNTIME_DIR="$runtime_dir" pactl info &>/dev/null
-     fi
+    remove_verification_tools
 }
 
 install_hybrid_service() {
@@ -680,9 +664,11 @@ install_hybrid_service() {
     # We are running via sudo, so SUDO_USER is set
     REAL_USER="${SUDO_USER}"
     
-    # Check for PipeWire for the real user
+    # Check for PipeWire for the real user. Warn but do not fail: the server
+    # itself handles audio-backend detection at runtime, and this check can
+    # false-negative when run under sudo or without a full desktop session.
     if ! check_pipewire_for_user "$REAL_USER"; then
-        fail "PipeWire is not available for user '$REAL_USER'. Please ensure PipeWire is running and the user has an active desktop session."
+        warn "PipeWire check failed for user '$REAL_USER'. The server will still be installed; audio backend will be detected at runtime."
     fi
     
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
@@ -702,7 +688,7 @@ install_hybrid_service() {
     mkdir -p "$SCRIPTS_DIR"
     cp "$BIN" "$BIN_DIR/l337-audio-server"
     chmod +x "$BIN_DIR/l337-audio-server"
-    cp -r "$SCRIPT_DIR/scripts" "$SCRIPTS_DIR/"
+    cp -r "$SCRIPT_DIR/scripts/." "$SCRIPTS_DIR/"
     chmod -R +rx "$SCRIPTS_DIR"
     chown -R root:root "$INSTALL_DIR"
 
@@ -712,7 +698,6 @@ install_hybrid_service() {
     mkdir -p "$UNIT_DIR"
 
     # We know PipeWire is available for the user (checked above)
-    local env_runtime="Environment=XDG_RUNTIME_DIR=/run/user/$(id -u "$REAL_USER")"
     local exec_start_pre="ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh"
 
     echo "Writing user unit $UNIT..."
@@ -731,7 +716,6 @@ Type=simple
 User=$REAL_USER
 Group=$REAL_USER
 WorkingDirectory=$INSTALL_DIR
-${env_runtime}
 ${exec_start_pre}
 ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
@@ -746,8 +730,6 @@ RuntimeDirectoryMode=0700
 
 # Hardening (unprivileged service user).
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelModules=true
@@ -759,7 +741,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=false
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/var/lib/l337-audio-server /var/cache/l337-audio-server
+ReadWritePaths=/run/l337-audio-server /home/$REAL_USER/.cache/l337
 
 [Install]
 WantedBy=default.target
@@ -773,7 +755,16 @@ EOF
      sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user enable l337-audio-server.service
      sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user restart l337-audio-server.service
 
-    echo
+     # Fix permissions on runtime/config directories so the service user can write
+     # its lock/config files without permission errors.
+     if [ -d "/run/l337-audio-server" ]; then
+         chown -R "$REAL_USER:$REAL_USER" /run/l337-audio-server 2>/dev/null || true
+     fi
+     if [ -d "/etc/l337-audio-server" ]; then
+         chown -R "$REAL_USER:$REAL_USER" /etc/l337-audio-server 2>/dev/null || true
+     fi
+
+     echo
     echo "L337 Audio Server installed as a hybrid service:"
     echo "  - Binaries and scripts installed to $INSTALL_DIR (owned by root)"
     echo "  - Service runs as user '$REAL_USER' (for PipeWire access)"

@@ -1,4 +1,4 @@
-use crate::platform::common::{audio_env, ensure_runtime_dir};
+use crate::platform::common::{audio_env, ensure_runtime_dir, runtime_dir};
 
 /// Linux-specific platform implementation.
 ///
@@ -8,15 +8,19 @@ use crate::platform::common::{audio_env, ensure_runtime_dir};
 /// - systemd service paths
 pub fn init() {
     ensure_runtime_dir();
-    let defaults = audio_env();
-    for (key, value) in &defaults {
-        if std::env::var(key).is_err() {
-            unsafe { std::env::set_var(key, value) };
-        }
+
+    // Preserve an existing XDG_RUNTIME_DIR when systemd/user service has already
+    // set one (e.g. /run/user/1002). In that case, keep PIPEWIRE_RUNTIME_DIR in
+    // sync with it so cpal can find the existing PipeWire session instead of
+    // falling back to ALSA.
+    let rt = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| runtime_dir().display().to_string());
+
+    if std::env::var("XDG_RUNTIME_DIR").is_err() {
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &rt) };
     }
-    if std::env::var("XDG_RUNTIME_DIR").is_ok() && std::env::var("PIPEWIRE_RUNTIME_DIR").is_err() {
-        let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap();
-        unsafe { std::env::set_var("PIPEWIRE_RUNTIME_DIR", xdg) };
+    if std::env::var("PIPEWIRE_RUNTIME_DIR").is_err() {
+        unsafe { std::env::set_var("PIPEWIRE_RUNTIME_DIR", &rt) };
     }
 }
 
