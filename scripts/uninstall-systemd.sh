@@ -114,9 +114,10 @@ uninstall_user_service() {
         local user_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/l337-audio-server"
         local user_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/l337-audio-server"
         local user_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/l337-audio-server"
+        local user_install_dir="${XDG_DATA_HOME:-$HOME/.local/share}/l337-audio-server"
 
-        rm -rf "$user_config_dir" "$user_state_dir" "$user_cache_dir"
-        ok "User data directories removed"
+        rm -rf "$user_config_dir" "$user_state_dir" "$user_cache_dir" "$user_install_dir"
+        ok "User data directories and installed binary removed"
     else
         warn "User data directories retained. Re-run with --remove-data to delete them."
     fi

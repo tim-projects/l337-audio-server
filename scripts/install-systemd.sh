@@ -455,6 +455,112 @@ test_audio_playback() {
     return 0
 }
 
+
+verify_installed_files() {
+    echo "---------------------------------------------------------------------"
+    echo "FILE INTEGRITY CHECK"
+    echo "---------------------------------------------------------------------"
+    echo
+
+    local errors=0
+
+    if [ -f "$INSTALL_DIR/l337-audio-server" ] && [ -x "$INSTALL_DIR/l337-audio-server" ]; then
+        ok "Binary present: $INSTALL_DIR/l337-audio-server"
+    else
+        fail "Binary missing or not executable: $INSTALL_DIR/l337-audio-server"
+    fi
+
+    if [ -d "$INSTALL_DIR/scripts" ]; then
+        ok "Scripts directory present: $INSTALL_DIR/scripts"
+    else
+        warn "Scripts directory missing: $INSTALL_DIR/scripts"
+        errors=$((errors + 1))
+    fi
+
+    if [ -f "$CONFIG_DIR/config.toml" ]; then
+        ok "Config present: $CONFIG_DIR/config.toml"
+    else
+        fail "Config missing: $CONFIG_DIR/config.toml"
+    fi
+
+    if [ -d "$STATE_DIR" ]; then
+        ok "State directory present: $STATE_DIR"
+    else
+        warn "State directory missing: $STATE_DIR"
+        errors=$((errors + 1))
+    fi
+
+    if [ -d "$CACHE_DIR" ]; then
+        ok "Cache directory present: $CACHE_DIR"
+    else
+        warn "Cache directory missing: $CACHE_DIR"
+        errors=$((errors + 1))
+    fi
+
+    if id "$USER_NAME" &>/dev/null; then
+        ok "System user exists: $USER_NAME"
+    else
+        fail "System user missing: $USER_NAME"
+    fi
+
+    if [ -f "$SYSTEM_SERVICE" ]; then
+        ok "Systemd unit present: $SYSTEM_SERVICE"
+    else
+        fail "Systemd unit missing: $SYSTEM_SERVICE"
+    fi
+
+    echo
+    if [ "$errors" -gt 0 ]; then
+        warn "File integrity check completed with $errors warning(s)."
+    else
+        ok "File integrity check passed."
+    fi
+    echo "---------------------------------------------------------------------"
+    echo
+}
+
+check_server_health() {
+    local configured_host="localhost"
+    local config_file="$CONFIG_DIR/config.toml"
+    if [ -f "$config_file" ]; then
+        configured_host=$(grep -E '^host\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/')
+        configured_host=${configured_host:-localhost}
+    fi
+
+    local addresses=("localhost" "127.0.0.1" "$configured_host")
+    if [ "$configured_host" != "0.0.0.0" ] && [ "$configured_host" != "::" ]; then
+        addresses+=("$configured_host")
+    fi
+
+    echo "Checking server health endpoint..."
+    local max_wait=15
+    local waited=0
+    local healthy=false
+    local health_addr=""
+
+    while [ $waited -lt $max_wait ]; do
+        for addr in "${addresses[@]}"; do
+            local url="https://$addr:1337/health"
+            if curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 2 "$url" 2>/dev/null | grep -q "200"; then
+                healthy=true
+                health_addr="$addr"
+                break 2
+            fi
+        done
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ "$healthy" = true ]; then
+        ok "Server health check passed (https://$health_addr:1337/health)"
+        return 0
+    else
+        warn "Server did not respond to health check after ${max_wait}s."
+        warn "Tried: ${addresses[*]}"
+        return 1
+    fi
+}
+
 verify_installation() {
     local audio_backend="${1:-pipewire-system}"
     echo "---------------------------------------------------------------------"
@@ -523,6 +629,17 @@ verify_installation() {
     fi
 
     echo
+    echo "Testing server health endpoint..."
+    echo "---------------------------------------------------------------------"
+    if ! systemctl is-active --quiet l337-audio-server.service; then
+        warn "Skipping health check because service is not running (no audio device?)"
+    elif ! check_server_health; then
+        warn "Server health check failed. The server may not be responding."
+    fi
+    echo "---------------------------------------------------------------------"
+    echo
+
+    echo
     echo "Testing audio playback via server API..."
     echo "---------------------------------------------------------------------"
     if ! systemctl is-active --quiet l337-audio-server.service; then
@@ -553,6 +670,16 @@ install_user_service() {
     BIN="$(require_prebuilt_binary)"
     migrate_old_service_name
 
+    USER_INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/l337-audio-server"
+    mkdir -p "$USER_INSTALL_DIR/scripts"
+
+    echo "Installing binary to $USER_INSTALL_DIR..."
+    cp "$BIN" "$USER_INSTALL_DIR/l337-audio-server"
+    chmod +x "$USER_INSTALL_DIR/l337-audio-server"
+
+    echo "Copying scripts..."
+    cp -r "$SCRIPT_DIR/scripts" "$USER_INSTALL_DIR/"
+
     UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     UNIT="$UNIT_DIR/l337-audio-server.service"
     mkdir -p "$UNIT_DIR"
@@ -566,8 +693,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$BIN
+WorkingDirectory=$USER_INSTALL_DIR
+ExecStart=$USER_INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
 
@@ -584,7 +711,7 @@ EOF
     echo "For headless/always-on, enable linger:  sudo loginctl enable-linger $USER"
     echo "Check status with:  systemctl --user status l337-audio-server.service"
     echo
-    echo "Installed binary: $BIN"
+    echo "Installed binary: $USER_INSTALL_DIR/l337-audio-server"
 }
 
 update_system_service() {
@@ -835,6 +962,7 @@ install_system_service() {
         info "Skipping PipeWire dependency check (audio backend: $audio_backend)."
     fi
     echo
+    verify_installed_files
     verify_installation "$audio_backend"
 }
 
