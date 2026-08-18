@@ -57,13 +57,14 @@ impl AudioBackend for PipeWireAudioBackend {
         let ab = audio_buffer.clone();
         let vol = volume.clone();
         let playing_cb = playing.clone();
+        let channels_captured = channels;
 
         let listener = stream
-            .add_local_listener_with_user_data((ab, vol, playing_cb))
+            .add_local_listener_with_user_data((ab, vol, playing_cb, channels_captured))
             .state_changed(|stream, _user_data, old, new| {
                 tracing::info!("PipeWire stream state changed: {:?} -> {:?}", old, new);
             })
-            .process(move |stream, (ab, vol, playing_cb)| {
+            .process(move |stream, (ab, vol, playing_cb, channels)| {
                 tracing::debug!("PipeWire process callback called");
                 let playing = playing_cb.load(Ordering::SeqCst);
                 if !playing {
@@ -108,7 +109,7 @@ impl AudioBackend for PipeWireAudioBackend {
 
                     let chunk = data.chunk_mut();
                     *chunk.offset_mut() = 0;
-                    *chunk.stride_mut() = (channels as i32) * 4;
+                    *chunk.stride_mut() = (*channels as i32) * 4;
                     *chunk.size_mut() = (to_copy * 4) as u32;
                 }
             })
@@ -171,7 +172,7 @@ impl AudioBackend for PipeWireAudioBackend {
 
         impl SendMainLoopPtr {
             unsafe fn run(self) {
-                let ml = &*(self.0 as *const pipewire::main_loop::MainLoop);
+                let ml = unsafe { &*(self.0 as *const pipewire::main_loop::MainLoop) };
                 ml.run();
             }
         }

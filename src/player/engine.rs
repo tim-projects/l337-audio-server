@@ -321,6 +321,14 @@ impl PlayerEngine {
                 .map_err(|e| format!("stream download failed: {e}"))?;
         }
 
+        {
+            let mut buf = self.audio_buffer.lock().unwrap();
+            buf.pcm.clear();
+            buf.read_pos = 0;
+            buf.channels = 0;
+            buf.file_sample_rate = 0;
+        }
+
         let audio_buffer = self.audio_buffer.clone();
         let decode_path = path.clone();
         let decode_cancel = cancel.clone();
@@ -964,6 +972,15 @@ fn streaming_decode_sync(
     track_id = track.id;
     codec_params = track.codec_params.clone();
 
+    let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
+    let channels = codec_params.channels.unwrap_or_default().count() as u16;
+
+    {
+        let mut ab = audio_buffer.lock().unwrap();
+        ab.channels = channels;
+        ab.file_sample_rate = file_sample_rate;
+    }
+
     tracing::info!(?codec_params, codec_id = ?codec_params.codec, "streaming_decode_sync: selected track codec params");
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &decoder_opts)
@@ -971,6 +988,32 @@ fn streaming_decode_sync(
             tracing::error!(?codec_params, error = ?e, "streaming_decode_sync: decoder creation failed");
             format!("decoder init: {e}")
         })?;
+
+    let device_rate = {
+        let ab = audio_buffer.lock().unwrap();
+        ab.sample_rate
+    };
+    let speed = {
+        let ab = audio_buffer.lock().unwrap();
+        ab.speed
+    };
+
+    let mut resampler = if file_sample_rate != device_rate || speed != 1.0 {
+        let channels = channels as usize;
+        let params = SincInterpolationParameters {
+            sinc_len: 1024,
+            f_cutoff: 0.95,
+            oversampling_factor: 128,
+            interpolation: SincInterpolationType::Cubic,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let chunk_size = 4096;
+        let effective_in_rate = (file_sample_rate as f64) * (speed as f64);
+        let ratio = device_rate as f64 / effective_in_rate;
+        Some(SincFixedIn::<f32>::new(ratio, 10.0, params, chunk_size, channels).unwrap())
+    } else {
+        None
+    };
 
     let mut sample_buf = None;
     let mut last_file_size = file_size;
@@ -994,16 +1037,34 @@ fn streaming_decode_sync(
                                 audio_buf.capacity() as u64,
                                 spec,
                             ));
-                            let mut ab = audio_buffer.lock().unwrap();
-                            ab.channels = spec.channels.count() as u16;
-                            ab.file_sample_rate = spec.rate;
                         }
 
                         if let Some(buf) = &mut sample_buf {
                             buf.copy_interleaved_ref(audio_buf);
                             let samples = buf.samples();
                             let mut ab = audio_buffer.lock().unwrap();
-                            ab.pcm.extend_from_slice(samples);
+
+                            if let Some(ref mut resampler) = resampler {
+                                let mut input_planar = vec![Vec::new(); channels as usize];
+                                for chunk in samples.chunks(channels as usize) {
+                                    for (ch, &sample) in chunk.iter().enumerate() {
+                                        input_planar[ch].push(sample);
+                                    }
+                                }
+
+                                if let Ok(output_planar) = resampler.process(&input_planar, None) {
+                                    let output_len = output_planar[0].len();
+                                    let mut output = Vec::with_capacity(output_len * channels as usize);
+                                    for i in 0..output_len {
+                                        for ch in 0..channels as usize {
+                                            output.push(output_planar[ch][i]);
+                                        }
+                                    }
+                                    ab.pcm.extend_from_slice(&output);
+                                }
+                            } else {
+                                ab.pcm.extend_from_slice(samples);
+                            }
                         }
 
                         stall_cycles = 0;
