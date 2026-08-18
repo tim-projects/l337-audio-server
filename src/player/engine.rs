@@ -1,6 +1,6 @@
 use crate::api::models::{PlayerStateLabel, PlayerStatus, Track};
+use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 use crate::player::storage::StorageManager;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::Resampler;
 use rubato::SincFixedIn;
 use rubato::SincInterpolationParameters;
@@ -16,28 +16,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tracing::{error, info};
 
-struct AudioBuffer {
-    pcm: Vec<f32>,
-    read_pos: usize,
-    channels: u16,
-    sample_rate: u32,
-    file_sample_rate: u32,
-    speed: f32,
-}
-
-impl AudioBuffer {
-    fn new(sample_rate: u32, file_sample_rate: u32) -> Self {
-        Self {
-            pcm: Vec::new(),
-            read_pos: 0,
-            channels: 0,
-            sample_rate,
-            file_sample_rate,
-            speed: 1.0,
-        }
-    }
-}
-
 struct StreamingPlayback {
     download_handle: Option<tokio::task::JoinHandle<()>>,
     decode_handle: tokio::task::JoinHandle<()>,
@@ -45,7 +23,7 @@ struct StreamingPlayback {
 }
 
 pub struct PlayerEngine {
-    stream: Option<cpal::Stream>,
+    stream: Option<Box<dyn AudioOutputStream>>,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
     volume: Arc<Mutex<f32>>,
     pub storage: StorageManager,
@@ -60,23 +38,41 @@ pub struct PlayerEngine {
     streaming: Option<StreamingPlayback>,
 }
 
-// SAFETY: `cpal::Stream` is a handle to an OS audio stream. On all supported
-// platforms it is safe to send it to another thread; cpal marks it `!Send` only
-// because the underlying platform type is conservatively modeled. All other
-// fields are `Send+Sync`, so `PlayerEngine` is `Send+Sync` in practice.
-unsafe impl Send for PlayerEngine {}
-unsafe impl Sync for PlayerEngine {}
-
 impl PlayerEngine {
     pub fn new(storage: StorageManager) -> Result<Self, String> {
-        let (stream, device_sample_rate) = Self::init_audio_device()?;
-
-        let buffer = Arc::new(Mutex::new(AudioBuffer::new(device_sample_rate, 0)));
+        let audio_buffer = Arc::new(Mutex::new(AudioBuffer::new(48000, 0)));
         let volume = Arc::new(Mutex::new(1.0));
 
+        let backend: Box<dyn AudioBackend> = {
+            #[cfg(target_os = "linux")]
+            {
+                Box::new(crate::platform::linux::PipeWireAudioBackend)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Box::new(crate::platform::macos::CoreAudioAudioBackend)
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Box::new(crate::platform::windows::WasapiAudioBackend)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            {
+                Box::new(crate::platform::common::NoopAudioBackend)
+            }
+        };
+
+        let stream = backend.start_stream(
+            "l337-audio-server",
+            48000,
+            2,
+            audio_buffer.clone(),
+            volume.clone(),
+        )?;
+
         Ok(Self {
-            stream,
-            audio_buffer: buffer,
+            stream: Some(stream),
+            audio_buffer,
             volume: volume.clone(),
             storage,
             current_track: None,
@@ -93,7 +89,7 @@ impl PlayerEngine {
 
     pub fn new_dummy(storage: StorageManager) -> Self {
         Self {
-            stream: None,
+            stream: Some(Box::new(crate::platform::common::NoopAudioOutputStream)),
             audio_buffer: Arc::new(Mutex::new(AudioBuffer::new(48000, 0))),
             volume: Arc::new(Mutex::new(1.0)),
             storage,
@@ -106,81 +102,6 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
-        }
-    }
-
-    fn init_audio_device() -> Result<(Option<cpal::Stream>, u32), String> {
-        if !crate::platform::linux::check_pipewire_available() {
-            return Err(
-                "PipeWire is required but not available. Start PipeWire or install it, then retry."
-                    .to_string(),
-            );
-        }
-
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or_else(|| {
-                "No PipeWire audio output device available. Re-run with --dummy to start without audio (testing only)."
-                    .to_string()
-            })?;
-
-        let mut supported = device
-            .supported_output_configs()
-            .map_err(|e| format!("Failed to query audio output configs: {}", e))?;
-
-        let config = supported
-            .find(|c| c.sample_format() == cpal::SampleFormat::F32)
-            .or_else(|| supported.next())
-            .ok_or_else(|| "no supported audio output config".to_string())?;
-
-        let sample_rate = config.max_sample_rate().0;
-        let _sample_format = config.sample_format();
-        let config: cpal::StreamConfig = config
-            .with_sample_rate(cpal::SampleRate(sample_rate))
-            .into();
-
-        let audio_buffer = Arc::new(Mutex::new(AudioBuffer::new(sample_rate, 0)));
-        let volume = Arc::new(Mutex::new(1.0));
-
-        let stream = {
-            let ab = audio_buffer.clone();
-            let vol = volume.clone();
-            device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if data.is_empty() {
-                        return;
-                    }
-                    let mut buf = ab.lock().unwrap();
-                    let available = buf.pcm.len().saturating_sub(buf.read_pos);
-                    let to_copy = data.len().min(available);
-
-                    let vol = *vol.lock().unwrap();
-                    for (dst, src) in data.iter_mut().zip(buf.pcm[buf.read_pos..].iter()) {
-                        *dst = src * vol;
-                    }
-                    buf.read_pos += to_copy;
-
-                    for sample in &mut data[to_copy..] {
-                        *sample = 0.0;
-                    }
-                },
-                |err| error!("audio stream error: {}", err),
-                None,
-            )
-        };
-
-        match stream {
-            Ok(s) => {
-                if let Err(e) = s.play() {
-                    error!("Failed to start audio stream: {}", e);
-                }
-                Ok((Some(s), sample_rate))
-            }
-            Err(e) => Err(
-                format!("Audio device found but could not initialize a stream ({}). A working audio \
-                      output is required. Re-run with --dummy to start without audio (testing only).", e)
-            ),
         }
     }
 
@@ -220,7 +141,7 @@ impl PlayerEngine {
         );
 
         if let Err(e) = download_stream(&track.stream_url, &path).await {
-            error!("Failed to download track: {}", e);
+            error!("play_track: download failed for {}: {}", track.stream_url, e);
             return Err(format!("Failed to download track: {}", e));
         }
 
@@ -345,7 +266,7 @@ impl PlayerEngine {
     }
 
     pub fn pause(&mut self) {
-        if let Some(ref stream) = self.stream {
+        if let Some(stream) = self.stream.as_mut() {
             if let Err(e) = stream.pause() {
                 error!("pause failed: {}", e);
             }
@@ -354,7 +275,7 @@ impl PlayerEngine {
     }
 
     pub fn resume(&mut self) {
-        if let Some(ref stream) = self.stream {
+        if let Some(stream) = self.stream.as_mut() {
             if let Err(e) = stream.play() {
                 error!("resume failed: {}", e);
             }
@@ -390,9 +311,6 @@ impl PlayerEngine {
         let dl_url = direct_url.clone();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        // yt-dlp-resolved URLs often require cookies / browser-like headers that
-        // simple HTTP clients do not provide. Prefer downloading through yt-dlp
-        // itself when possible.
         if yt_dlp_available() {
             download_via_ytdlp(url, &dl_path)
                 .await
@@ -429,11 +347,6 @@ impl PlayerEngine {
         drop(buf);
     }
 
-    /// Try to control the PipeWire/PulseAudio sink input volume directly.
-    ///
-    /// Falls back to the internal software gain if `pactl` is unavailable or the
-    /// sink input cannot be found. This keeps the API portable while giving
-    /// real system-level volume control on PipeWire hosts.
     pub fn set_volume(&mut self, volume: f32) {
         self.volume_val = volume.clamp(0.0, 1.0);
         if let Err(e) = self.set_pipewire_sink_input_volume(self.volume_val) {
@@ -645,7 +558,14 @@ fn decode_to_pcm(
     let track = format.default_track().ok_or("no default track")?;
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
-    let mut decoder = symphonia::default::get_codecs().make(&codec_params, &decoder_opts)?;
+    tracing::info!(?codec_params, codec_id = ?codec_params.codec, "decode_to_pcm: probing result");
+    let mut decoder = match symphonia::default::get_codecs().make(&codec_params, &decoder_opts) {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            tracing::error!(?codec_params, error = ?e, "decode_to_pcm: decoder creation failed");
+            return Err(format!("decoder init: {e}").into());
+        }
+    };
 
     let mut sample_buf = None;
     let mut pcm = Vec::new();
@@ -828,7 +748,6 @@ async fn download_via_ytdlp(
     url: &str,
     dest: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::process::Command;
 
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to download YouTube URLs.".into());
@@ -839,8 +758,10 @@ async fn download_via_ytdlp(
     let status = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
+        .arg("--extractor-args")
+        .arg("youtube:player_client=web")
         .arg("-f")
-        .arg("bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio")
+        .arg("bestaudio/best")
         .arg("--no-playlist")
         .arg("-o")
         .arg(dest)
@@ -860,18 +781,19 @@ async fn download_via_ytdlp(
     Ok(())
 }
 
-/// Use `yt-dlp -g` to resolve a YouTube watch URL to a direct audio stream URL.
 async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if !yt_dlp_available() {
-        return Err("yt-dlp is not installed. Install yt-dlp to play YouTube URLs.".into());
+        return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
     }
 
     let output = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
+        .arg("--extractor-args")
+        .arg("youtube:player_client=web")
         .arg("-g")
         .arg("-f")
-        .arg("bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio")
+        .arg("bestaudio/best")
         .arg("--no-playlist")
         .arg(url)
         .stdout(std::process::Stdio::piped())
@@ -894,7 +816,6 @@ async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::er
     Ok(stream_url)
 }
 
-/// Stream an HTTP response directly to `dest`, supporting cancellation.
 async fn stream_http_to_file(
     url: &str,
     dest: &PathBuf,
@@ -964,7 +885,7 @@ impl symphonia::core::io::MediaSource for FileSource {
 /// Synchronous decode loop for streaming playback.
 ///
 /// Waits for the download to produce data, then incrementally decodes packets
-/// and appends PCM into `audio_buffer` for the cpal callback to consume.
+/// and appends PCM into `audio_buffer` for the audio callback to consume.
 fn streaming_decode_sync(
     path: PathBuf,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
@@ -998,10 +919,7 @@ fn streaming_decode_sync(
         let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
         let source = FileSource { file };
         let mss = symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
-        let mut hint = symphonia::core::probe::Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
+        let hint = symphonia::core::probe::Hint::new();
         match symphonia::default::get_probe().format(
             &hint,
             mss,
@@ -1021,15 +939,38 @@ fn streaming_decode_sync(
 
     let probed = probed.unwrap();
     let mut format = probed.format;
-    let track = format
-        .default_track()
-        .ok_or("no default track in stream")?;
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
-    let decoder_opts = Default::default();
+    let track_id;
+    let codec_params;
+    let mut decoder_opts = Default::default();
+
+    let audio_track = format.tracks().iter().find(|t| {
+        let ct = t.codec_params.codec;
+        ct == symphonia::core::codecs::CODEC_TYPE_AAC
+            || ct == symphonia::core::codecs::CODEC_TYPE_MP3
+            || ct == symphonia::core::codecs::CODEC_TYPE_OPUS
+            || ct == symphonia::core::codecs::CODEC_TYPE_VORBIS
+            || ct == symphonia::core::codecs::CODEC_TYPE_FLAC
+            || ct == symphonia::core::codecs::CODEC_TYPE_ALAC
+            || ct == symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
+    });
+
+    let track = if let Some(t) = audio_track {
+        t
+    } else {
+        format
+            .default_track()
+            .ok_or("no default track in stream")?
+    };
+    track_id = track.id;
+    codec_params = track.codec_params.clone();
+
+    tracing::info!(?codec_params, codec_id = ?codec_params.codec, "streaming_decode_sync: selected track codec params");
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &decoder_opts)
-        .map_err(|e| format!("decoder init: {e}"))?;
+        .map_err(|e| {
+            tracing::error!(?codec_params, error = ?e, "streaming_decode_sync: decoder creation failed");
+            format!("decoder init: {e}")
+        })?;
 
     let mut sample_buf = None;
     let mut last_file_size = file_size;
@@ -1109,4 +1050,11 @@ fn streaming_decode_sync(
     Ok(())
 }
 
-
+#[cfg(test)]
+mod send_tests {
+    fn assert_send<T: Send>() {}
+    #[test]
+    fn test_player_engine_send() {
+        assert_send::<crate::player::engine::PlayerEngine>();
+    }
+}

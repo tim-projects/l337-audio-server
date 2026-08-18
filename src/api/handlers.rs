@@ -12,16 +12,15 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 // Use a simple wrapper to make PlayerEngine safely shareable across tasks.
-// tokio::sync::Mutex<PlayerEngine> is Send+Sync because PlayerEngine has an
-// explicit unsafe impl for Send+Sync (cpal::Stream is conservatively !Send
-// even though the underlying OS handle is safe to move between threads).
+// tokio::sync::Mutex<PlayerEngine> is Send+Sync because PlayerEngine and all
+// its fields (including the boxed audio stream handle) are naturally Send+Sync.
 pub struct SendableEngine(pub Mutex<PlayerEngine>);
 
 pub type AppState = Arc<SendableEngine>;
 
-pub async fn setup(axum::Extension(token): axum::Extension<Arc<std::sync::Mutex<String>>>) -> impl IntoResponse {
-    let token = token.lock().expect("token mutex poisoned");
-    Json(token.clone())
+pub async fn setup(axum::Extension(token): axum::Extension<Arc<tokio::sync::Mutex<String>>>) -> impl IntoResponse {
+    let token = token.lock().await;
+    Json(serde_json::json!({"token": token.clone()}))
 }
 
 fn track_id_missing() -> impl IntoResponse {

@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[allow(unused_imports)]
 use dirs;
@@ -37,6 +39,30 @@ impl PlatformInfo {
     }
 }
 
+/// Audio buffer shared between the engine and the native audio backend callback.
+#[derive(Debug, Clone)]
+pub struct AudioBuffer {
+    pub pcm: Vec<f32>,
+    pub read_pos: usize,
+    pub channels: u16,
+    pub sample_rate: u32,
+    pub file_sample_rate: u32,
+    pub speed: f32,
+}
+
+impl AudioBuffer {
+    pub fn new(sample_rate: u32, file_sample_rate: u32) -> Self {
+        Self {
+            pcm: Vec::new(),
+            read_pos: 0,
+            channels: 0,
+            sample_rate,
+            file_sample_rate,
+            speed: 1.0,
+        }
+    }
+}
+
 /// Runtime directory for the platform's session bus / IPC.
 /// On Linux with PipeWire this is `/run/l337-audio-server`.
 /// On other platforms it falls back to a cache dir.
@@ -62,29 +88,6 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
-/// Environment variables that must be set before opening an audio stream.
-pub fn audio_env() -> Vec<(&'static str, String)> {
-    let mut vars = Vec::new();
-
-    #[cfg(target_os = "linux")]
-    {
-        let rt = runtime_dir();
-        vars.push(("XDG_RUNTIME_DIR", rt.display().to_string()));
-        vars.push(("PIPEWIRE_RUNTIME_DIR", rt.display().to_string()));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let rt = runtime_dir();
-        vars.push(("XDG_RUNTIME_DIR", rt.display().to_string()));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = ();
-    }
-
-    vars
-}
-
 /// Ensure the platform runtime directory exists with correct permissions.
 pub fn ensure_runtime_dir() {
     let dir = runtime_dir();
@@ -101,6 +104,45 @@ pub fn ensure_runtime_dir() {
             let _ = std::fs::set_permissions(&dir, perms);
         }
     }
+}
+
+pub trait AudioOutputStream: Send + Sync {
+    fn play(&mut self) -> Result<(), String>;
+    fn pause(&mut self) -> Result<(), String>;
+    fn stop(&mut self);
+}
+
+pub trait AudioBackend: Send + Sync {
+    fn start_stream(
+        &self,
+        name: &str,
+        sample_rate: u32,
+        channels: u16,
+        audio_buffer: Arc<Mutex<AudioBuffer>>,
+        volume: Arc<Mutex<f32>>,
+    ) -> Result<Box<dyn AudioOutputStream>, String>;
+}
+
+pub struct NoopAudioBackend;
+pub struct NoopAudioOutputStream;
+
+impl AudioBackend for NoopAudioBackend {
+    fn start_stream(
+        &self,
+        _name: &str,
+        _sample_rate: u32,
+        _channels: u16,
+        _audio_buffer: Arc<Mutex<AudioBuffer>>,
+        _volume: Arc<Mutex<f32>>,
+    ) -> Result<Box<dyn AudioOutputStream>, String> {
+        Ok(Box::new(NoopAudioOutputStream))
+    }
+}
+
+impl AudioOutputStream for NoopAudioOutputStream {
+    fn play(&mut self) -> Result<(), String> { Ok(()) }
+    fn pause(&mut self) -> Result<(), String> { Ok(()) }
+    fn stop(&mut self) {}
 }
 
 #[cfg(test)]

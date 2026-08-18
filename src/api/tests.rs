@@ -10,9 +10,40 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    fn write_minimal_wav(path: &PathBuf) {
+        let sample_rate = 44100u32;
+        let channels = 2u16;
+        let duration_secs = 1u32;
+        let num_samples = (sample_rate * duration_secs) as usize;
+        let byte_rate = sample_rate * channels as u32 * 2;
+        let block_align = channels * 2;
+        let data_bytes = (num_samples * channels as usize) as u32 * 2;
+        let chunk_size = 36 + data_bytes;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&chunk_size.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for _ in 0..(num_samples * channels as usize) {
+            bytes.extend_from_slice(&[0u8; 2]);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
     async fn setup_state() -> AppState {
-        let storage =
-            StorageManager::new(500 * 1024 * 1024, Some(PathBuf::from("./test_cache"))).await;
+        let dir = std::env::temp_dir().join("l337-test-cache");
+        let _ = std::fs::create_dir_all(&dir);
+        let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
         let engine = PlayerEngine::new_dummy(storage);
         Arc::new(SendableEngine(Mutex::new(engine)))
     }
@@ -20,9 +51,11 @@ mod tests {
     #[tokio::test]
     async fn test_api_play() {
         let state = setup_state().await;
+        let audio_path = std::env::temp_dir().join("l337-test-cache").join("test.wav");
+        write_minimal_wav(&audio_path);
         let track = Track {
             track_id: "1".into(),
-            stream_url: "http://example.com/stream".into(),
+            stream_url: format!("file://{}", audio_path.display()),
             title: Some("Title".into()),
             artist: Some("Artist".into()),
             duration: Some(100),

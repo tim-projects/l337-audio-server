@@ -1,9 +1,40 @@
 use reqwest::Client;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 const SERVER_BIN: &str = "l337-audio-server";
+
+fn write_minimal_wav(path: &PathBuf) {
+    let sample_rate = 44100u32;
+    let channels = 2u16;
+    let duration_secs = 1u32;
+    let num_samples = (sample_rate * duration_secs) as usize;
+    let byte_rate = sample_rate * channels as u32 * 2;
+    let block_align = channels * 2;
+    let data_bytes = (num_samples * channels as usize) as u32 * 2;
+    let chunk_size = 36 + data_bytes;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&chunk_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_bytes.to_le_bytes());
+    for _ in 0..(num_samples * channels as usize) {
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    std::fs::write(path, bytes).unwrap();
+}
 
 /// Find an available TCP port by binding to port 0 and reading the assigned port.
 async fn find_available_port() -> u16 {
@@ -207,9 +238,12 @@ async fn test_play_endpoint() {
     let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
     let token = setup_body["token"].as_str().unwrap();
 
+    let audio_path = std::env::temp_dir().join("l337-test-audio.wav");
+    write_minimal_wav(&audio_path);
+
     let payload = serde_json::json!({
         "track_id": "test-track-1",
-        "stream_url": "http://example.com/stream",
+        "stream_url": format!("file://{}", audio_path.display()),
         "title": "Test Track",
         "artist": "Test Artist",
         "duration": 120
