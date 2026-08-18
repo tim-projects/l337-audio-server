@@ -22,6 +22,15 @@ pub fn init() {
     if std::env::var("PIPEWIRE_RUNTIME_DIR").is_err() {
         unsafe { std::env::set_var("PIPEWIRE_RUNTIME_DIR", &rt) };
     }
+    if std::env::var("PULSE_PROP_APPLICATION_NAME").is_err() {
+        unsafe { std::env::set_var("PULSE_PROP_APPLICATION_NAME", "l337-audio-server") };
+    }
+    if std::env::var("PIPEWIRE_NAME").is_err() {
+        unsafe { std::env::set_var("PIPEWIRE_NAME", "l337-audio-server") };
+    }
+    if std::env::var("ALSA_CLIENT_NAME").is_err() {
+        unsafe { std::env::set_var("ALSA_CLIENT_NAME", "l337-audio-server") };
+    }
 }
 
 /// Verify that PipeWire is available on the system.

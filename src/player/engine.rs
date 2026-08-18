@@ -39,7 +39,7 @@ impl AudioBuffer {
 }
 
 struct StreamingPlayback {
-    download_handle: tokio::task::JoinHandle<()>,
+    download_handle: Option<tokio::task::JoinHandle<()>>,
     decode_handle: tokio::task::JoinHandle<()>,
     cancel: Arc<AtomicBool>,
 }
@@ -110,12 +110,18 @@ impl PlayerEngine {
     }
 
     fn init_audio_device() -> Result<(Option<cpal::Stream>, u32), String> {
+        if !crate::platform::linux::check_pipewire_available() {
+            return Err(
+                "PipeWire is required but not available. Start PipeWire or install it, then retry."
+                    .to_string(),
+            );
+        }
+
         let device = cpal::default_host()
             .default_output_device()
             .ok_or_else(|| {
-                "No audio output device available. A working audio output \
-                 (e.g. PipeWire/ALSA) is required to serve audio. Re-run with --dummy \
-                 to start without audio (testing only).".to_string()
+                "No PipeWire audio output device available. Re-run with --dummy to start without audio (testing only)."
+                    .to_string()
             })?;
 
         let mut supported = device
@@ -357,12 +363,11 @@ impl PlayerEngine {
     }
 
     pub fn stop(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            drop(stream);
-        }
         if let Some(streaming) = self.streaming.take() {
             streaming.cancel.store(true, Ordering::SeqCst);
-            streaming.download_handle.abort();
+            if let Some(handle) = streaming.download_handle {
+                handle.abort();
+            }
             streaming.decode_handle.abort();
         }
         let mut buf = self.audio_buffer.lock().unwrap();
@@ -384,11 +389,19 @@ impl PlayerEngine {
         let dl_path = path.clone();
         let dl_url = direct_url.clone();
         let cancel = Arc::new(AtomicBool::new(false));
-        let download_cancel = cancel.clone();
 
-        let download_handle = tokio::spawn(async move {
-            let _ = stream_http_to_file(&dl_url, &dl_path, download_cancel).await;
-        });
+        // yt-dlp-resolved URLs often require cookies / browser-like headers that
+        // simple HTTP clients do not provide. Prefer downloading through yt-dlp
+        // itself when possible.
+        if yt_dlp_available() {
+            download_via_ytdlp(url, &dl_path)
+                .await
+                .map_err(|e| format!("yt-dlp download failed: {e}"))?;
+        } else {
+            stream_http_to_file(&dl_url, &dl_path, cancel.clone())
+                .await
+                .map_err(|e| format!("stream download failed: {e}"))?;
+        }
 
         let audio_buffer = self.audio_buffer.clone();
         let decode_path = path.clone();
@@ -400,7 +413,7 @@ impl PlayerEngine {
         });
 
         self.streaming = Some(StreamingPlayback {
-            download_handle,
+            download_handle: None,
             decode_handle,
             cancel,
         });
@@ -416,9 +429,64 @@ impl PlayerEngine {
         drop(buf);
     }
 
+    /// Try to control the PipeWire/PulseAudio sink input volume directly.
+    ///
+    /// Falls back to the internal software gain if `pactl` is unavailable or the
+    /// sink input cannot be found. This keeps the API portable while giving
+    /// real system-level volume control on PipeWire hosts.
     pub fn set_volume(&mut self, volume: f32) {
         self.volume_val = volume.clamp(0.0, 1.0);
-        *self.volume.lock().unwrap() = self.volume_val;
+        if let Err(e) = self.set_pipewire_sink_input_volume(self.volume_val) {
+            tracing::warn!("PipeWire volume control unavailable, using software gain: {e}");
+            *self.volume.lock().unwrap() = self.volume_val;
+        }
+    }
+
+    fn set_pipewire_sink_input_volume(&self, volume: f32) -> Result<(), String> {
+        let sink_input = Command::new("pactl")
+            .arg("list")
+            .arg("sink-inputs")
+            .output()
+            .map_err(|e| format!("pactl not available: {e}"))?;
+
+        if !sink_input.status.success() {
+            return Err("pactl list sink-inputs failed".into());
+        }
+
+        let output = String::from_utf8_lossy(&sink_input.stdout);
+        let mut current_index: Option<u32> = None;
+        let mut in_target = false;
+
+        for line in output.lines() {
+            let line = line.trim();
+            if line.starts_with("Sink Input #") {
+                current_index = line.rsplit('#').next().and_then(|s| s.trim().parse().ok());
+                in_target = false;
+            } else if line.starts_with("application.name =") || line.starts_with("node.name =") {
+                in_target = line.contains("l337-audio-server");
+            }
+
+            if in_target && line.starts_with("volume:") {
+                if let Some(index) = current_index {
+                    let percentage = (volume * 100.0).round().clamp(0.0, 100.0);
+                    let value = (volume * 65536.0).round().clamp(0.0, 65536.0) as u32;
+                    let status = Command::new("pactl")
+                        .arg("set-sink-input-volume")
+                        .arg(index.to_string())
+                        .arg(format!("{}%", percentage))
+                        .status()
+                        .map_err(|e| format!("pactl set-sink-input-volume failed: {e}"))?;
+
+                    if !status.success() {
+                        return Err(format!("pactl set-sink-input-volume exited with {}", status));
+                    }
+                    tracing::info!("Set PipeWire sink-input #{} volume to {}% ({})", index, percentage, value);
+                    return Ok(());
+                }
+            }
+        }
+
+        Err("l337-audio-server sink input not found".into())
     }
 
     pub fn seek(&mut self, position: u64) {
@@ -684,13 +752,20 @@ pub async fn download_stream(
         if !yt_dlp_available() {
             return Err("yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into());
         }
-        let direct_url = resolve_youtube_stream_url(url).await?;
-        return stream_http_to_file(&direct_url, dest, Arc::new(AtomicBool::new(false)))
+        return download_via_ytdlp(url, dest)
             .await
-            .map_err(|e| format!("yt-dlp stream failed for {url}: {e}").into());
+            .map_err(|e| format!("yt-dlp download failed for {url}: {e}").into());
     }
 
-    let response = reqwest::get(url).await?;
+    let response = reqwest::Client::builder()
+        .user_agent(concat!("l337-audio-server/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?
+        .get(url)
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await?;
     if !response.status().is_success() {
         return Err(format!("fetch failed ({}): {}", response.status(), url).into());
     }
@@ -827,7 +902,15 @@ async fn stream_http_to_file(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
 
-    let response = reqwest::get(url).await?;
+    let response = reqwest::Client::builder()
+        .user_agent(concat!("l337-audio-server/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?
+        .get(url)
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await?;
     if !response.status().is_success() {
         return Err(format!("fetch failed ({}): {}", response.status(), url).into());
     }
@@ -915,7 +998,10 @@ fn streaming_decode_sync(
         let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
         let source = FileSource { file };
         let mss = symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
-        let hint = symphonia::core::probe::Hint::new();
+        let mut hint = symphonia::core::probe::Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
         match symphonia::default::get_probe().format(
             &hint,
             mss,
