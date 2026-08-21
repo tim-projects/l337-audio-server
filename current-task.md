@@ -791,8 +791,15 @@ After completing all steps, report back:
 - `pactl set-sink-input-volume` hardware volume control.
 - HTTP transport with client-certificate auth or non-localhost binding.
 
+### YouTube Playback Attempt — FAILED
+- Requested `POST /player/play` with `https://www.youtube.com/watch?v=dQw4w9WgXcQ`
+- Initial response: `{"ok":true,"state":"playing"}`
+- Server then crashed with `Aborted (core dumped)` before `/player/status` could return data
+- Next step: reproduce under `gdb`/`coredumpctl` and inspect `start_streaming_playback` / `download_via_ytdlp` / `streaming_decode_sync` paths
+
 ### Remaining Work
-- [ ] Test YouTube URL playback end-to-end.
+- [ ] Diagnose and fix server abort during YouTube playback.
+- [ ] Retest YouTube URL playback end-to-end after fix.
 - [ ] Test seek endpoint with real audio.
 - [ ] Test `/player/play/stream` upload playback.
 - [ ] Verify `pactl set-sink-input-volume` works for hardware volume control.
