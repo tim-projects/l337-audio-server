@@ -634,6 +634,113 @@ The `NoopAudioBackend` is used for `--dummy` mode on all platforms.
 3. Build with `./scripts/build.sh` and compare binary size with `cargo bloat --release --crates`.
 4. Verify `pw-cli ls-node` shows `l337-audio-server` after running the server on a PipeWire system.
 
+### Step 10: Real Hardware Validation (this machine has PipeWire)
+This machine has a soundcard with PipeWire. Do NOT use `--dummy`. Validate actual playback end-to-end.
+
+#### 10.1 Build the binary
+```bash
+./scripts/build.sh
+```
+Expected: `bin/l337-audio-server` exists and is executable.
+
+#### 10.2 Start server over HTTP
+```bash
+L337__SERVER__PORT=1337 ./bin/l337-audio-server
+```
+- Confirm it binds to `0.0.0.0:1337` or `127.0.0.1:1337` per config.
+- Confirm `/health` returns JSON with `yt_dlp` capability.
+- Confirm `/setup` returns a token.
+
+#### 10.3 Play a local audio file over HTTP
+```bash
+# In another terminal, with the token from /setup:
+TOKEN="<token>"
+curl -k -X POST https://127.0.0.1:1337/player/play \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"track_id":"local-1","stream_url":"file:///path/to/test.wav","title":"Test"}'
+```
+- Confirm response is `200` with `{"ok": true, ...}`.
+- Confirm `/player/status` returns `"state":"playing"`.
+- Confirm audio is audible on the soundcard.
+
+#### 10.4 Play a YouTube URL over HTTP
+```bash
+curl -k -X POST https://127.0.0.1:1337/player/play \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"track_id":"yt-1","stream_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","title":"YouTube Test"}'
+```
+- Confirm response is `200`.
+- Confirm `/player/status` transitions to `playing`.
+- Confirm audio is audible on the soundcard.
+- Check server logs for `yt-dlp` download and decode progress.
+
+#### 10.5 Start server over Unix socket
+```bash
+./bin/l337-audio-server --transport=socket
+```
+- Confirm socket is created at `~/.cache/l337/l337-audio-server/l337.sock` (or configured path).
+- Confirm `curl --unix-socket` can reach `/health` and `/setup`.
+
+#### 10.6 Play a local audio file over Unix socket
+```bash
+curl --unix-socket ~/.cache/l337/l337-audio-server/l337.sock \
+  -k -X POST https://localhost/player/play \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"track_id":"socket-1","stream_url":"file:///path/to/test.wav","title":"Socket Test"}'
+```
+- Confirm response is `200`.
+- Confirm `/player/status` returns `playing`.
+- Confirm audio is audible on the soundcard.
+
+#### 10.7 Verify PipeWire sink input
+```bash
+pactl list sink-inputs
+```
+- Confirm an entry with `application.name = "l337-audio-server"` or `node.name = "l337-audio-server"` exists while playing.
+- Confirm `pactl set-sink-input-volume <index> 50%` works (hardware volume control).
+
+#### 10.8 Pause / Resume / Stop
+```bash
+curl -k -X POST https://127.0.0.1:1337/player/pause -H "Authorization: Bearer $TOKEN"
+curl -k -X POST https://127.0.0.1:1337/player/pause -H "Authorization: Bearer $TOKEN"  # resume
+curl -k -X POST https://127.0.0.1:1337/player/pause -H "Authorization: Bearer $TOKEN"  # pause again
+```
+- Confirm state toggles between `paused` and `playing`.
+- Confirm audio output mutes on pause and resumes on play.
+
+#### 10.9 Seek
+```bash
+curl -k -X POST https://127.0.0.1:1337/player/seek \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"position": 30}'
+```
+- Confirm response is `200`.
+- Confirm `/player/status` shows updated `position_sec`.
+
+#### 10.10 Stop
+```bash
+curl -k -X POST https://127.0.0.1:1337/player/pause -H "Authorization: Bearer $TOKEN"
+```
+- Confirm state returns to `stopped`.
+- Confirm `pactl list sink-inputs` no longer shows `l337-audio-server`.
+
+#### 10.11 Upload stream playback
+```bash
+curl -k -X POST https://127.0.0.1:1337/player/play/stream \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Track-Id: uploaded-1" \
+  -H "X-Title: Uploaded" \
+  -H "Content-Type: audio/wav" \
+  --data-binary @/path/to/test.wav
+```
+- Confirm response is `200`.
+- Confirm `/player/status` returns `playing`.
+- Confirm audio is audible on the soundcard.
+
 ### Critical Invariants (do not violate)
 - The audio callback in every backend must directly lock `Arc<Mutex<AudioBuffer>>` and `Arc<Mutex<f32>>`, copying PCM with volume and zeroing the remainder — exactly mirroring old `engine.rs` lines 154-166.
 - `AudioBuffer` lives in `platform/common.rs`, not `engine.rs`.
