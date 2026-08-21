@@ -757,3 +757,43 @@ After completing all steps, report back:
 3. `cargo test` result.
 4. Any compilation warnings that were intentionally suppressed or need follow-up.
 5. Any API assumptions that turned out to be incorrect and how you resolved them.
+
+---
+
+## Actual Validation Results (2026-08-21)
+
+### Environment
+- Machine has a soundcard with PipeWire.
+- `yt-dlp` is installed (`2026.07.04`).
+- Existing server instance was already running on Unix socket at `~/.cache/l337/l337-audio-server/l337.sock`.
+
+### Unix Socket Transport — Verified
+- **Health:** `curl --unix-socket ... /health` returned `{"status":"ok","capabilities":{"yt_dlp":true}}`
+- **Setup:** `/setup` returned token.
+- **Play local file:** `POST /player/play` with `file:///tmp/test_tone.wav` returned `{"ok":true,"state":"playing"}`
+- **Status:** `/player/status` returned `"state":"playing"`, `"audio_available":true`
+- **PipeWire sink input:** `pactl list sink-inputs` showed `node.name = "l337-audio-server"`
+- **Pause/Resume:** Toggling `/player/pause` correctly switched state between `playing` and `paused`
+
+### HTTP Transport — Verified
+- **Server start:** `L337__SERVER__PORT=1338 ./bin/l337-audio-server --transport=http` started successfully after clearing stale instance lock.
+- **Health:** `https://127.0.0.1:1338/health` returned `{"status":"ok","capabilities":{"yt_dlp":true}}`
+- **Setup:** `/setup` returned token `l337-shared-token-change-me`
+- **Play local file:** `POST /player/play` with `file:///tmp/test_tone.wav` returned `{"ok":true,"state":"playing"}`
+- **Status:** `/player/status` returned `"state":"playing"`, `"audio_available":true`
+- **PipeWire sink input:** `pactl list sink-inputs` confirmed `node.name = "l337-audio-server"` and `media.name = "l337-audio-server"`
+- **User confirmation:** User heard the 440Hz test tone on their speaker via HTTP playback.
+
+### What Was Not Yet Tested
+- YouTube URL playback over HTTP (yt-dlp is installed, but no YouTube URL was tested in this session).
+- Seek endpoint over real hardware.
+- Upload stream (`/player/play/stream`) over real hardware.
+- `pactl set-sink-input-volume` hardware volume control.
+- HTTP transport with client-certificate auth or non-localhost binding.
+
+### Remaining Work
+- [ ] Test YouTube URL playback end-to-end.
+- [ ] Test seek endpoint with real audio.
+- [ ] Test `/player/play/stream` upload playback.
+- [ ] Verify `pactl set-sink-input-volume` works for hardware volume control.
+- [ ] Consider reducing `PipeWire process callback called` debug log spam in production.
