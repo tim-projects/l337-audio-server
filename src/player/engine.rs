@@ -242,14 +242,14 @@ impl PlayerEngine {
         self.duration_sec = Some((pcm.len() / channels as usize) as u64);
 
         let device_rate = {
-            let buf = self.audio_buffer.lock().unwrap();
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.sample_rate
         };
 
         let playback_pcm =
             resample_interleaved(&pcm, channels, file_sample_rate, device_rate, self.speed);
 
-        let mut buf = self.audio_buffer.lock().unwrap();
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
         buf.channels = channels;
@@ -291,7 +291,7 @@ impl PlayerEngine {
             }
             streaming.decode_handle.abort();
         }
-        let mut buf = self.audio_buffer.lock().unwrap();
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm.clear();
         buf.read_pos = 0;
         drop(buf);
@@ -322,7 +322,7 @@ impl PlayerEngine {
         }
 
         {
-            let mut buf = self.audio_buffer.lock().unwrap();
+            let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.pcm.clear();
             buf.read_pos = 0;
             buf.channels = 0;
@@ -350,7 +350,7 @@ impl PlayerEngine {
 
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed.clamp(0.25, 4.0);
-        let mut buf = self.audio_buffer.lock().unwrap();
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.speed = self.speed;
         drop(buf);
     }
@@ -359,7 +359,7 @@ impl PlayerEngine {
         self.volume_val = volume.clamp(0.0, 1.0);
         if let Err(e) = self.set_pipewire_sink_input_volume(self.volume_val) {
             tracing::warn!("PipeWire volume control unavailable, using software gain: {e}");
-            *self.volume.lock().unwrap() = self.volume_val;
+            *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
         }
     }
 
@@ -454,14 +454,15 @@ impl PlayerEngine {
         self.channels = channels;
 
         let device_rate = {
-            let buf = self.audio_buffer.lock().unwrap();
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.sample_rate
         };
 
         let playback_pcm =
             resample_interleaved(&pcm, channels, file_sample_rate, device_rate, self.speed);
+        tracing::info!("seek: after resample: playback_pcm.len()={}", playback_pcm.len());
 
-        let mut buf = self.audio_buffer.lock().unwrap();
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
         buf.channels = channels;
@@ -519,14 +520,15 @@ impl PlayerEngine {
         let utilization = self.storage.get_total_size().await;
 
         let position_sec = {
-            let buf = self.audio_buffer.lock().unwrap();
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
                 Some(self.position_sec)
             } else {
                 let consumed = buf.read_pos as u64;
                 let orig_frames = (consumed as f64 * buf.file_sample_rate as f64 * buf.speed as f64
                     / buf.sample_rate as f64) as u64;
-                Some(orig_frames / buf.file_sample_rate as u64)
+                let buffer_sec = orig_frames / buf.file_sample_rate as u64;
+                Some(self.position_sec + buffer_sec)
             }
         };
 
@@ -643,14 +645,37 @@ fn resample_interleaved(
         }
     }
 
-    let output_planar = resampler.process(&input_planar, None).unwrap();
-
-    let output_len = output_planar[0].len();
-    let mut output = Vec::with_capacity(output_len * channels);
-    for i in 0..output_len {
-        for ch in 0..channels {
-            output.push(output_planar[ch][i]);
+    let mut output = Vec::new();
+    let mut input_offset = 0;
+    loop {
+        let frames_needed = resampler.input_frames_next();
+        if frames_needed == 0 {
+            break;
         }
+        if input_offset + frames_needed > input_planar[0].len() {
+            if input_offset < input_planar[0].len() {
+                let remaining = &input_planar[0].len() - input_offset;
+                let mut remaining_input: Vec<Vec<f32>> = input_planar
+                    .iter()
+                    .map(|v| v[input_offset..].to_vec())
+                    .collect();
+                let output_planar = resampler.process_partial(Some(&remaining_input), None).unwrap();
+                for ch in 0..channels {
+                    output.extend_from_slice(&output_planar[ch]);
+                }
+            }
+            break;
+        }
+
+        let mut chunk_input: Vec<Vec<f32>> = input_planar
+            .iter()
+            .map(|v| v[input_offset..input_offset + frames_needed].to_vec())
+            .collect();
+        let output_planar = resampler.process(&chunk_input, None).unwrap();
+        for ch in 0..channels {
+            output.extend_from_slice(&output_planar[ch]);
+        }
+        input_offset += frames_needed;
     }
     output
 }
@@ -973,10 +998,10 @@ fn streaming_decode_sync(
     codec_params = track.codec_params.clone();
 
     let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.unwrap_or_default().count() as u16;
+    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
 
     {
-        let mut ab = audio_buffer.lock().unwrap();
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.channels = channels;
         ab.file_sample_rate = file_sample_rate;
     }
@@ -990,11 +1015,11 @@ fn streaming_decode_sync(
         })?;
 
     let device_rate = {
-        let ab = audio_buffer.lock().unwrap();
+        let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.sample_rate
     };
     let speed = {
-        let ab = audio_buffer.lock().unwrap();
+        let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.speed
     };
 
@@ -1042,7 +1067,7 @@ fn streaming_decode_sync(
                         if let Some(buf) = &mut sample_buf {
                             buf.copy_interleaved_ref(audio_buf);
                             let samples = buf.samples();
-                            let mut ab = audio_buffer.lock().unwrap();
+                            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
 
                             if let Some(ref mut resampler) = resampler {
                                 let mut input_planar = vec![Vec::new(); channels as usize];

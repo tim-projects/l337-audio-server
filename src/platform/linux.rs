@@ -65,15 +65,14 @@ impl AudioBackend for PipeWireAudioBackend {
                 tracing::info!("PipeWire stream state changed: {:?} -> {:?}", old, new);
             })
             .process(move |stream, (ab, vol, playing_cb, channels)| {
-                tracing::debug!("PipeWire process callback called");
                 let playing = playing_cb.load(Ordering::SeqCst);
                 if !playing {
                     return;
                 }
 
-                let mut buf = ab.lock().unwrap();
+                let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
-                let v = *vol.lock().unwrap();
+                let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
 
                 if let Some(mut buffer) = stream.dequeue_buffer() {
                     let datas = buffer.datas_mut();

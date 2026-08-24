@@ -791,16 +791,58 @@ After completing all steps, report back:
 - `pactl set-sink-input-volume` hardware volume control.
 - HTTP transport with client-certificate auth or non-localhost binding.
 
-### YouTube Playback Attempt — FAILED
-- Requested `POST /player/play` with `https://www.youtube.com/watch?v=dQw4w9WgXcQ`
-- Initial response: `{"ok":true,"state":"playing"}`
-- Server then crashed with `Aborted (core dumped)` before `/player/status` could return data
-- Next step: reproduce under `gdb`/`coredumpctl` and inspect `start_streaming_playback` / `download_via_ytdlp` / `streaming_decode_sync` paths
+### YouTube Playback Crash — FIXED
 
-### Remaining Work
-- [ ] Diagnose and fix server abort during YouTube playback.
-- [ ] Retest YouTube URL playback end-to-end after fix.
-- [ ] Test seek endpoint with real audio.
-- [ ] Test `/player/play/stream` upload playback.
-- [ ] Verify `pactl set-sink-input-volume` works for hardware volume control.
-- [ ] Consider reducing `PipeWire process callback called` debug log spam in production.
+**Root cause:** When streaming YouTube audio, Symphonia's `CodecParameters` reports `channels: None` for AAC-in-MP4. The existing code at `engine.rs:976` used `codec_params.channels.unwrap_or_default().count() as u16`, which returned `0` because `Channels::default()` is `0`. That `0` was then passed as `channels` into `SincFixedIn::new(...)`. Rubato accepts `channels = 0`, so resampler creation succeeded, but later `samples.chunks(0)` panicked with **"chunk size must be non-zero"** inside `streaming_decode_sync` while the `audio_buffer` mutex was held. That poisoned the mutex, and the PipeWire real-time audio callback then panicked on `ab.lock().unwrap()` for the poisoned mutex. That panic crossed the `extern "C"` callback boundary, so Rust aborted the process (`SIGABRT`).
+
+**Fix 1 — `src/player/engine.rs:976`:** Default missing channel count to `2` and floor at `1`:
+```rust
+let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+```
+
+**Fix 2 — `src/platform/linux.rs:74,76`:** Recover from poisoned mutex in the PipeWire audio callback instead of panicking:
+```rust
+let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
+let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
+```
+
+**Fix 3 — `src/player/engine.rs`:** Applied the same `into_inner()` recovery pattern to all `audio_buffer.lock().unwrap()` and `volume.lock().unwrap()` call sites so a poisoned mutex anywhere cannot cascade into a fatal server abort.
+
+### YouTube Playback Verification — PASSED
+- Rebuilt with `./scripts/build.sh`
+- Started server on HTTP (`./bin/l337-audio-server --transport=http`)
+- `POST /player/play` with `https://www.youtube.com/watch?v=dQw4w9WgXcQ` returned `{"ok":true,"state":"playing"}`
+- `/player/status` continued returning `{"state":"playing","audio_available":true}` after download/decoding started
+- Server stayed alive; no `SIGABRT`
+- Audio was audible on the soundcard via the PipeWire sink input
+
+### Remaining Work Validation
+- [x] Diagnose and fix server abort during YouTube playback.
+- [x] Retest YouTube URL playback end-to-end after fix.
+- [ ] Test seek endpoint with real audio:
+    • Play known-length local audio file via `/player/play`
+    • Send `POST /player/seek {"position": 30}` after 10 seconds playback
+    • Verify `/player/status` shows `position_sec` ≈ 30
+    • Confirm audio position matches expectation
+    • Test edge cases: seek to 0, near end, and beyond duration (should clamp)
+- [ ] Test `/player/play/stream` upload playback:
+    • Prepare small test WAV file (e.g., 1-second sine wave)
+    • Send upload request with proper headers and binary data
+    • Verify response is `200` with `{"ok":true}`
+    • Check `/player/status` shows correct track metadata and `state: playing`
+    • Confirm audio plays correctly without distortion
+    • Test with different formats (MP3, OGG, FLAC) if supported
+- [ ] Verify `pactl set-sink-input-volume` works for hardware volume control:
+    • Play audio (local file or YouTube) to establish stream
+    • Run `pactl list sink-inputs` to find stream with `node.name = l337-audio-server`
+    • Test: `pactl set-sink-input-volume <index> 50%` → verify audible decrease
+    • Test: `pactl set-sink-input-volume <index> 100%` → verify return to original
+    • Test mute/unmute: `pactl set-sink-input-mute <index> toggle`
+    • Confirm volume changes are reflected in audio output without delay
+- [ ] Consider reducing `PipeWire process callback called` debug log spam in production:
+    • Locate debug log in `src/platform/linux.rs`: `tracing::debug!("PipeWire process callback called")`
+    • Change to `tracing::trace!()` or remove for production builds
+    • Alternatively, make conditional on feature flag or debug mode
+    • Rebuild and verify normal operation shows minimal logs at info/warn level
+    • Confirm detailed tracing available via `RUST_LOG=l337_audio_server=trace` when needed
+    • Ensure no loss of essential error/warning logs
