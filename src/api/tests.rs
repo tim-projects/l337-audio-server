@@ -1,10 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::api::handlers::{AppState, SendableEngine, get_status, pause, play};
-    use crate::api::models::Track;
+    use crate::api::handlers::{AppState, SendableEngine, get_status, pause, play, seek, set_speed, set_volume, upload_stream};
+    use crate::api::models::{SeekPayload, SpeedPayload, Track, VolumePayload};
     use crate::player::engine::PlayerEngine;
     use crate::player::storage::StorageManager;
+    use axum::body::Body;
     use axum::extract::{Json, State};
+    use axum::http::{HeaderMap, HeaderValue};
     use axum::response::IntoResponse;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -85,5 +87,91 @@ mod tests {
             response.into_response().status(),
             axum::http::StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn test_api_seek() {
+        let state = setup_state().await;
+        let audio_path = std::env::temp_dir().join("l337-test-cache").join("seek.wav");
+        write_minimal_wav(&audio_path);
+        let track = Track {
+            track_id: "seek-track".into(),
+            stream_url: format!("file://{}", audio_path.display()),
+            title: Some("Seek".into()),
+            artist: Some("Test".into()),
+            duration: Some(1),
+        };
+        let _ = play(State(state.clone()), Json(track)).await;
+
+        let response = seek(State(state.clone()), Json(SeekPayload { position: 0 })).await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_set_speed() {
+        let state = setup_state().await;
+        let response = set_speed(State(state.clone()), Json(SpeedPayload { speed: 1.5 })).await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+        let status = get_status(State(state.clone())).await;
+        let response = status.into_response();
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["speed"], 1.5);
+    }
+
+    #[tokio::test]
+    async fn test_api_set_volume() {
+        let state = setup_state().await;
+        let response = set_volume(State(state.clone()), Json(VolumePayload { volume: 0.5 })).await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+        let status = get_status(State(state.clone())).await;
+        let response = status.into_response();
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["volume"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_api_upload_stream() {
+        let state = setup_state().await;
+        let audio_path = std::env::temp_dir().join("l337-test-cache").join("upload.wav");
+        write_minimal_wav(&audio_path);
+        let bytes = std::fs::read(&audio_path).expect("Failed to read WAV bytes");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Track-Id", HeaderValue::from_static("upload-track"));
+        headers.insert("X-Title", HeaderValue::from_static("Upload Title"));
+        headers.insert("X-Artist", HeaderValue::from_static("Upload Artist"));
+
+        let response = upload_stream(
+            State(state.clone()),
+            axum::extract::OriginalUri(axum::http::Uri::from_static("/player/play/stream")),
+            headers,
+            Body::from(bytes),
+        )
+        .await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+
+        let status = get_status(State(state.clone())).await;
+        let response = status.into_response();
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["state"], "playing");
+        assert_eq!(json["current_track"]["track_id"], "upload-track");
     }
 }

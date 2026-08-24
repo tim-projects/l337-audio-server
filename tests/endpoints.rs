@@ -456,3 +456,443 @@ async fn test_cache_lookup_endpoint() {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
+
+#[tokio::test]
+async fn test_seek_endpoint() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let audio_path = std::env::temp_dir().join("l337-test-seek.wav");
+    write_minimal_wav(&audio_path);
+
+    let play_payload = serde_json::json!({
+        "track_id": "seek-test-track",
+        "stream_url": format!("file://{}", audio_path.display()),
+        "title": "Seek Test",
+        "artist": "Test",
+        "duration": 1
+    });
+
+    let play_resp = client
+        .post(format!("https://127.0.0.1:{}/player/play", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&play_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/play");
+    assert_eq!(play_resp.status(), 200);
+
+    sleep(Duration::from_millis(200)).await;
+
+    let seek_payload = serde_json::json!({
+        "position": 0
+    });
+
+    let seek_resp = client
+        .post(format!("https://127.0.0.1:{}/player/seek", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&seek_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/seek");
+    assert_eq!(seek_resp.status(), 200);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    assert_eq!(status_body["state"], "playing");
+    assert!(status_body["position_sec"].is_number());
+    assert!(status_body["duration_sec"].is_number());
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_upload_stream_endpoint() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let audio_path = std::env::temp_dir().join("l337-test-stream.wav");
+    write_minimal_wav(&audio_path);
+    let wav_bytes = std::fs::read(&audio_path).expect("Failed to read WAV bytes");
+
+    let resp = client
+        .post(format!("https://127.0.0.1:{}/player/play/stream", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Track-Id", "stream-test-track")
+        .header("X-Title", "Stream Test")
+        .header("X-Artist", "Test Artist")
+        .body(wav_bytes)
+        .send()
+        .await
+        .expect("Failed to call /player/play/stream");
+
+    assert_eq!(resp.status(), 200);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    assert_eq!(status_body["state"], "playing");
+    assert_eq!(status_body["current_track"]["track_id"], "stream-test-track");
+    assert_eq!(status_body["current_track"]["title"], "Stream Test");
+    assert_eq!(status_body["audio_available"], true);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_upload_stream_validation() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("https://127.0.0.1:{}/player/play/stream", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .body(vec![])
+        .send()
+        .await
+        .expect("Failed to call /player/play/stream");
+
+    assert_eq!(resp.status(), 400);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_auth_invalid_token() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", "Bearer wrong-token")
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+
+    assert_eq!(resp.status(), 401);
+
+    let resp2 = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", "NotBearer at-all")
+        .send()
+        .await
+        .expect("Failed to call /player/status with malformed header");
+
+    assert_eq!(resp2.status(), 401);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_speed_endpoint() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let audio_path = std::env::temp_dir().join("l337-test-speed.wav");
+    write_minimal_wav(&audio_path);
+
+    let play_payload = serde_json::json!({
+        "track_id": "speed-test-track",
+        "stream_url": format!("file://{}", audio_path.display()),
+        "title": "Speed Test",
+        "artist": "Test",
+        "duration": 1
+    });
+
+    let play_resp = client
+        .post(format!("https://127.0.0.1:{}/player/play", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&play_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/play");
+    assert_eq!(play_resp.status(), 200);
+
+    let speed_payload = serde_json::json!({"speed": 1.5});
+    let speed_resp = client
+        .post(format!("https://127.0.0.1:{}/player/speed", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&speed_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/speed");
+    assert_eq!(speed_resp.status(), 200);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    assert_eq!(status_body["speed"], 1.5);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_volume_endpoint() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let audio_path = std::env::temp_dir().join("l337-test-volume.wav");
+    write_minimal_wav(&audio_path);
+
+    let play_payload = serde_json::json!({
+        "track_id": "volume-test-track",
+        "stream_url": format!("file://{}", audio_path.display()),
+        "title": "Volume Test",
+        "artist": "Test",
+        "duration": 1
+    });
+
+    let play_resp = client
+        .post(format!("https://127.0.0.1:{}/player/play", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&play_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/play");
+    assert_eq!(play_resp.status(), 200);
+
+    let volume_payload = serde_json::json!({"volume": 0.5});
+    let volume_resp = client
+        .post(format!("https://127.0.0.1:{}/player/volume", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&volume_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/volume");
+    assert_eq!(volume_resp.status(), 200);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    assert_eq!(status_body["volume"], 0.5);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_cache_next_and_previous_endpoints() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let next_audio = std::env::temp_dir().join("l337-test-next.wav");
+    write_minimal_wav(&next_audio);
+    let prev_audio = std::env::temp_dir().join("l337-test-prev.wav");
+    write_minimal_wav(&prev_audio);
+
+    let cache_next_payload = serde_json::json!({
+        "track_id": "next-cache-track",
+        "stream_url": format!("file://{}", next_audio.display()),
+        "title": "Next Track",
+        "artist": "Test",
+        "duration": 1
+    });
+
+    let cache_next_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/next", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&cache_next_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/cache/next");
+    assert_eq!(cache_next_resp.status(), 202);
+
+    let cache_prev_payload = serde_json::json!({
+        "track_id": "prev-cache-track",
+        "stream_url": format!("file://{}", prev_audio.display()),
+        "title": "Prev Track",
+        "artist": "Test",
+        "duration": 1
+    });
+
+    let cache_prev_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/previous", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&cache_prev_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/cache/previous");
+    assert_eq!(cache_prev_resp.status(), 202);
+
+    sleep(Duration::from_secs(2)).await;
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    assert_eq!(status_body["next_cached"], true);
+    assert_eq!(status_body["prev_cached"], true);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_cache_stream_upload_endpoints() {
+    let (_port, mut child) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let setup_resp = client
+        .get(format!("https://127.0.0.1:{}/setup", _port))
+        .send()
+        .await
+        .expect("Failed to call /setup");
+    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
+    let token = setup_body["token"].as_str().unwrap();
+
+    let next_audio = std::env::temp_dir().join("l337-test-cache-next-stream.wav");
+    write_minimal_wav(&next_audio);
+    let prev_audio = std::env::temp_dir().join("l337-test-cache-prev-stream.wav");
+    write_minimal_wav(&prev_audio);
+    let next_bytes = std::fs::read(&next_audio).expect("Failed to read next WAV bytes");
+    let prev_bytes = std::fs::read(&prev_audio).expect("Failed to read prev WAV bytes");
+
+    let next_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/next/stream", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Track-Id", "cache-next-stream")
+        .header("X-Title", "Cached Next")
+        .body(next_bytes)
+        .send()
+        .await
+        .expect("Failed to call /player/cache/next/stream");
+    assert_eq!(next_resp.status(), 200);
+
+    let prev_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/previous/stream", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Track-Id", "cache-prev-stream")
+        .header("X-Title", "Cached Prev")
+        .body(prev_bytes)
+        .send()
+        .await
+        .expect("Failed to call /player/cache/previous/stream");
+    assert_eq!(prev_resp.status(), 200);
+
+    let lookup_payload = serde_json::json!({
+        "track_ids": ["cache-next-stream", "cache-prev-stream"]
+    });
+
+    let lookup_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/lookup", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&lookup_payload)
+        .send()
+        .await
+        .expect("Failed to call /player/cache/lookup");
+    assert_eq!(lookup_resp.status(), 200);
+    let lookup_body: serde_json::Value = lookup_resp.json().await.expect("Failed to parse /player/cache/lookup JSON");
+    let cached: Vec<String> = lookup_body["cached"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    assert!(cached.contains(&"cache-next-stream".to_string()));
+    assert!(cached.contains(&"cache-prev-stream".to_string()));
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}

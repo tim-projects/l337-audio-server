@@ -24,7 +24,7 @@ impl AudioBackend for PipeWireAudioBackend {
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
         tracing::info!("Starting PipeWire stream: name={}, sample_rate={}, channels={}", name, sample_rate, channels);
-        unsafe { pipewire::init() };
+        pipewire::init();
 
         let main_loop = Box::new(pipewire::main_loop::MainLoopBox::new(None)
             .map_err(|e| format!("Failed to create PipeWire main loop: {}", e))?);
@@ -61,7 +61,7 @@ impl AudioBackend for PipeWireAudioBackend {
 
         let listener = stream
             .add_local_listener_with_user_data((ab, vol, playing_cb, channels_captured))
-            .state_changed(|stream, _user_data, old, new| {
+            .state_changed(|_stream, _user_data, old, new| {
                 tracing::info!("PipeWire stream state changed: {:?} -> {:?}", old, new);
             })
             .process(move |stream, (ab, vol, playing_cb, channels)| {

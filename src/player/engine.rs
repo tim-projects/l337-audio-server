@@ -239,7 +239,7 @@ impl PlayerEngine {
 
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
-        self.duration_sec = Some((pcm.len() / channels as usize) as u64);
+        self.duration_sec = Some(((pcm.len() / channels as usize) as f64 / file_sample_rate as f64).round() as u64);
 
         let device_rate = {
             let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -471,6 +471,8 @@ impl PlayerEngine {
         drop(buf);
 
         self.position_sec = position;
+        let remaining_frames = pcm.len() / channels as usize;
+        self.duration_sec = Some((remaining_frames as f64 / file_sample_rate as f64).round() as u64);
         self.state = PlayerStateLabel::Playing;
     }
 
@@ -547,7 +549,7 @@ impl PlayerEngine {
     }
 }
 
-fn decode_to_pcm(
+pub(crate) fn decode_to_pcm(
     bytes: Vec<u8>,
 ) -> Result<(Vec<f32>, u32, u16), Box<dyn std::error::Error + Send + Sync>> {
     use symphonia::core::audio::SampleBuffer;
@@ -612,7 +614,7 @@ fn decode_to_pcm(
     Ok((pcm, sample_rate, channels))
 }
 
-fn resample_interleaved(
+pub(crate) fn resample_interleaved(
     input: &[f32],
     channels: u16,
     in_rate: u32,
@@ -654,7 +656,7 @@ fn resample_interleaved(
         }
         if input_offset + frames_needed > input_planar[0].len() {
             if input_offset < input_planar[0].len() {
-                let remaining = &input_planar[0].len() - input_offset;
+                let _remaining = &input_planar[0].len() - input_offset;
                 let mut remaining_input: Vec<Vec<f32>> = input_planar
                     .iter()
                     .map(|v| v[input_offset..].to_vec())
