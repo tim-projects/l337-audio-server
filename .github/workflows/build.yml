@@ -113,6 +113,8 @@ jobs:
         wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
         unzip -q android-ndk-${NDK_VERSION}-linux.zip
         echo "$(pwd)/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        echo "CC_aarch64-linux-android=$(pwd)/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> $GITHUB_ENV
+        echo "CXX_aarch64-linux-android=$(pwd)/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++" >> $GITHUB_ENV
     - name: Build release binary
       run: cargo build --verbose --release --target aarch64-linux-android --no-default-features
     - name: Upload artifact
