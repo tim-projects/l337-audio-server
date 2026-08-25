@@ -135,6 +135,20 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         path: ./release-artifacts
+    - name: Rename binaries with target triple
+      run: |
+        find ./release-artifacts -type f ! -name '*.d' | while read -r f; do
+          dir=$(dirname "$f")
+          base=$(basename "$f")
+          target=$(basename "$dir")
+          ext=""
+          case "$base" in
+            *.exe) ext=".exe" ;;
+          esac
+          newname="${target}${ext}"
+          mv "$f" "$dir/$newname"
+          echo "Renamed: $base -> $newname"
+        done
     - name: Inspect downloaded artifacts
       run: |
         echo "Artifacts downloaded:"
