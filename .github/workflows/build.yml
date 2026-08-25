@@ -138,11 +138,11 @@ jobs:
         echo "Artifacts downloaded:"
         find ./release-artifacts -type f -exec ls -lh {} \;
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.release_tag.outputs.tag }}
-        name: ${{ steps.release_tag.outputs.name }}
-        files: ./release-artifacts/**/*
-        draft: false
-        prerelease: true
-        generate_release_notes: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "${{ steps.release_tag.outputs.tag }}" \
+          --title "${{ steps.release_tag.outputs.name }}" \
+          --prerelease \
+          --generate-notes \
+          $(find ./release-artifacts -type f -printf '-a %p ')
