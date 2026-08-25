@@ -120,13 +120,11 @@ write_system_unit() {
 
     local after_pipewire=""
     local env_runtime=""
-    local exec_start_pre=""
 
     if [ "$audio_backend" = "pipewire-system" ]; then
         after_pipewire="After=pipewire.service
 Wants=pipewire.service"
         env_runtime="Environment=XDG_RUNTIME_DIR=/run/l337-audio-server"
-        exec_start_pre="ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh"
     fi
 
     cat > "$SYSTEM_SERVICE" <<EOF
@@ -143,7 +141,6 @@ User=$USER_NAME
 Group=$GROUP_NAME
 WorkingDirectory=$INSTALL_DIR
 ${env_runtime}
-${exec_start_pre}
 ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
@@ -161,15 +158,13 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-RestrictNamespaces=true
-RestrictRealtime=true
+ProtectKernelModules=false
+ProtectKernelTunables=false
+RestrictNamespaces=false
+RestrictRealtime=false
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
 ReadWritePaths=$STATE_DIR $CACHE_DIR
 
 [Install]
@@ -697,9 +692,6 @@ install_hybrid_service() {
     UNIT="$UNIT_DIR/l337-audio-server.service"
     mkdir -p "$UNIT_DIR"
 
-    # We know PipeWire is available for the user (checked above)
-    local exec_start_pre="ExecStartPre=$INSTALL_DIR/scripts/start-pipewire.sh"
-
     echo "Writing user unit $UNIT..."
     {
         cat <<EOF
@@ -708,15 +700,12 @@ Description=L337 Audio Server (hybrid: system-wide binaries, user service)
 Documentation=https://github.com/l337-audio-server
 After=network-online.target sound.target
 Wants=network-online.target
-After=pipewire.service
-Wants=pipewire.service
 
 [Service]
 Type=simple
 User=$REAL_USER
 Group=$REAL_USER
 WorkingDirectory=$INSTALL_DIR
-${exec_start_pre}
 ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
@@ -732,15 +721,13 @@ RuntimeDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-RestrictNamespaces=true
-RestrictRealtime=true
+ProtectKernelModules=false
+ProtectKernelTunables=false
+RestrictNamespaces=false
+RestrictRealtime=false
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
 ReadWritePaths=/run/l337-audio-server /home/$REAL_USER/.cache/l337
 
 [Install]
