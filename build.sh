@@ -9,6 +9,7 @@
 #   ./build.sh --debug                                  # debug build with symbols
 #   ./build.sh --release-debuginfo                      # release + debug symbols
 #   ./build.sh --no-check                               # skip cargo check
+#   ./build.sh --no-audio                               # build without audio backend
 #   ./build.sh --target aarch64-unknown-linux-gnu        # cross-build
 #   ./build.sh --cargo-home /path/to/cargo               # use existing cargo
 #   ./build.sh --cargo-bin /path/to/cargo/bin            # add cargo to PATH
@@ -27,6 +28,7 @@ Options:
   --debug                Build debug binary with symbols
   --release-debuginfo    Release build with debug symbols
   --no-check             Skip post-build cargo check
+  --no-audio             Build without audio backend
   --cargo-home DIR       Use existing CARGO_HOME instead of /tmp/cargo
   --cargo-bin DIR        Add cargo bin dir to PATH
   --target-dir DIR       Override cargo target directory
@@ -46,6 +48,7 @@ TARGET_DIR_ARG=""
 DEBUG_BUILD=0
 RELEASE_DEBUGINFO=0
 NO_CHECK=0
+NO_AUDIO=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -53,6 +56,7 @@ while [ $# -gt 0 ]; do
         --debug) DEBUG_BUILD=1; shift ;;
         --release-debuginfo) RELEASE_DEBUGINFO=1; shift ;;
         --no-check) NO_CHECK=1; shift ;;
+        --no-audio) NO_AUDIO=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
         --target-dir) TARGET_DIR_ARG="$2"; shift 2 ;;
@@ -87,6 +91,9 @@ case "$OS" in
         fi
         if [ "$NO_CHECK" -eq 1 ]; then
             BUILD_ARGS+=(--no-check)
+        fi
+        if [ "$NO_AUDIO" -eq 1 ]; then
+            BUILD_ARGS+=(--no-audio)
         fi
         if [ -n "$CARGO_HOME_ARG" ]; then
             BUILD_ARGS+=(--cargo-home "$CARGO_HOME_ARG")
