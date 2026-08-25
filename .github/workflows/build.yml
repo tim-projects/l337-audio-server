@@ -58,7 +58,7 @@ jobs:
       with:
         targets: x86_64-pc-windows-msvc
     - name: Build release binary
-      run: cargo build --verbose --release --target x86_64-pc-windows-msvc
+      run: cargo build --verbose --release --target x86_64-pc-windows-msvc --no-default-features
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -79,7 +79,7 @@ jobs:
       with:
         targets: x86_64-apple-darwin
     - name: Build release binary
-      run: cargo build --verbose --release --target x86_64-apple-darwin
+      run: cargo build --verbose --release --target x86_64-apple-darwin --no-default-features
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -94,16 +94,12 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'aarch64-linux-android' }}
     steps:
     - uses: actions/checkout@v4
-    - name: Setup Android NDK
-      run: |
-        echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
-        rustup target add aarch64-linux-android
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: aarch64-linux-android
     - name: Build release binary
-      run: cargo build --verbose --release --target aarch64-linux-android
+      run: cargo build --verbose --release --target aarch64-linux-android --no-default-features
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
