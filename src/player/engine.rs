@@ -44,19 +44,30 @@ impl PlayerEngine {
         let volume = Arc::new(Mutex::new(1.0));
 
         let backend: Box<dyn AudioBackend> = {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "backend"))]
             {
                 Box::new(crate::platform::linux::PipeWireAudioBackend)
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "backend"))]
             {
                 Box::new(crate::platform::macos::CoreAudioAudioBackend)
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "backend"))]
             {
                 Box::new(crate::platform::windows::WasapiAudioBackend)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            #[cfg(not(feature = "backend"))]
+            {
+                Box::new(crate::platform::common::NoopAudioBackend)
+            }
+            #[cfg(all(
+                not(any(
+                    all(target_os = "linux", feature = "backend"),
+                    all(target_os = "macos", feature = "backend"),
+                    all(target_os = "windows", feature = "backend")
+                )),
+                feature = "backend"
+            ))]
             {
                 Box::new(crate::platform::common::NoopAudioBackend)
             }

@@ -13,25 +13,25 @@
 pub mod common;
 pub mod single_instance;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "backend"))]
 pub mod linux;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "backend"))]
 pub mod macos;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "backend"))]
 pub mod windows;
 
 /// Initialize the platform-specific subsystem.
 ///
 /// Call this once at startup before any platform-dependent code runs.
 pub fn init() {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "backend"))]
     linux::init();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "backend"))]
     macos::init();
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "backend"))]
     windows::init();
 }

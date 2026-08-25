@@ -30,6 +30,7 @@ TARGET_DIR_ARG=""
 DEBUG_BUILD=0
 RELEASE_DEBUGINFO=0
 NO_CHECK=0
+NO_AUDIO=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
         --debug) DEBUG_BUILD=1; shift ;;
         --release-debuginfo) RELEASE_DEBUGINFO=1; shift ;;
         --no-check) NO_CHECK=1; shift ;;
+        --no-audio) NO_AUDIO=1; shift ;;
         --cargo-home) CARGO_HOME_ARG="$2"; shift 2 ;;
         --cargo-bin) CARGO_BIN_ARG="$2"; shift 2 ;;
         --target-dir) TARGET_DIR_ARG="$2"; shift 2 ;;
@@ -59,6 +61,14 @@ fi
 # broken mount on some shared setups). Caller can override with --target-dir.
 export CARGO_TARGET_DIR="${TARGET_DIR_ARG:-/tmp/l337-build}"
 
+# When --no-audio is requested, disable the default `backend` feature so the
+# build does not require system audio libraries (PipeWire / CoreAudio / WASAPI).
+if [ "$NO_AUDIO" -eq 1 ]; then
+    FEATURES="--no-default-features"
+else
+    FEATURES=""
+fi
+
 # If cargo is not on PATH, install a minimal toolchain into /tmp/cargo/.
 if ! command -v cargo >/dev/null 2>&1; then
     CARGO_HOME="${CARGO_HOME:-/tmp/cargo}"
@@ -80,20 +90,20 @@ fi
 
 if [ -n "$TARGET" ]; then
     echo "Building L337 Audio Server for target $TARGET (release) in $CARGO_TARGET_DIR ..."
-    cargo build --release --target "$TARGET"
+    cargo build $FEATURES --release --target "$TARGET"
     SRC="$CARGO_TARGET_DIR/$TARGET/release/l337-audio-server"
 else
     if [ "$DEBUG_BUILD" -eq 1 ]; then
         echo "Building L337 Audio Server (debug) in $CARGO_TARGET_DIR ..."
-        cargo build
+        cargo build $FEATURES
         SRC="$CARGO_TARGET_DIR/debug/l337-audio-server"
     elif [ "$RELEASE_DEBUGINFO" -eq 1 ]; then
         echo "Building L337 Audio Server (release with debuginfo) in $CARGO_TARGET_DIR ..."
-        RUSTFLAGS="${RUSTFLAGS:-} -C debuginfo=1" cargo build --release
+        RUSTFLAGS="${RUSTFLAGS:-} -C debuginfo=1" cargo build $FEATURES --release
         SRC="$CARGO_TARGET_DIR/release/l337-audio-server"
     else
         echo "Building L337 Audio Server (release) in $CARGO_TARGET_DIR ..."
-        cargo build --release
+        cargo build $FEATURES --release
         SRC="$CARGO_TARGET_DIR/release/l337-audio-server"
     fi
 fi
@@ -113,10 +123,10 @@ echo "Build complete. Binary available at bin/l337-audio-server"
 if [ "$NO_CHECK" -ne 1 ]; then
     if [ -n "$TARGET" ]; then
         echo "Running cargo check for target $TARGET ..."
-        cargo check --target "$TARGET"
+        cargo check $FEATURES --target "$TARGET"
     else
         echo "Running cargo check ..."
-        cargo check
+        cargo check $FEATURES
     fi
     echo "[OK] Build and check complete"
 else

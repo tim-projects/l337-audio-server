@@ -4,8 +4,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
-const SERVER_BIN: &str = "l337-audio-server";
-
 fn write_minimal_wav(path: &PathBuf) {
     let sample_rate = 44100u32;
     let channels = 2u16;
@@ -67,11 +65,25 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
 
     let port = find_available_port().await;
 
-    let mut child = Command::new("cargo")
-        .arg("run")
-        .arg("--bin")
-        .arg(SERVER_BIN)
-        .arg("--")
+    let binary_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .and_then(|mut p| {
+            p.pop();
+            p.pop();
+            p.push("bin");
+            p.push("l337-audio-server");
+            if p.exists() { Some(p) } else { None }
+        })
+        .or_else(|| {
+            let mut p = std::env::current_dir().unwrap_or_default();
+            p.push("bin");
+            p.push("l337-audio-server");
+            if p.exists() { Some(p) } else { None }
+        })
+        .unwrap_or_else(|| PathBuf::from("l337-audio-server"));
+
+    let mut child = Command::new(binary_path)
         .arg("--dummy")
         .arg("--transport=http")
         .env("L337__SERVER__PORT", port.to_string())
@@ -79,7 +91,7 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn l337-audio-server via cargo run");
+        .expect("Failed to spawn l337-audio-server");
 
     // Wait for the server to become ready by polling /health.
     let client = Client::builder()
