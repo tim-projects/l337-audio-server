@@ -145,4 +145,4 @@ jobs:
           --title "${{ steps.release_tag.outputs.name }}" \
           --prerelease \
           --generate-notes \
-          $(find ./release-artifacts -type f -printf '-a %p ')
+          $(find ./release-artifacts -type f -printf '%p ')
