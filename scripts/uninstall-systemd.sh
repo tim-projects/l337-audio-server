@@ -227,10 +227,18 @@ uninstall_user_service() {
 INSTALL_USER=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --user) INSTALL_USER="$2"; shift 2 ;;
+        --user)
+            if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
+                INSTALL_USER="$2"
+                shift 2
+            else
+                MODE="user"
+                shift
+            fi
+            ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         system|--system|"") MODE="system"; shift ;;
-        user|--user) MODE="user"; shift ;;
+        user) MODE="user"; shift ;;
         hybrid|--hybrid) MODE="hybrid"; shift ;;
         *) echo "Unknown mode: $1 (use --user, --hybrid, or run as root for system service)"; exit 1 ;;
     esac
