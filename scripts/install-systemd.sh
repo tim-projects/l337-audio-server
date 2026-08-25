@@ -43,7 +43,20 @@ VERIFICATION_WAS_MISSING_PACTL=false
 VERIFICATION_WAS_MISSING_PWCLI=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${1:-auto}"
+INSTALL_USER=""
+MODE="auto"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user) INSTALL_USER="$2"; shift 2 ;;
+        --auto) MODE="auto"; shift ;;
+        --update) MODE="update"; shift ;;
+        -h|--help) echo "Usage: $0 [--user USER] [--auto|--update]"; exit 0 ;;
+        *) MODE="$1"; shift ;;
+    esac
+done
+
+MODE="${MODE:-auto}"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
@@ -693,6 +706,9 @@ install_hybrid_service() {
     mkdir -p "$UNIT_DIR"
 
     echo "Writing user unit $UNIT..."
+    mkdir -p /run/l337-audio-server
+    chown "$REAL_USER:$REAL_USER" /run/l337-audio-server
+    chmod 700 /run/l337-audio-server
     {
         cat <<EOF
 [Unit]
@@ -710,13 +726,6 @@ ExecStart=$INSTALL_DIR/l337-audio-server
 Restart=on-failure
 RestartSec=2
 
-# Filesystem / runtime locations (systemd creates + chowns these).
-StateDirectory=l337-audio-server
-CacheDirectory=l337-audio-server
-ConfigurationDirectory=l337-audio-server
-RuntimeDirectory=l337-audio-server
-RuntimeDirectoryMode=0700
-
 # Hardening (unprivileged service user).
 NoNewPrivileges=true
 PrivateTmp=true
@@ -728,7 +737,6 @@ RestrictRealtime=false
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
-ReadWritePaths=/run/l337-audio-server /home/$REAL_USER/.cache/l337
 
 [Install]
 WantedBy=default.target
@@ -742,25 +750,34 @@ EOF
      sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user enable l337-audio-server.service
      sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" systemctl --user restart l337-audio-server.service
 
-     # Fix permissions on runtime/config directories so the service user can write
-     # its lock/config files without permission errors.
-     if [ -d "/run/l337-audio-server" ]; then
-         chown -R "$REAL_USER:$REAL_USER" /run/l337-audio-server 2>/dev/null || true
-     fi
-     if [ -d "/etc/l337-audio-server" ]; then
-         chown -R "$REAL_USER:$REAL_USER" /etc/l337-audio-server 2>/dev/null || true
-     fi
-
+      echo
+     echo "L337 Audio Server installed as a hybrid service:"
+     echo "  - Binaries and scripts installed to $INSTALL_DIR (owned by root)"
+     echo "  - Service runs as user '$REAL_USER' (for PipeWire access)"
+     echo "  - State/cache/config in /var/lib/l337-audio-server etc. (owned by $REAL_USER)"
      echo
-    echo "L337 Audio Server installed as a hybrid service:"
-    echo "  - Binaries and scripts installed to $INSTALL_DIR (owned by root)"
-    echo "  - Service runs as user '$REAL_USER' (for PipeWire access)"
-    echo "  - State/cache/config in /var/lib/l337-audio-server etc. (owned by $REAL_USER)"
-    echo
-    echo "Check status with:  systemctl --user status l337-audio-server.service"
-    echo "View logs with:     journalctl --user -u l337-audio-server.service -f"
-    echo
-    echo "Installed binary: $INSTALL_DIR/l337-audio-server"
+     echo "Check status with:  systemctl --user status l337-audio-server.service"
+     echo "View logs with:     journalctl --user -u l337-audio-server.service -f"
+     echo
+     echo "Installed binary: $INSTALL_DIR/l337-audio-server"
+
+    # Symlink token from cache to config dir so everything lives in ~/.config
+    local token_cache="$REAL_HOME/.cache/l337/l337-audio-server/server_token.txt"
+    local token_config="$REAL_HOME/.config/l337-audio-server/server_token.txt"
+    if [ ! -e "$token_config" ] && [ -f "$token_cache" ]; then
+        mkdir -p "$REAL_HOME/.config/l337-audio-server"
+        mv "$token_cache" "$token_config"
+        ln -s "$token_config" "$token_cache"
+        ok "Moved server_token.txt to $token_config"
+    fi
+
+    # Create /etc/l337-audio-server/ with symlink to user config so binary doesn't
+    # try to create a system-wide config and fail with permission denied.
+    mkdir -p /etc/l337-audio-server
+    chown "$REAL_USER:$REAL_USER" /etc/l337-audio-server
+    chmod 755 /etc/l337-audio-server
+    ln -sf "$REAL_HOME/.config/l337-audio-server/server.ini" /etc/l337-audio-server/server.ini
+    ok "Created /etc/l337-audio-server/server.ini symlink"
 
     # We do not run setup_config or verification for hybrid service by default.
     # The user can configure the server via its configuration file or command line.
@@ -933,12 +950,16 @@ except ImportError:
 }
 
 install_auto() {
-    if [ -n "${SUDO_USER:-}" ]; then
-        info "Installing via sudo detected. Installing files to /opt/l337-audio-server and setting up user service for $SUDO_USER..."
-        install_hybrid_service
-    else
-        fail "This script must be run with sudo to install binaries to /opt/l337-audio-server. Please run: sudo $0"
+    local target_user="${INSTALL_USER:-${SUDO_USER:-}}"
+    if [ -z "$target_user" ]; then
+        fail "This script must be run with sudo or specify a user.
+
+Usage: sudo $0 --user USERNAME
+Example:
+  sudo $0 --user tim"
     fi
+    info "Installing via sudo detected. Installing files to /opt/l337-audio-server and setting up user service for $target_user..."
+    SUDO_USER="$target_user" install_hybrid_service
 }
 
 case "$MODE" in

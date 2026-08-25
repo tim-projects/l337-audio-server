@@ -14,6 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
 DRY_RUN=false
 UNINSTALL=false
+REAL_USER_ARG=""
 
 usage() {
     cat <<EOF
@@ -22,6 +23,7 @@ Usage: $0 [OPTIONS]
 Options:
   --dry-run              Show what would happen without making changes
   --uninstall, -u        Uninstall the service and remove installed files
+  --user USER            Install for a specific user (requires root)
   -h, --help             Show this help message
 
 Platforms:
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         -h|--help) usage ;;
+        --user) REAL_USER_ARG="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
@@ -45,6 +48,21 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Sudo check
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ] && [ -z "${REAL_USER_ARG:-}" ]; then
+    fail "This script must be run with sudo, not as root directly.
+
+Usage: sudo $0
+
+Example:
+  sudo ./install.sh            # install for your user
+  sudo ./install.sh --user tim # specify user when running as root"
+fi
+
+
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -145,13 +163,21 @@ case "$OS_TYPE" in
             if [ ! -x "$UNINSTALL_SCRIPT" ]; then
                 fail "Uninstaller script not found or not executable: $UNINSTALL_SCRIPT"
             fi
-            UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --hybrid"
+            if [ -n "$REAL_USER_ARG" ]; then
+                UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --user $REAL_USER_ARG"
+            else
+                UNINSTALL_CMD="\"$UNINSTALL_SCRIPT\" --user"
+            fi
         else
             INSTALL_SCRIPT="$SCRIPT_DIR/install-systemd.sh"
             if [ ! -x "$INSTALL_SCRIPT" ]; then
                 fail "Installer script not found or not executable: $INSTALL_SCRIPT"
             fi
-            INSTALL_CMD="\"$INSTALL_SCRIPT\" --auto"
+            if [ -n "$REAL_USER_ARG" ]; then
+                INSTALL_CMD="\"$INSTALL_SCRIPT\" --auto --user $REAL_USER_ARG"
+            else
+                INSTALL_CMD="\"$INSTALL_SCRIPT\" --auto"
+            fi
         fi
         ;;
     macos)

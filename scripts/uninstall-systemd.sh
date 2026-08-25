@@ -27,14 +27,6 @@ ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --user)        MODE="user"; shift ;;
-        --remove-data) REMOVE_DATA=true; shift ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
-
 uninstall_system_service() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "Uninstalling the system service requires root (use sudo)." >&2
@@ -63,10 +55,19 @@ uninstall_system_service() {
         warn "Systemd unit not found at $SYSTEM_SERVICE"
     fi
 
+    # Always remove the install directory
+    if [ -d "$INSTALL_DIR" ]; then
+        info "Removing installed files..."
+        rm -rf "$INSTALL_DIR"
+        ok "Install directory removed"
+    else
+        warn "Install directory not found at $INSTALL_DIR"
+    fi
+
     if [ "$REMOVE_DATA" = true ]; then
-        info "Removing installed files and directories..."
-        rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"
-        ok "Install directories removed"
+        info "Removing data directories..."
+        rm -rf "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"
+        ok "Data directories removed"
 
         if id "$USER_NAME" &>/dev/null; then
             info "Removing system user '$USER_NAME'..."
@@ -81,7 +82,6 @@ uninstall_system_service() {
         fi
     else
         warn "Data directories retained:"
-        warn "  $INSTALL_DIR"
         warn "  $CONFIG_DIR"
         warn "  $STATE_DIR"
         warn "  $CACHE_DIR"
@@ -92,7 +92,7 @@ uninstall_system_service() {
 }
 
 uninstall_hybrid_service() {
-    local real_user="${SUDO_USER:-${USER}}"
+    local real_user="${INSTALL_USER:-$(id -un 2>/dev/null || echo ${SUDO_USER:-${USER}})}"
     local real_uid
     real_uid=$(id -u "$real_user" 2>/dev/null || echo "")
     local runtime_dir="/run/user/$real_uid"
@@ -109,7 +109,8 @@ uninstall_hybrid_service() {
     fi
 
     # Remove user unit file
-    local unit_dir="${XDG_CONFIG_HOME:-/home/$real_user/.config}/systemd/user"
+    local real_home=$(getent passwd "$real_user" 2>/dev/null | cut -d: -f6)
+    local unit_dir="${XDG_CONFIG_HOME:-${real_home:-/home/$real_user}/.config}/systemd/user"
     local unit="$unit_dir/l337-audio-server.service"
     if [ -f "$unit" ]; then
         rm -f "$unit"
@@ -162,22 +163,50 @@ uninstall_hybrid_service() {
 }
 
 uninstall_user_service() {
-    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local real_user="${INSTALL_USER:-$(id -un 2>/dev/null || echo ${SUDO_USER:-${USER}})}"
+    local real_uid
+    real_uid=$(id -u "$real_user" 2>/dev/null || echo "")
+    local runtime_dir="/run/user/$real_uid"
+    local real_home=$(getent passwd "$real_user" 2>/dev/null | cut -d: -f6)
+    local unit_dir="${XDG_CONFIG_HOME:-${real_home:-/home/$real_user}/.config}/systemd/user"
     local unit="$unit_dir/l337-audio-server.service"
 
     info "Uninstalling user service..."
 
-    if systemctl --user is-enabled --quiet l337-audio-server.service 2>/dev/null; then
+    if [ -n "$runtime_dir" ] && [ -d "$runtime_dir" ]; then
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-enabled --quiet l337-audio-server.service 2>/dev/null || true
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user disable l337-audio-server.service 2>/dev/null || true
+        sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user stop l337-audio-server.service 2>/dev/null || true
+    else
+        systemctl --user is-enabled --quiet l337-audio-server.service 2>/dev/null || true
         systemctl --user disable l337-audio-server.service 2>/dev/null || true
+        systemctl --user stop l337-audio-server.service 2>/dev/null || true
     fi
-    systemctl --user stop l337-audio-server.service 2>/dev/null || true
 
     if [ -f "$unit" ]; then
         rm -f "$unit"
-        systemctl --user daemon-reload
+        if [ -n "$runtime_dir" ] && [ -d "$runtime_dir" ]; then
+            sudo -u "$real_user" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user daemon-reload 2>/dev/null || true
+        else
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
         ok "User unit removed"
     else
         warn "User unit not found at $unit"
+    fi
+
+    # Clean up /etc/l337-audio-server symlink if it points to this user's config
+    local etc_symlink="/etc/l337-audio-server/server.ini"
+    if [ -L "$etc_symlink" ]; then
+        local etc_target
+        etc_target=$(readlink -f "$etc_symlink")
+        local real_config
+        real_config=$(realpath "${real_home:-/home/$real_user}/.config/l337-audio-server/server.ini" 2>/dev/null || echo "${real_home:-/home/$real_user}/.config/l337-audio-server/server.ini")
+        if [[ "$etc_target" == "$real_config" ]]; then
+            rm -f "$etc_symlink"
+            rmdir /etc/l337-audio-server 2>/dev/null || true
+            ok "Removed /etc/l337-audio-server symlink"
+        fi
     fi
 
     if [ "$REMOVE_DATA" = true ]; then
@@ -194,6 +223,18 @@ uninstall_user_service() {
 
     ok "User service uninstall complete"
 }
+
+INSTALL_USER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user) INSTALL_USER="$2"; shift 2 ;;
+        --remove-data) REMOVE_DATA=true; shift ;;
+        system|--system|"") MODE="system"; shift ;;
+        user|--user) MODE="user"; shift ;;
+        hybrid|--hybrid) MODE="hybrid"; shift ;;
+        *) echo "Unknown mode: $1 (use --user, --hybrid, or run as root for system service)"; exit 1 ;;
+    esac
+done
 
 case "$MODE" in
     system|--system|"") uninstall_system_service ;;
