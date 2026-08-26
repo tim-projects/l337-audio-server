@@ -98,12 +98,12 @@ try_cargo() {
     shift
     local args=("$@")
 
-    echo "[$phase] Running: cargo ${args[*]}"
+    echo "[$phase] Running: cargo $phase ${args[*]}"
 
     # Capture output so we can inspect it on failure.
     set +e
     local output
-    output=$(cargo "${args[@]}" 2>&1)
+    output=$(cargo "$phase" "${args[@]}" 2>&1)
     local rc=$?
     set -e
 
@@ -115,7 +115,7 @@ try_cargo() {
     if echo "$output" | grep -qE "rust-lld|ld terminated with signal|Bus error|signal 7"; then
         warn "[$phase] rust-lld crashed (likely out of memory/tmp space); retrying with GNU ld (gcc)..."
         set +e
-        output=$(RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" cargo "${args[@]}" 2>&1)
+        output=$(RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" cargo "$phase" "${args[@]}" 2>&1)
         rc=$?
         set -e
         if [ $rc -eq 0 ]; then
