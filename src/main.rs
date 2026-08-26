@@ -126,6 +126,11 @@ fn load_settings() -> Result<Settings, config::ConfigError> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|a| a == "--version" || a == "-v") {
+        println!("l337-audio-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -242,6 +247,7 @@ async fn main() {
     let mut app = Router::new()
         .route("/health", get(handlers::health))
         .route("/setup", get(handlers::setup))
+        .route("/version", get(handlers::version))
         .route("/", get(|| async { "L337 Audio Server" }))
         .route("/player/play", post(handlers::play))
         .route("/player/play/stream", post(handlers::upload_stream))

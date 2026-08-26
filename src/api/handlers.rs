@@ -18,6 +18,12 @@ pub struct SendableEngine(pub Mutex<PlayerEngine>);
 
 pub type AppState = Arc<SendableEngine>;
 
+pub async fn version() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
 pub async fn setup(axum::Extension(token): axum::Extension<Arc<tokio::sync::Mutex<String>>>) -> impl IntoResponse {
     let token = token.lock().await;
     Json(serde_json::json!({"token": token.clone()}))
