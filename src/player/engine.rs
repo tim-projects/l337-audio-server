@@ -319,18 +319,14 @@ impl PlayerEngine {
             .map_err(|e| e.to_string())?;
 
         let dl_path = path.clone();
-        let dl_url = direct_url.clone();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        if yt_dlp_available() {
-            download_via_ytdlp(url, &dl_path)
-                .await
-                .map_err(|e| format!("yt-dlp download failed: {e}"))?;
-        } else {
-            stream_http_to_file(&dl_url, &dl_path, cancel.clone())
-                .await
-                .map_err(|e| format!("stream download failed: {e}"))?;
-        }
+        let download_cancel = cancel.clone();
+        let download_handle = tokio::spawn(async move {
+            if let Err(e) = stream_http_to_file(&direct_url, &dl_path, download_cancel).await {
+                error!("stream download failed: {}", e);
+            }
+        });
 
         {
             let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,7 +346,7 @@ impl PlayerEngine {
         });
 
         self.streaming = Some(StreamingPlayback {
-            download_handle: None,
+            download_handle: Some(download_handle),
             decode_handle,
             cancel,
         });
