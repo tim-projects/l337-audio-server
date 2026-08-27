@@ -314,19 +314,33 @@ impl PlayerEngine {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
-        let direct_url = resolve_youtube_stream_url(url)
-            .await
-            .map_err(|e| e.to_string())?;
+        let direct_url = if is_direct_stream_url(url) {
+            url.to_string()
+        } else {
+            resolve_youtube_stream_url(url)
+                .await
+                .map_err(|e| e.to_string())?
+        };
 
         let dl_path = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
 
         let download_cancel = cancel.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let download_handle = tokio::spawn(async move {
-            if let Err(e) = stream_http_to_file(&direct_url, &dl_path, download_cancel).await {
-                error!("stream download failed: {}", e);
-            }
+            let result = stream_http_to_file(&direct_url, &dl_path, download_cancel).await;
+            let _ = tx.send(result);
         });
+
+        if let Ok(Ok(Err(e))) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx,
+        )
+        .await
+        {
+            download_handle.abort();
+            return Err(format!("stream download failed: {}", e));
+        }
 
         {
             let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -710,7 +724,7 @@ pub async fn download_stream(
         }
     }
 
-    if is_youtube_url(url) {
+    if is_youtube_url(url) && !is_direct_stream_url(url) {
         if !yt_dlp_available() {
             return Err("yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into());
         }
@@ -774,6 +788,10 @@ fn is_youtube_url(url: &str) -> bool {
         || url.contains("youtu.be/")
         || url.contains("youtube.com/shorts/")
         || url.contains("googlevideo.com/videoplayback")
+}
+
+fn is_direct_stream_url(url: &str) -> bool {
+    url.contains("googlevideo.com/videoplayback")
 }
 
 fn yt_dlp_available() -> bool {
