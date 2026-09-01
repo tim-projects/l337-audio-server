@@ -15,14 +15,16 @@ pub struct PlatformInfo {
 
 impl PlatformInfo {
     pub const fn current() -> Self {
-        #[cfg(target_os = "linux")]
-        let (os, display_name) = ("linux", "Linux");
-        #[cfg(target_os = "macos")]
-        let (os, display_name) = ("macos", "macOS");
-        #[cfg(target_os = "windows")]
-        let (os, display_name) = ("windows", "Windows");
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let (os, display_name) = ("unknown", "Unknown");
+    #[cfg(target_os = "linux")]
+    let (os, display_name) = ("linux", "Linux");
+    #[cfg(target_os = "android")]
+    let (os, display_name) = ("android", "Android");
+    #[cfg(target_os = "macos")]
+    let (os, display_name) = ("macos", "macOS");
+    #[cfg(target_os = "windows")]
+    let (os, display_name) = ("windows", "Windows");
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    let (os, display_name) = ("unknown", "Unknown");
 
         #[cfg(target_arch = "x86_64")]
         let arch = "x64";
@@ -71,6 +73,10 @@ pub fn runtime_dir() -> PathBuf {
     {
         PathBuf::from("/run/l337-audio-server")
     }
+    #[cfg(target_os = "android")]
+    {
+        std::env::temp_dir().join("l337-audio-server").join("runtime")
+    }
     #[cfg(target_os = "macos")]
     {
         dirs::cache_dir()
@@ -82,7 +88,7 @@ pub fn runtime_dir() -> PathBuf {
     {
         std::env::temp_dir().join("l337-audio-server").join("runtime")
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     {
         PathBuf::from("/tmp/l337-audio-server-runtime")
     }

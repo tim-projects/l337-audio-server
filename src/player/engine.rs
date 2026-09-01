@@ -22,6 +22,56 @@ struct StreamingPlayback {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YouTubeBlockType {
+    RateLimit,
+    Captcha,
+    BotDetected,
+    IpBlocked,
+}
+
+impl YouTubeBlockType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            YouTubeBlockType::RateLimit => "rate_limit",
+            YouTubeBlockType::Captcha => "captcha",
+            YouTubeBlockType::BotDetected => "bot_detected",
+            YouTubeBlockType::IpBlocked => "ip_blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct YouTubeError {
+    pub block_type: YouTubeBlockType,
+    pub message: String,
+}
+
+impl std::fmt::Display for YouTubeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for YouTubeError {}
+
+#[derive(Debug)]
+pub enum EngineError {
+    YouTube(YouTubeError),
+    Other(String),
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineError::YouTube(e) => write!(f, "{}", e),
+            EngineError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
 pub struct PlayerEngine {
     stream: Option<Box<dyn AudioOutputStream>>,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
@@ -56,6 +106,10 @@ impl PlayerEngine {
             {
                 Box::new(crate::platform::windows::WasapiAudioBackend)
             }
+            #[cfg(all(target_os = "android", feature = "backend"))]
+            {
+                Box::new(crate::platform::android::AndroidAudioBackend)
+            }
             #[cfg(not(feature = "backend"))]
             {
                 Box::new(crate::platform::common::NoopAudioBackend)
@@ -64,7 +118,8 @@ impl PlayerEngine {
                 not(any(
                     all(target_os = "linux", feature = "backend"),
                     all(target_os = "macos", feature = "backend"),
-                    all(target_os = "windows", feature = "backend")
+                    all(target_os = "windows", feature = "backend"),
+                    all(target_os = "android", feature = "backend")
                 )),
                 feature = "backend"
             ))]
@@ -116,7 +171,7 @@ impl PlayerEngine {
         }
     }
 
-    pub async fn play_track(&mut self, track: Track) -> Result<(), String> {
+pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         self.stop();
         self.current_track = Some(track.clone());
 
@@ -133,10 +188,17 @@ impl PlayerEngine {
         if is_youtube_url(&track.stream_url) {
             info!("play_track: YouTube streaming for {}", track.stream_url);
             if let Err(e) = self.start_streaming_playback(&track.stream_url).await {
+                if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                    return Err(EngineError::YouTube(yt_err.clone()));
+                }
                 error!("YouTube streaming failed, falling back to download: {}", e);
                 let path = self.storage.get_active_slot_path("current");
                 if let Err(e) = download_stream(&track.stream_url, &path).await {
-                    return Err(format!("Failed to download track: {}", e));
+                    let err_box = e;
+                    if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
+                        return Err(EngineError::YouTube(yt_err.clone()));
+                    }
+                    return Err(EngineError::Other(format!("Failed to download track: {}", err_box)));
                 }
                 self.load_and_play("current").await;
                 self.persist_slot(&track.track_id, &path).await;
@@ -152,8 +214,12 @@ impl PlayerEngine {
         );
 
         if let Err(e) = download_stream(&track.stream_url, &path).await {
-            error!("play_track: download failed for {}: {}", track.stream_url, e);
-            return Err(format!("Failed to download track: {}", e));
+            let err_box = e;
+            if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
+                return Err(EngineError::YouTube(yt_err.clone()));
+            }
+            error!("play_track: download failed for {}: {}", track.stream_url, err_box);
+            return Err(EngineError::Other(format!("Failed to download track: {}", err_box)));
         }
 
         match tokio::fs::metadata(&path).await {
@@ -164,7 +230,7 @@ impl PlayerEngine {
             ),
             Err(e) => {
                 error!("play_track: slot file missing after download: {}", e);
-                return Err(format!("Slot file missing after download: {}", e));
+                return Err(EngineError::Other(format!("Slot file missing after download: {}", e)));
             }
         }
 
@@ -310,16 +376,14 @@ impl PlayerEngine {
         self.state = PlayerStateLabel::Stopped;
     }
 
-    async fn start_streaming_playback(&mut self, url: &str) -> Result<(), String> {
+    async fn start_streaming_playback(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
         let direct_url = if is_direct_stream_url(url) {
             url.to_string()
         } else {
-            resolve_youtube_stream_url(url)
-                .await
-                .map_err(|e| e.to_string())?
+            resolve_youtube_stream_url(url).await?
         };
 
         let dl_path = path.clone();
@@ -339,7 +403,7 @@ impl PlayerEngine {
         .await
         {
             download_handle.abort();
-            return Err(format!("stream download failed: {}", e));
+            return Err(format!("stream download failed: {}", e).into());
         }
 
         {
@@ -703,11 +767,20 @@ pub(crate) fn resample_interleaved(
     output
 }
 
+#[cfg(test)]
+pub(crate) static DOWNLOAD_STREAM_INVOKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub async fn download_stream(
     url: &str,
     dest: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
+
+    #[cfg(test)]
+    {
+        DOWNLOAD_STREAM_INVOKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     let local_path: Option<PathBuf> = if let Some(path) = url.strip_prefix("file://") {
         Some(PathBuf::from(path))
@@ -794,6 +867,23 @@ fn is_direct_stream_url(url: &str) -> bool {
     url.contains("googlevideo.com/videoplayback")
 }
 
+fn detect_youtube_block(stderr: &str) -> Option<YouTubeBlockType> {
+    let lower = stderr.to_lowercase();
+    if lower.contains("http error 429") || lower.contains("429") {
+        return Some(YouTubeBlockType::RateLimit);
+    }
+    if lower.contains("captcha") || lower.contains("playercaptchaviewmodel") {
+        return Some(YouTubeBlockType::Captcha);
+    }
+    if lower.contains("403") || lower.contains("cloudflare") {
+        return Some(YouTubeBlockType::BotDetected);
+    }
+    if lower.contains("no video formats found") || lower.contains("skipping player response") {
+        return Some(YouTubeBlockType::IpBlocked);
+    }
+    None
+}
+
 fn yt_dlp_available() -> bool {
     Command::new("yt-dlp")
         .arg("--version")
@@ -808,14 +898,13 @@ async fn download_via_ytdlp(
     url: &str,
     dest: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to download YouTube URLs.".into());
     }
 
     let _ = tokio::fs::remove_file(dest).await;
 
-    let status = TokioCommand::new("yt-dlp")
+    let output = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
         .arg("-f")
@@ -825,12 +914,21 @@ async fn download_via_ytdlp(
         .arg(dest)
         .arg(url)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await?;
 
-    if !status.success() {
-        return Err(format!("yt-dlp exited with {status}").into());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(block_type) = detect_youtube_block(&stderr) {
+        return Err(YouTubeError {
+            block_type,
+            message: format!("yt-dlp block detected: {:?}", block_type),
+        }
+        .into());
+    }
+
+    if !output.status.success() {
+        return Err(format!("yt-dlp exited with {}", output.status).into());
     }
     let meta = tokio::fs::metadata(dest).await?;
     if meta.len() == 0 {
@@ -853,9 +951,18 @@ async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::er
         .arg("--no-playlist")
         .arg(url)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .await?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(block_type) = detect_youtube_block(&stderr) {
+        return Err(YouTubeError {
+            block_type,
+            message: format!("yt-dlp block detected: {:?}", block_type),
+        }
+        .into());
+    }
 
     if !output.status.success() {
         return Err("yt-dlp -g failed".into());
@@ -1165,5 +1272,134 @@ mod send_tests {
     #[test]
     fn test_player_engine_send() {
         assert_send::<crate::player::engine::PlayerEngine>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::Track;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_detect_youtube_block_rate_limit() {
+        assert_eq!(
+            detect_youtube_block("HTTP Error 429 Too Many Requests"),
+            Some(YouTubeBlockType::RateLimit)
+        );
+        assert_eq!(detect_youtube_block("yt-dlp: 429"), Some(YouTubeBlockType::RateLimit));
+    }
+
+    #[test]
+    fn test_detect_youtube_block_captcha() {
+        assert_eq!(
+            detect_youtube_block("playerCaptchaViewModel"),
+            Some(YouTubeBlockType::Captcha)
+        );
+        assert_eq!(
+            detect_youtube_block("Captcha required, please solve"),
+            Some(YouTubeBlockType::Captcha)
+        );
+    }
+
+    #[test]
+    fn test_detect_youtube_block_bot_detected() {
+        assert_eq!(
+            detect_youtube_block("HTTP Error 403 Forbidden"),
+            Some(YouTubeBlockType::BotDetected)
+        );
+        assert_eq!(
+            detect_youtube_block("cloudflare protection detected"),
+            Some(YouTubeBlockType::BotDetected)
+        );
+    }
+
+    #[test]
+    fn test_detect_youtube_block_ip_blocked() {
+        assert_eq!(
+            detect_youtube_block("No video formats found"),
+            Some(YouTubeBlockType::IpBlocked)
+        );
+        assert_eq!(
+            detect_youtube_block("Skipping player response"),
+            Some(YouTubeBlockType::IpBlocked)
+        );
+    }
+
+    #[test]
+    fn test_detect_youtube_block_no_match() {
+        assert_eq!(detect_youtube_block("some random error"), None);
+        assert_eq!(detect_youtube_block("yt-dlp: unknown error"), None);
+        assert_eq!(detect_youtube_block(""), None);
+    }
+
+    #[test]
+    fn test_youtube_block_type_as_str() {
+        assert_eq!(YouTubeBlockType::RateLimit.as_str(), "rate_limit");
+        assert_eq!(YouTubeBlockType::Captcha.as_str(), "captcha");
+        assert_eq!(YouTubeBlockType::BotDetected.as_str(), "bot_detected");
+        assert_eq!(YouTubeBlockType::IpBlocked.as_str(), "ip_blocked");
+    }
+
+    #[test]
+    fn test_engine_error_display() {
+        let yt_err = YouTubeError {
+            block_type: YouTubeBlockType::RateLimit,
+            message: "rate limited".to_string(),
+        };
+        let engine_err = EngineError::YouTube(yt_err);
+        assert_eq!(format!("{}", engine_err), "rate limited");
+
+        let other_err = EngineError::Other("generic failure".to_string());
+        assert_eq!(format!("{}", other_err), "generic failure");
+    }
+
+    #[tokio::test]
+    async fn test_play_track_short_circuits_on_youtube_block() {
+        let dir = std::env::temp_dir().join("l337-block-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fake_ytdlp = dir.join("yt-dlp");
+        let script = r#"#!/bin/bash
+if [ "$1" = "--version" ]; then
+    echo "fake yt-dlp"
+    exit 0
+fi
+echo "HTTP Error 429 Too Many Requests" >&2
+exit 1
+"#;
+        std::fs::write(&fake_ytdlp, script).unwrap();
+        let _ = std::fs::set_permissions(&fake_ytdlp, std::fs::Permissions::from_mode(0o755));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path)); }
+        DOWNLOAD_STREAM_INVOKED.store(false, Ordering::SeqCst);
+
+        let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
+        let mut engine = PlayerEngine::new_dummy(storage);
+
+        let track = Track {
+            track_id: "test".to_string(),
+            stream_url: "https://www.youtube.com/watch?v=test".to_string(),
+            title: None,
+            artist: None,
+            duration: None,
+        };
+
+        let result = engine.play_track(track).await;
+
+        unsafe { std::env::set_var("PATH", original_path); }
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::YouTube(yt_err) => {
+                assert!(matches!(yt_err.block_type, YouTubeBlockType::RateLimit));
+            }
+            ref e => panic!("Expected EngineError::YouTube, got: {:?}", e),
+        }
+        assert!(
+            !DOWNLOAD_STREAM_INVOKED.load(Ordering::SeqCst),
+            "download_stream should not be called when start_streaming_playback returns a block"
+        );
     }
 }

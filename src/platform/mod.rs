@@ -13,6 +13,9 @@
 pub mod common;
 pub mod single_instance;
 
+#[cfg(all(target_os = "android", feature = "backend"))]
+pub mod android;
+
 #[cfg(all(target_os = "linux", feature = "backend"))]
 pub mod linux;
 
@@ -26,6 +29,9 @@ pub mod windows;
 ///
 /// Call this once at startup before any platform-dependent code runs.
 pub fn init() {
+    #[cfg(all(target_os = "android", feature = "backend"))]
+    android::init();
+
     #[cfg(all(target_os = "linux", feature = "backend"))]
     linux::init();
 

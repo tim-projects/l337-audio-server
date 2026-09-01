@@ -48,11 +48,28 @@ pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> im
     let mut engine = state.0.lock().await;
     match engine.play_track(track).await {
         Ok(()) => Json(serde_json::json!({"ok": true, "state": engine.state})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": e})),
-        )
-            .into_response(),
+        Err(e) => match e {
+            crate::player::engine::EngineError::YouTube(yt_err) => {
+                let block_type = yt_err.block_type.as_str();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "youtube_blocked",
+                        "block_type": block_type,
+                        "message": yt_err.message
+                    })),
+                )
+                    .into_response()
+            }
+            crate::player::engine::EngineError::Other(msg) => {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"ok": false, "error": msg})),
+                )
+                    .into_response()
+            }
+        },
     }
 }
 

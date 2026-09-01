@@ -14,6 +14,7 @@
 #   ./scripts/build.sh --release-debuginfo                   # release + debug symbols
 #   ./scripts/build.sh --no-check                            # skip cargo check
 #   ./scripts/build.sh --target aarch64-unknown-linux-gnu     # cross build
+#   ./scripts/build.sh --target aarch64-linux-android         # Android cross build
 #   ./scripts/build.sh --cargo-home /path/to/cargo            # use existing cargo
 #   ./scripts/build.sh --cargo-bin /path/to/cargo/bin         # add cargo to PATH
 #   ./scripts/build.sh --target-dir /path/to/target           # override cargo target dir
