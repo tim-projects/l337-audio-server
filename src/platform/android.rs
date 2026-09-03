@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
+static GLOBAL_STATE: Mutex<Option<*mut AndroidState>> = Mutex::new(None);
+
 #[allow(non_camel_case_types)]
 mod ffi {
     use std::os::raw::{c_int, c_void};
@@ -119,11 +121,18 @@ unsafe impl Sync for AndroidAudioOutputStream {}
 
 extern "C" fn data_callback(
     _stream: *mut ffi::AAudioStream,
-    userdata: *mut std::os::raw::c_void,
+    _userdata: *mut std::os::raw::c_void,
     audio_data: *mut std::os::raw::c_void,
     num_frames: i32,
 ) -> i32 {
-    let state = unsafe { &*(userdata as *const AndroidState) };
+    let state_ptr = {
+        let global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        match *global {
+            Some(ptr) => ptr,
+            None => return ffi::AAUDIO_CALLBACK_RESULT_CONTINUE,
+        }
+    };
+    let state = unsafe { &*state_ptr };
 
     let channels = {
         let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,7 +213,6 @@ impl AudioBackend for AndroidAudioBackend {
                 ffi::AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
             );
             ffi::AAudioStreamBuilder_setDataCallback(builder, data_callback);
-            ffi::AAudioStreamBuilder_setUserData(builder, userdata);
             ffi::AAudioStreamBuilder_setBufferCapacityInFrames(builder, 65536);
         }
 
@@ -222,6 +230,11 @@ impl AudioBackend for AndroidAudioBackend {
                 "AAudioStreamBuilder_openStream failed with result {}",
                 result
             ));
+        }
+
+        {
+            let mut global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            *global = Some(state_ptr);
         }
 
         let actual_rate = unsafe { ffi::AAudioStream_getSampleRate(stream) };
@@ -273,6 +286,8 @@ impl AudioOutputStream for AndroidAudioOutputStream {
             let _ = ffi::AAudioStream_close(self.stream);
             ffi::AAudioStreamBuilder_delete(self.builder);
         }
+        let mut global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *global = None;
     }
 }
 
@@ -293,5 +308,7 @@ impl Drop for AndroidAudioOutputStream {
             }
             self.state = std::ptr::null_mut();
         }
+        let mut global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *global = None;
     }
 }
