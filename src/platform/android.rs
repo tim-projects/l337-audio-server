@@ -46,7 +46,7 @@ mod ffi {
     pub const AAUDIO_CALLBACK_RESULT_CONTINUE: c_int = 0;
     pub const AAUDIO_OK: c_int = 0;
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn AAudio_createStreamBuilder() -> *mut AAudioStreamBuilder;
         pub fn AAudioStreamBuilder_setDirection(
             builder: *mut AAudioStreamBuilder,
@@ -93,7 +93,7 @@ mod ffi {
     }
 
     #[link(name = "aaudio")]
-    extern "C" {}
+    unsafe extern "C" {}
 }
 
 struct AndroidState {
@@ -103,6 +103,10 @@ struct AndroidState {
 }
 
 pub struct AndroidAudioBackend;
+
+pub fn init() {
+    tracing::info!("Android AAudio backend initialized");
+}
 
 pub struct AndroidAudioOutputStream {
     stream: *mut ffi::AAudioStream,
