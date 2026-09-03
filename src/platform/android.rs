@@ -3,7 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
-static GLOBAL_STATE: Mutex<Option<*mut AndroidState>> = Mutex::new(None);
+struct GlobalStatePtr(*mut AndroidState);
+
+unsafe impl Send for GlobalStatePtr {}
+unsafe impl Sync for GlobalStatePtr {}
+
+static GLOBAL_STATE: Mutex<Option<GlobalStatePtr>> = Mutex::new(None);
 
 #[allow(non_camel_case_types)]
 mod ffi {
@@ -128,7 +133,7 @@ extern "C" fn data_callback(
     let state_ptr = {
         let global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         match *global {
-            Some(ptr) => ptr,
+            Some(ref ptr) => ptr.0,
             None => return ffi::AAUDIO_CALLBACK_RESULT_CONTINUE,
         }
     };
@@ -234,7 +239,7 @@ impl AudioBackend for AndroidAudioBackend {
 
         {
             let mut global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            *global = Some(state_ptr);
+            *global = Some(GlobalStatePtr(state_ptr));
         }
 
         let actual_rate = unsafe { ffi::AAudioStream_getSampleRate(stream) };
