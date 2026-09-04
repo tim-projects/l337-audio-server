@@ -128,7 +128,7 @@ impl PulseAudioAudioOutputStream {
                 let result = unsafe {
                     (funcs.pa_simple_write)(
                         simple_ptr,
-                        bytes.as_ptr(),
+                        bytes.as_ptr() as *const std::os::raw::c_void,
                         bytes.len(),
                         std::ptr::null_mut(),
                     )
@@ -142,7 +142,7 @@ impl PulseAudioAudioOutputStream {
                 let result = unsafe {
                     (funcs.pa_simple_write)(
                         simple_ptr,
-                        silence_buf.as_ptr(),
+                        silence_buf.as_ptr() as *const std::os::raw::c_void,
                         silence_buf.len(),
                         std::ptr::null_mut(),
                     )
@@ -168,9 +168,11 @@ impl AudioBackend for PulseAudioAudioBackend {
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
         let lib = Arc::new(
-            libloading::Library::new("libpulse-simple.so.0")
-                .or_else(|_| libloading::Library::new("libpulse-simple.so"))
-                .map_err(|e| format!("Failed to load libpulse-simple: {}", e))?,
+            unsafe {
+                libloading::Library::new("libpulse-simple.so.0")
+                    .or_else(|_| libloading::Library::new("libpulse-simple.so"))
+                    .map_err(|e| format!("Failed to load libpulse-simple: {}", e))?
+            },
         );
 
         let pa_simple_new: libloading::Symbol<ffi::pa_simple_new_fn> = unsafe {
