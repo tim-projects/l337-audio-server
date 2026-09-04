@@ -13,11 +13,17 @@
 pub mod common;
 pub mod single_instance;
 
+#[cfg(all(target_os = "android", feature = "pulseaudio"))]
+pub mod pulseaudio;
+
 #[cfg(all(target_os = "android", feature = "backend"))]
 pub mod android;
 
 #[cfg(all(target_os = "linux", feature = "backend"))]
 pub mod linux;
+
+#[cfg(all(target_os = "linux", feature = "alsa"))]
+pub mod alsa;
 
 #[cfg(all(target_os = "macos", feature = "backend"))]
 pub mod macos;
@@ -34,6 +40,9 @@ pub fn init() {
 
     #[cfg(all(target_os = "linux", feature = "backend"))]
     linux::init();
+
+    #[cfg(all(target_os = "linux", feature = "alsa"))]
+    alsa::init();
 
     #[cfg(all(target_os = "macos", feature = "backend"))]
     macos::init();

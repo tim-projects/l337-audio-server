@@ -6,6 +6,8 @@ edition = "2024"
 [features]
 default = ["backend"]
 backend = ["pipewire", "coreaudio-rs", "wasapi"]
+alsa = []
+pulseaudio = ["backend"]
 
 [dependencies]
 axum = "0.7.9"

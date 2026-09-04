@@ -14,7 +14,8 @@ on:
         type: choice
         options:
           - all
-          - x86_64-unknown-linux-gnu
+          - x86_64-linux-pipewire
+          - x86_64-linux-alsa
           - x86_64-pc-windows-msvc
           - x86_64-apple-darwin
           - aarch64-linux-android
@@ -28,25 +29,35 @@ concurrency:
 
 jobs:
   build-linux:
-    name: Build - x86_64-unknown-linux-gnu
+    name: Build - x86_64-linux (${{ matrix.variant }})
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'x86_64-unknown-linux-gnu' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'x86_64-linux-pipewire' || github.event.inputs.target == 'x86_64-linux-alsa' }}
+    strategy:
+      matrix:
+        variant: [pipewire, alsa]
+        include:
+          - variant: pipewire
+            features: ""
+            pkg_deps: libpipewire-0.3-dev libspa-0.2-dev
+          - variant: alsa
+            features: "--no-default-features --features alsa"
+            pkg_deps: ""
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies (Linux)
       run: |
         sudo apt-get update
-        sudo apt-get install -y pkg-config libpipewire-0.3-dev libspa-0.2-dev
+        sudo apt-get install -y pkg-config ${{ matrix.pkg_deps }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-unknown-linux-gnu
     - name: Build release binary
-      run: cargo build --verbose --release --target x86_64-unknown-linux-gnu
+      run: cargo build --verbose --release --target x86_64-unknown-linux-gnu ${{ matrix.features }}
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-x86_64-unknown-linux-gnu
+        name: l337-audio-server-x86_64-linux-${{ matrix.variant }}
         path: |
           target/x86_64-unknown-linux-gnu/release/l337-audio-server
         retention-days: 90
@@ -95,10 +106,13 @@ jobs:
         retention-days: 90
 
   build-android:
-    name: Build - aarch64-linux-android
+    name: Build - aarch64-linux-android (${{ matrix.variant }})
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'aarch64-linux-android' }}
     continue-on-error: true
+    strategy:
+      matrix:
+        variant: [native, termux]
     steps:
     - uses: actions/checkout@v4
     - name: Setup Rust
@@ -117,11 +131,16 @@ jobs:
         echo "CXX_aarch64-linux-android=$(pwd)/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++" >> $GITHUB_ENV
         echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$(pwd)/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang" >> $GITHUB_ENV
     - name: Build release binary
-      run: cargo build --verbose --release --target aarch64-linux-android
+      run: |
+        if [ "${{ matrix.variant }}" = "termux" ]; then
+          cargo build --verbose --release --target aarch64-linux-android --features pulseaudio
+        else
+          cargo build --verbose --release --target aarch64-linux-android
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-aarch64-linux-android
+        name: ${{ matrix.variant == 'native' && 'l337-audio-server-aarch64-android' || 'l337-audio-server-aarch64-android-termux' }}
         path: |
           target/aarch64-linux-android/release/l337-audio-server
         retention-days: 90

@@ -53,6 +53,7 @@ mod ffi {
     pub const AAUDIO_CALLBACK_RESULT_CONTINUE: c_int = 0;
     pub const AAUDIO_OK: c_int = 0;
 
+    #[link(name = "aaudio")]
     unsafe extern "C" {
         pub fn AAudio_createStreamBuilder() -> *mut AAudioStreamBuilder;
         pub fn AAudioStreamBuilder_setDirection(
@@ -98,9 +99,6 @@ mod ffi {
         pub fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder);
         pub fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
     }
-
-    #[link(name = "aaudio")]
-    unsafe extern "C" {}
 }
 
 struct AndroidState {
@@ -187,12 +185,31 @@ extern "C" fn data_callback(
 impl AudioBackend for AndroidAudioBackend {
     fn start_stream(
         &self,
-        _name: &str,
+        name: &str,
         sample_rate: u32,
         channels: u16,
         audio_buffer: Arc<Mutex<AudioBuffer>>,
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
+        #[cfg(feature = "pulseaudio")]
+        {
+            // On Android/Termux, direct AAudio/OpenSL ES from a console process
+            // is unreliable. Prefer PulseAudio if available (Termux standard).
+            let pa_backend = crate::platform::pulseaudio::PulseAudioAudioBackend;
+            if let Ok(stream) = pa_backend.start_stream(
+                name,
+                sample_rate,
+                channels,
+                audio_buffer.clone(),
+                volume.clone(),
+            ) {
+                tracing::info!("Using PulseAudio backend for Android");
+                return Ok(stream);
+            }
+            tracing::warn!("PulseAudio not available on this Android device, falling back to AAudio");
+        }
+
+        // Fallback: native AAudio via NDK.
         let state = Box::new(AndroidState {
             buffer: audio_buffer,
             volume,

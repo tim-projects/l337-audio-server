@@ -98,6 +98,10 @@ impl PlayerEngine {
             {
                 Box::new(crate::platform::linux::PipeWireAudioBackend)
             }
+            #[cfg(all(target_os = "linux", feature = "alsa", not(feature = "backend")))]
+            {
+                Box::new(crate::platform::alsa::AlsaAudioBackend)
+            }
             #[cfg(all(target_os = "macos", feature = "backend"))]
             {
                 Box::new(crate::platform::macos::CoreAudioAudioBackend)
@@ -110,7 +114,7 @@ impl PlayerEngine {
             {
                 Box::new(crate::platform::android::AndroidAudioBackend)
             }
-            #[cfg(not(feature = "backend"))]
+            #[cfg(not(any(feature = "backend", feature = "alsa")))]
             {
                 Box::new(crate::platform::common::NoopAudioBackend)
             }
