@@ -16,6 +16,8 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "vorbis", "wav", "isomp4", "ogg"] }
 rubato = "0.14"
+wsola = "0.1.0"
+pitch_shift = "2.1"
 async-trait = "0.1.86"
 libloading = "0.8.6"
 walkdir = "2.5.0"

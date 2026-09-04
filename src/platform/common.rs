@@ -50,6 +50,7 @@ pub struct AudioBuffer {
     pub sample_rate: u32,
     pub file_sample_rate: u32,
     pub speed: f32,
+    pub pitch: f32,
 }
 
 impl AudioBuffer {
@@ -61,6 +62,7 @@ impl AudioBuffer {
             sample_rate,
             file_sample_rate,
             speed: 1.0,
+            pitch: 1.0,
         }
     }
 }

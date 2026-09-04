@@ -174,7 +174,7 @@ pub async fn set_speed(
     Json(payload): Json<SpeedPayload>,
 ) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
-    engine.set_speed(payload.speed);
+    engine.set_speed_and_pitch(payload.speed, payload.pitch);
     StatusCode::OK.into_response()
 }
 

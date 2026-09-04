@@ -15,6 +15,8 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tracing::{error, info};
+use wsola;
+use pitch_shift;
 
 struct StreamingPlayback {
     download_handle: Option<tokio::task::JoinHandle<()>>,
@@ -80,6 +82,7 @@ pub struct PlayerEngine {
     pub current_track: Option<Track>,
     pub state: PlayerStateLabel,
     pub speed: f32,
+    pub pitch: f32,
     pub volume_val: f32,
     pub duration_sec: Option<u64>,
     pub position_sec: u64,
@@ -148,6 +151,7 @@ impl PlayerEngine {
             current_track: None,
             state: PlayerStateLabel::Stopped,
             speed: 1.0,
+            pitch: 1.0,
             volume_val: 1.0,
             duration_sec: None,
             position_sec: 0,
@@ -166,6 +170,7 @@ impl PlayerEngine {
             current_track: None,
             state: PlayerStateLabel::Stopped,
             speed: 1.0,
+            pitch: 1.0,
             volume_val: 1.0,
             duration_sec: None,
             position_sec: 0,
@@ -328,7 +333,7 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         };
 
         let playback_pcm =
-            resample_interleaved(&pcm, channels, file_sample_rate, device_rate, self.speed);
+            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
 
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
@@ -336,6 +341,7 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
+        buf.pitch = self.pitch;
         drop(buf);
 
         self.position_sec = 0;
@@ -438,9 +444,15 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
     }
 
     pub fn set_speed(&mut self, speed: f32) {
+        self.set_speed_and_pitch(speed, self.pitch);
+    }
+
+    pub fn set_speed_and_pitch(&mut self, speed: f32, pitch: f32) {
         self.speed = speed.clamp(0.25, 4.0);
+        self.pitch = pitch.clamp(0.25, 4.0);
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.speed = self.speed;
+        buf.pitch = self.pitch;
         drop(buf);
     }
 
@@ -548,7 +560,7 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         };
 
         let playback_pcm =
-            resample_interleaved(&pcm, channels, file_sample_rate, device_rate, self.speed);
+            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
         tracing::info!("seek: after resample: playback_pcm.len()={}", playback_pcm.len());
 
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -557,6 +569,7 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
+        buf.pitch = self.pitch;
         drop(buf);
 
         self.position_sec = position;
@@ -627,6 +640,7 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
             state: self.state,
             volume: self.volume_val,
             speed: self.speed,
+            pitch: self.pitch,
             current_track: self.current_track.clone(),
             disk_pool_utilization_bytes: utilization,
             next_cached,
@@ -769,6 +783,93 @@ pub(crate) fn resample_interleaved(
         input_offset += frames_needed;
     }
     output
+}
+
+pub(crate) fn pitch_shift_interleaved(
+    input: &[f32],
+    channels: u16,
+    pitch: f32,
+    sample_rate: f32,
+) -> Vec<f32> {
+    if pitch == 1.0 || input.is_empty() {
+        return input.to_vec();
+    }
+
+    let channels = channels as usize;
+    let total_frames = input.len() / channels;
+    if total_frames == 0 {
+        return input.to_vec();
+    }
+
+    let shift_semitones = 12.0 * (pitch as f64).log2() as f32;
+    let chunk_size = 128usize;
+
+    let mut planar: Vec<Vec<f32>> = vec![Vec::with_capacity(total_frames); channels];
+    for frame in input.chunks(channels) {
+        for (ch, &sample) in frame.iter().enumerate() {
+            planar[ch].push(sample);
+        }
+    }
+
+    let padded_frames = total_frames.div_ceil(chunk_size) * chunk_size;
+    let mut output_planar: Vec<Vec<f32>> = vec![Vec::with_capacity(padded_frames); channels];
+    for ch in 0..channels {
+        let mut shifter = pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32]));
+        let samples = &planar[ch];
+        for chunk in samples.chunks(chunk_size) {
+            let mut buf = [0.0f32; 128];
+            for (i, &s) in chunk.iter().enumerate() {
+                buf[i] = s;
+            }
+            let result = shifter.shift(&buf, shift_semitones, chunk_size, sample_rate);
+            output_planar[ch].extend_from_slice(result);
+        }
+    }
+
+    let output_frames = output_planar[0].len();
+    let mut output = Vec::with_capacity(output_frames * channels);
+    for frame_idx in 0..output_frames {
+        for ch in 0..channels {
+            output.push(output_planar[ch][frame_idx]);
+        }
+    }
+
+    output
+}
+
+pub(crate) fn stretch_and_resample(
+    input: &[f32],
+    channels: u16,
+    file_sample_rate: u32,
+    device_rate: u32,
+    speed: f32,
+    pitch: f32,
+) -> Vec<f32> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let channels = channels as usize;
+    let tempo = speed / pitch;
+
+    let stretched = if tempo != 1.0 {
+        wsola::stretch(input, file_sample_rate, channels as u16, tempo)
+            .unwrap_or_else(|_| input.to_vec())
+    } else {
+        input.to_vec()
+    };
+
+    let pitched = if pitch != 1.0 {
+        pitch_shift_interleaved(&stretched, channels as u16, pitch, file_sample_rate as f32)
+    } else {
+        stretched
+    };
+
+    if file_sample_rate == device_rate {
+        return pitched;
+    }
+
+    resample_interleaved(&pitched, channels as u16, file_sample_rate, device_rate, 1.0)
 }
 
 #[cfg(test)]
@@ -1152,12 +1253,32 @@ fn streaming_decode_sync(
         let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.sample_rate
     };
-    let speed = {
+    let (speed, pitch) = {
         let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        ab.speed
+        (ab.speed, ab.pitch)
     };
 
-    let mut resampler = if file_sample_rate != device_rate || speed != 1.0 {
+    let tempo = speed / pitch;
+    let mut stretcher = if tempo != 1.0 {
+        wsola::TimeStretch::new(file_sample_rate, channels)
+            .ok()
+            .map(|mut ts| { ts.set_tempo(tempo); ts })
+    } else {
+        None
+    };
+
+    let mut shifter = if pitch != 1.0 {
+        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+    } else {
+        None
+    };
+    let shift_semitones = if pitch != 1.0 {
+        Some(12.0 * (pitch as f64).log2() as f32)
+    } else {
+        None
+    };
+
+    let mut resampler = if file_sample_rate != device_rate {
         let channels = channels as usize;
         let params = SincInterpolationParameters {
             sinc_len: 1024,
@@ -1167,8 +1288,7 @@ fn streaming_decode_sync(
             window: WindowFunction::BlackmanHarris2,
         };
         let chunk_size = 4096;
-        let effective_in_rate = (file_sample_rate as f64) * (speed as f64);
-        let ratio = device_rate as f64 / effective_in_rate;
+        let ratio = device_rate as f64 / file_sample_rate as f64;
         Some(SincFixedIn::<f32>::new(ratio, 10.0, params, chunk_size, channels).unwrap())
     } else {
         None
@@ -1203,9 +1323,44 @@ fn streaming_decode_sync(
                             let samples = buf.samples();
                             let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
 
+                            let mut output = samples.to_vec();
+
+                            if let Some(ref mut stretcher) = stretcher {
+                                stretcher.push(samples);
+                                output = stretcher.pull(4096);
+                            }
+
+                            if let (Some(ref mut shifter), Some(semitones)) = (shifter.as_mut(), shift_semitones) {
+                                let ch = channels as usize;
+                                let mut input_planar = vec![Vec::new(); ch];
+                                for frame in output.chunks(ch) {
+                                    for (c, &sample) in frame.iter().enumerate() {
+                                        input_planar[c].push(sample);
+                                    }
+                                }
+                                let mut pitched_planar: Vec<Vec<f32>> = vec![Vec::new(); ch];
+                                for c in 0..ch {
+                                    for chunk in input_planar[c].chunks(128) {
+                                        let mut buf = [0.0f32; 128];
+                                        for (i, &s) in chunk.iter().enumerate() {
+                                            buf[i] = s;
+                                        }
+                                        let result = shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                                        pitched_planar[c].extend_from_slice(result);
+                                    }
+                                }
+                                let out_frames = pitched_planar[0].len();
+                                output = Vec::with_capacity(out_frames * ch);
+                                for f in 0..out_frames {
+                                    for c in 0..ch {
+                                        output.push(pitched_planar[c][f]);
+                                    }
+                                }
+                            }
+
                             if let Some(ref mut resampler) = resampler {
                                 let mut input_planar = vec![Vec::new(); channels as usize];
-                                for chunk in samples.chunks(channels as usize) {
+                                for chunk in output.chunks(channels as usize) {
                                     for (ch, &sample) in chunk.iter().enumerate() {
                                         input_planar[ch].push(sample);
                                     }
@@ -1222,7 +1377,7 @@ fn streaming_decode_sync(
                                     ab.pcm.extend_from_slice(&output);
                                 }
                             } else {
-                                ab.pcm.extend_from_slice(samples);
+                                ab.pcm.extend_from_slice(&output);
                             }
                         }
 

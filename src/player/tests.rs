@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::player::engine::{PlayerEngine, decode_to_pcm, resample_interleaved};
+    use crate::player::engine::{PlayerEngine, decode_to_pcm, resample_interleaved, stretch_and_resample};
     use crate::player::storage::StorageManager;
     use std::path::PathBuf;
 
@@ -148,6 +148,43 @@ mod tests {
             "downsample length {} != expected ~{}",
             output.len(),
             expected_frames * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stretch_and_resample_speed_only() {
+        let input: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let sample = (i as f32 / 48000.0 * std::f32::consts::TAU * 440.0).sin();
+                [sample, sample]
+            })
+            .collect();
+
+        let output = stretch_and_resample(&input, 2, 48000, 48000, 2.0, 1.0);
+        let expected_frames = input.len() / 4;
+        assert!(
+            (output.len() as i64 - (expected_frames * 2) as i64).abs() <= expected_frames as i64 / 10,
+            "2x speed stretch length {} != expected ~{}",
+            output.len(),
+            expected_frames * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stretch_and_resample_pitch_only() {
+        let input: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let sample = (i as f32 / 48000.0 * std::f32::consts::TAU * 440.0).sin();
+                [sample, sample]
+            })
+            .collect();
+
+        let output = stretch_and_resample(&input, 2, 48000, 48000, 1.0, 1.5);
+        assert!(
+            (output.len() as i64 - input.len() as i64).abs() <= input.len() as i64 / 20,
+            "pitch-only stretch length {} != input {}",
+            output.len(),
+            input.len()
         );
     }
 }

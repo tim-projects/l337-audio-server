@@ -12,6 +12,8 @@ pub struct Track {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpeedPayload {
     pub speed: f32,
+    #[serde(default)]
+    pub pitch: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +46,7 @@ pub struct PlayerStatus {
     pub state: PlayerStateLabel,
     pub volume: f32,
     pub speed: f32,
+    pub pitch: f32,
     pub current_track: Option<Track>,
     pub disk_pool_utilization_bytes: u64,
     pub next_cached: bool,

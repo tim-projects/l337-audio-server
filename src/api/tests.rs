@@ -113,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_set_speed() {
         let state = setup_state().await;
-        let response = set_speed(State(state.clone()), Json(SpeedPayload { speed: 1.5 })).await;
+        let response = set_speed(State(state.clone()), Json(SpeedPayload { speed: 1.5, pitch: 1.0 })).await;
         assert_eq!(
             response.into_response().status(),
             axum::http::StatusCode::OK
@@ -124,6 +124,7 @@ mod tests {
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["speed"], 1.5);
+        assert_eq!(json["pitch"], 1.0);
     }
 
     #[tokio::test]
