@@ -67,12 +67,16 @@ struct PulseAudioFuncs {
     pa_simple_get_latency: ffi::pa_simple_get_latency_fn,
 }
 
+struct SendSyncPulseAudio(*mut ffi::pa_simple);
+unsafe impl Send for SendSyncPulseAudio {}
+unsafe impl Sync for SendSyncPulseAudio {}
+
 struct PulseAudioState {
     buffer: Arc<Mutex<AudioBuffer>>,
     volume: Arc<Mutex<f32>>,
     playing: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
-    simple: Mutex<*mut ffi::pa_simple>,
+    simple: Mutex<SendSyncPulseAudio>,
 }
 
 pub struct PulseAudioAudioBackend;
@@ -97,8 +101,8 @@ impl PulseAudioAudioOutputStream {
             let playing = state.playing.load(Ordering::Relaxed);
 
             let simple_ptr = match state.simple.lock() {
-                Ok(guard) => *guard,
-                Err(e) => *e.into_inner(),
+                Ok(guard) => guard.0,
+                Err(e) => e.into_inner().0,
             };
             if simple_ptr.is_null() {
                 break;
@@ -228,12 +232,12 @@ impl AudioBackend for PulseAudioAudioBackend {
             volume,
             playing: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
-            simple: Mutex::new(simple),
+            simple: Mutex::new(SendSyncPulseAudio(simple)),
         });
 
         let state_clone = state.clone();
         let thread = thread::spawn(move || {
-            Self::writer_loop(state_clone, funcs);
+            PulseAudioAudioOutputStream::writer_loop(state_clone, funcs);
         });
 
         Ok(Box::new(PulseAudioAudioOutputStream {
@@ -260,8 +264,8 @@ impl AudioOutputStream for PulseAudioAudioOutputStream {
         self.state.cancel.store(true, Ordering::Relaxed);
 
         let simple_ptr = match self.state.simple.lock() {
-            Ok(guard) => *guard,
-            Err(e) => *e.into_inner(),
+            Ok(guard) => guard.0,
+            Err(e) => e.into_inner().0,
         };
 
         if !simple_ptr.is_null() {

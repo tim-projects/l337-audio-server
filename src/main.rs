@@ -16,7 +16,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+#[cfg(unix)]
 use tokio::signal::unix::SignalKind;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -215,33 +217,36 @@ async fn main() {
     let shared_token = Arc::new(Mutex::new(token.clone()));
 
     // Spawn SIGHUP config reload: re-read config + env, rotate token if changed.
-    let reload_token = shared_token.clone();
-    let _reload_handle = tokio::spawn(async move {
-        let mut signal = match tokio::signal::unix::signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("SIGHUP reload unavailable: {}", e);
-                return;
-            }
-        };
-        while signal.recv().await.is_some() {
-            tracing::warn!("SIGHUP received; reloading configuration");
-            match load_settings() {
-                Ok(new_settings) => {
-                    if let Some(new_token) = new_settings.server.token {
-                        if !new_token.is_empty() {
-                            let mut guard = reload_token.lock().await;
-                            if *guard != new_token {
-                                tracing::warn!("Rotating auth token");
-                                *guard = new_token;
+    #[cfg(unix)]
+    {
+        let reload_token = shared_token.clone();
+        let _reload_handle = tokio::spawn(async move {
+            let mut signal = match tokio::signal::unix::signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGHUP reload unavailable: {}", e);
+                    return;
+                }
+            };
+            while signal.recv().await.is_some() {
+                tracing::warn!("SIGHUP received; reloading configuration");
+                match load_settings() {
+                    Ok(new_settings) => {
+                        if let Some(new_token) = new_settings.server.token {
+                            if !new_token.is_empty() {
+                                let mut guard = reload_token.lock().await;
+                                if *guard != new_token {
+                                    tracing::warn!("Rotating auth token");
+                                    *guard = new_token;
+                                }
                             }
                         }
                     }
+                    Err(e) => tracing::error!("Config reload failed: {}", e),
                 }
-                Err(e) => tracing::error!("Config reload failed: {}", e),
             }
-        }
-    });
+        });
+    }
 
     // Build our application with routes
     let mut app = Router::new()
@@ -279,6 +284,7 @@ async fn main() {
     ));
 
     // Serve over Unix socket or TCP/HTTPS.
+    #[cfg(unix)]
     if use_socket {
         let path = socket_path();
         if !remove_stale_socket(&path) {
@@ -292,7 +298,6 @@ async fn main() {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let listener =
             std::os::unix::net::UnixListener::bind(&path).expect("Failed to bind Unix socket");
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
@@ -308,7 +313,7 @@ async fn main() {
             .await
             .unwrap();
     } else {
-        // Run it (optionally over TLS)
+        // TCP/HTTPS path (also used on non-Unix platforms)
         let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
             .parse()
             .expect("Invalid address/port in config");
@@ -356,6 +361,54 @@ async fn main() {
             }
         }
     }
+
+    #[cfg(not(unix))]
+    {
+        // Non-Unix platforms (Windows): always use TCP/HTTPS.
+        let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)
+            .parse()
+            .expect("Invalid address/port in config");
+
+        if !tcp_port_available(addr) {
+            tracing::error!(
+                "TCP port {} is already in use. Another instance may be running, \
+                 or another service is bound to that port.",
+                addr
+            );
+            std::process::exit(1);
+        }
+
+        match (
+            settings.server.tls_cert.clone(),
+            settings.server.tls_key.clone(),
+        ) {
+            (Some(cert), Some(key)) => {
+                tracing::info!("L337 Audio Server listening with TLS on https://{}", addr);
+                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .expect("invalid TLS cert/key");
+                axum_server::bind_rustls(addr, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                let host = settings.server.host.clone();
+                let certified = security::generate_self_signed(&host);
+                let tls = security::rustls_config(certified);
+                tracing::warn!(
+                    "No TLS cert configured. Auto-generated a self-signed certificate; \
+                     server is available at https://{}. Configure a trusted cert in \
+                     [server] tls_cert/tls_key for production.",
+                    addr
+                );
+                axum_server::bind_rustls(addr, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
 }
 
 fn generate_token() -> String {
@@ -380,7 +433,11 @@ fn ensure_config_file() {
     if std::path::Path::new("/etc/l337-audio-server").is_dir() {
         match std::fs::write(etc_path, DEFAULT_CONFIG) {
             Ok(()) => {
-                let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
+                }
                 tracing::info!(
                     "No server.ini found; created a default at {}",
                     etc_path.display()
@@ -396,7 +453,11 @@ fn ensure_config_file() {
         if !xdg_path.exists() {
             let _ = std::fs::create_dir_all(xdg_path.parent().unwrap());
             let _ = std::fs::write(&xdg_path, DEFAULT_CONFIG);
-            let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
+            }
             tracing::info!(
                 "No server.ini found; created a default at {}",
                 xdg_path.display()
@@ -411,7 +472,11 @@ fn ensure_config_file() {
     }
     match std::fs::write(cwd_path, DEFAULT_CONFIG) {
         Ok(()) => {
-            let _ = std::fs::set_permissions(cwd_path, std::fs::Permissions::from_mode(0o600));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(cwd_path, std::fs::Permissions::from_mode(0o600));
+            }
             tracing::info!(
                 "No server.ini found; created a default at {}",
                 cwd_path.display()
@@ -457,9 +522,13 @@ fn load_or_create_token() -> String {
     if let Err(e) = std::fs::write(&path, &generated) {
         tracing::warn!("Could not persist token to {}: {}", path.display(), e);
     } else if let Ok(meta) = std::fs::metadata(&path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() & 0o7777 | 0o600);
-        let _ = std::fs::set_permissions(&path, perms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() & 0o7777 | 0o600);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
     }
     tracing::warn!(
         "No [server] token configured. Generated + persisted a token at {}; add it to the \
