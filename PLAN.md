@@ -168,9 +168,23 @@
 
 ## 6. Blockers
 
-### 6.1 `yt-dlp` binary dependency — **[NOTE]**
-`download_via_ytdlp` shells out to `yt-dlp`. It must be installed on the host or bundled with the
-binary for release builds. Document as a runtime dependency or embed a Python-based resolver.
+### 6.1 `yt-dlp` runtime dependency — **[NOTE]**
+`download_via_ytdlp` and `resolve_stream_url` shell out to the `yt-dlp` binary. This is a **runtime
+dependency** — it is **not** bundled with the server binary and is **not** installed by the
+`install-systemd.sh` / `install-launchd.sh` scripts.
+
+Operators must install `yt-dlp` separately and ensure it is on the server process `PATH`:
+- **Debian/Ubuntu:** `apt install yt-dlp`
+- **macOS (Homebrew):** `brew install yt-dlp`
+- **pip:** `pip install yt-dlp`
+
+If `yt-dlp` is missing, YouTube URLs return a clear error:
+```
+yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.
+```
+
+The `/health` endpoint reports `yt_dlp: true/false` in the capabilities object so the client
+can detect support without attempting a playback.
 
 ---
 
