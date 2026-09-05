@@ -160,7 +160,7 @@
 | 9 | Token rotation via `PUT /player/settings` + SIGHUP reload | **DONE** |
 | 10 | Challenge/redeem auth flow replacing `/setup` | **DONE** |
 | 11 | Config file permissions `0o600` on auto-generated files | **DONE** |
-| 12 | Token comparison hardening (constant-time) | **TODO** |
+| 12 | Token comparison hardening (constant-time) | **DONE** |
 | 13 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
 | 14 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
 
@@ -203,10 +203,10 @@ binary for release builds. Document as a runtime dependency or embed a Python-ba
 - Concurrency limiting deferred; can be added with `tower-governor` once axum 0.8 compatibility
   is resolved.
 
-### 7.5 Token comparison hardening — **[TODO]**
-- `src/security.rs` currently uses `String::eq` for bearer-token comparison, which is not
-  constant-time. Replace with a constant-time comparator (e.g. `subtle` crate or manual
-  bytewise XOR accumulator) to mitigate timing side-channels on the auth path.
+### 7.5 Token comparison hardening — **[DONE]**
+- `src/security.rs` now uses a bytewise XOR accumulator `constant_time_eq()` for bearer-token
+  comparison, replacing the previous `String::eq` short-circuit. This mitigates timing
+  side-channels on the auth path. The same pattern is used in `src/auth_challenge.rs`.
 
 ---
 
