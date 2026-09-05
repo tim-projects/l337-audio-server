@@ -163,6 +163,7 @@
 | 12 | Token comparison hardening (constant-time) | **DONE** |
 | 13 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
 | 14 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
+| 15 | GitHub Actions multi-platform release workflow | **DONE** |
 
 ---
 
@@ -247,10 +248,14 @@ can detect support without attempting a playback.
 - **[TODO]** Verify hardening flags (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
   `NoNewPrivileges`, `ReadOnlyPaths`, `ReadWritePaths`) are in the generated unit file.
 
-### 8.4 Build & release — **[TODO]**
-- `build.sh` dispatches to platform scripts. **[TODO]** Verify cross-compilation matrix works.
-- **[TODO]** Add GitHub Actions workflow for multi-platform release artifacts (Linux x86/arm64,
-  macOS x86/arm64, Windows x86_64).
+### 8.4 Build & release — **[DONE]**
+- `build.sh` dispatches to platform scripts.
+- `.github/workflows/build.yml` builds release artifacts for:
+  - Linux x86_64 (pipewire + alsa variants)
+  - Windows x86_64-pc-windows-msvc
+  - macOS x86_64-apple-darwin
+  - Android aarch64 (native + termux)
+- Workflow publishes a GitHub Release (`nightly-<sha>` tag) on push to `main`.
 
 ---
 
