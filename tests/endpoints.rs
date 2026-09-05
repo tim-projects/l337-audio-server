@@ -47,8 +47,12 @@ async fn find_available_port() -> u16 {
 /// Spawn the server on an available port in dummy HTTP mode.
 ///
 /// Uses `cargo run --bin l337-audio-server` so the binary does not need to be
-/// pre-built. Returns the port and a handle to the child process.
-async fn spawn_server() -> (u16, tokio::process::Child) {
+/// pre-built. Returns the port, a handle to the child process, and the XDG
+/// config directory used for the challenge token.
+async fn spawn_server() -> (u16, tokio::process::Child, PathBuf) {
+    let config_dir = std::env::temp_dir().join("l337-test-config").join("l337-audio-server");
+    let _ = std::fs::create_dir_all(&config_dir);
+
     // Clean up any stale instance lock from previous test runs.
     let _ = std::fs::remove_file(
         std::env::temp_dir()
@@ -62,6 +66,7 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
             .join("l337-audio-server")
             .join("instance.lock"),
     );
+    let _ = std::fs::remove_file(config_dir.join("instance.lock"));
 
     let port = find_available_port().await;
 
@@ -88,6 +93,7 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
         .arg("--transport=http")
         .env("L337__SERVER__PORT", port.to_string())
         .env("L337__SERVER__HOST", "127.0.0.1")
+        .env("XDG_CONFIG_HOME", config_dir.parent().unwrap())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -103,7 +109,7 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
     for _ in 0..120 {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
-                return (port, child);
+                return (port, child, config_dir);
             }
         }
         sleep(Duration::from_millis(500)).await;
@@ -114,9 +120,35 @@ async fn spawn_server() -> (u16, tokio::process::Child) {
     panic!("Server did not become ready on port {}", port);
 }
 
+/// Obtain a valid bearer token by completing the challenge/redeem flow.
+async fn get_token_via_challenge(client: &Client, port: u16, config_dir: &PathBuf) -> String {
+    let challenge_resp = client
+        .post(format!("https://127.0.0.1:{}/auth/challenge", port))
+        .send()
+        .await
+        .expect("Failed to call /auth/challenge");
+    assert_eq!(challenge_resp.status(), 202);
+
+    let challenge_path = config_dir.join("challenge-token.txt");
+    let challenge_token = std::fs::read_to_string(&challenge_path)
+        .expect("Failed to read challenge-token.txt")
+        .trim()
+        .to_string();
+
+    let redeem_resp = client
+        .post(format!("https://127.0.0.1:{}/auth/redeem", port))
+        .header("X-L337-Challenge", &challenge_token)
+        .send()
+        .await
+        .expect("Failed to call /auth/redeem");
+    assert_eq!(redeem_resp.status(), 200);
+
+    challenge_token
+}
+
 #[tokio::test]
 async fn test_health_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, _config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -138,31 +170,8 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
-async fn test_setup_endpoint_returns_token() {
-    let (_port, mut child) = spawn_server().await;
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("Failed to build reqwest client");
-
-    let resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.expect("Failed to parse /setup JSON");
-    assert!(body["token"].is_string());
-    assert!(!body["token"].as_str().unwrap().is_empty());
-
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
-
-#[tokio::test]
 async fn test_root_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, _config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -184,7 +193,7 @@ async fn test_root_endpoint() {
 
 #[tokio::test]
 async fn test_player_status_requires_auth() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, _config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -204,20 +213,14 @@ async fn test_player_status_requires_auth() {
 
 #[tokio::test]
 async fn test_player_status_with_auth() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
     // Discover token via /setup.
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let resp = client
         .get(format!("https://127.0.0.1:{}/player/status", _port))
@@ -236,19 +239,13 @@ async fn test_player_status_with_auth() {
 
 #[tokio::test]
 async fn test_play_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let audio_path = std::env::temp_dir().join("l337-test-audio.wav");
     write_minimal_wav(&audio_path);
@@ -279,19 +276,13 @@ async fn test_play_endpoint() {
 
 #[tokio::test]
 async fn test_play_endpoint_validation() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let payload = serde_json::json!({
         "track_id": "",
@@ -314,19 +305,13 @@ async fn test_play_endpoint_validation() {
 
 #[tokio::test]
 async fn test_pause_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let resp = client
         .post(format!("https://127.0.0.1:{}/player/pause", _port))
@@ -343,19 +328,13 @@ async fn test_pause_endpoint() {
 
 #[tokio::test]
 async fn test_next_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let resp = client
         .post(format!("https://127.0.0.1:{}/player/next", _port))
@@ -372,19 +351,13 @@ async fn test_next_endpoint() {
 
 #[tokio::test]
 async fn test_previous_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let resp = client
         .post(format!("https://127.0.0.1:{}/player/previous", _port))
@@ -401,19 +374,13 @@ async fn test_previous_endpoint() {
 
 #[tokio::test]
 async fn test_player_settings_update() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let payload = serde_json::json!({
         "max_disk_pool_bytes": 512 * 1024 * 1024
@@ -435,19 +402,13 @@ async fn test_player_settings_update() {
 
 #[tokio::test]
 async fn test_cache_lookup_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let payload = serde_json::json!({
         "track_ids": ["abc123", "def456"]
@@ -471,19 +432,13 @@ async fn test_cache_lookup_endpoint() {
 
 #[tokio::test]
 async fn test_seek_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let audio_path = std::env::temp_dir().join("l337-test-seek.wav");
     write_minimal_wav(&audio_path);
@@ -538,19 +493,13 @@ async fn test_seek_endpoint() {
 
 #[tokio::test]
 async fn test_upload_stream_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let audio_path = std::env::temp_dir().join("l337-test-stream.wav");
     write_minimal_wav(&audio_path);
@@ -588,19 +537,13 @@ async fn test_upload_stream_endpoint() {
 
 #[tokio::test]
 async fn test_upload_stream_validation() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let resp = client
         .post(format!("https://127.0.0.1:{}/player/play/stream", _port))
@@ -618,7 +561,7 @@ async fn test_upload_stream_validation() {
 
 #[tokio::test]
 async fn test_auth_invalid_token() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, _config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -648,19 +591,13 @@ async fn test_auth_invalid_token() {
 
 #[tokio::test]
 async fn test_speed_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let audio_path = std::env::temp_dir().join("l337-test-speed.wav");
     write_minimal_wav(&audio_path);
@@ -708,19 +645,13 @@ async fn test_speed_endpoint() {
 
 #[tokio::test]
 async fn test_volume_endpoint() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let audio_path = std::env::temp_dir().join("l337-test-volume.wav");
     write_minimal_wav(&audio_path);
@@ -768,19 +699,13 @@ async fn test_volume_endpoint() {
 
 #[tokio::test]
 async fn test_cache_next_and_previous_endpoints() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let next_audio = std::env::temp_dir().join("l337-test-next.wav");
     write_minimal_wav(&next_audio);
@@ -840,19 +765,13 @@ async fn test_cache_next_and_previous_endpoints() {
 
 #[tokio::test]
 async fn test_cache_stream_upload_endpoints() {
-    let (_port, mut child) = spawn_server().await;
+    let (_port, mut child, config_dir) = spawn_server().await;
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build reqwest client");
 
-    let setup_resp = client
-        .get(format!("https://127.0.0.1:{}/setup", _port))
-        .send()
-        .await
-        .expect("Failed to call /setup");
-    let setup_body: serde_json::Value = setup_resp.json().await.expect("Failed to parse /setup JSON");
-    let token = setup_body["token"].as_str().unwrap();
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
 
     let next_audio = std::env::temp_dir().join("l337-test-cache-next-stream.wav");
     write_minimal_wav(&next_audio);
@@ -904,6 +823,80 @@ async fn test_cache_stream_upload_endpoints() {
         .collect();
     assert!(cached.contains(&"cache-next-stream".to_string()));
     assert!(cached.contains(&"cache-prev-stream".to_string()));
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_auth_challenge_redeem_happy_path() {
+    let (_port, mut child, config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    let resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status with redeemed token");
+
+    assert_eq!(resp.status(), 200);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_auth_redeem_rejects_wrong_challenge() {
+    let (_port, mut child, _config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let challenge_resp = client
+        .post(format!("https://127.0.0.1:{}/auth/challenge", _port))
+        .send()
+        .await
+        .expect("Failed to call /auth/challenge");
+    assert_eq!(challenge_resp.status(), 202);
+
+    let redeem_resp = client
+        .post(format!("https://127.0.0.1:{}/auth/redeem", _port))
+        .header("X-L337-Challenge", "wrong-token")
+        .send()
+        .await
+        .expect("Failed to call /auth/redeem");
+
+    assert_eq!(redeem_resp.status(), 401);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn test_auth_redeem_is_single_use() {
+    let (_port, mut child, config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    let redeem_resp = client
+        .post(format!("https://127.0.0.1:{}/auth/redeem", _port))
+        .header("X-L337-Challenge", &token)
+        .send()
+        .await
+        .expect("Failed to call /auth/redeem second time");
+
+    assert_eq!(redeem_resp.status(), 401);
 
     let _ = child.kill().await;
     let _ = child.wait().await;

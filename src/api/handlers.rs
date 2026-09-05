@@ -1,11 +1,12 @@
-use crate::api::models::{PoolSettings, SeekPayload, SpeedPayload, Track, VolumePayload};
+use crate::api::models::{AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload, Track, VolumePayload};
 use crate::player::engine::{self, PlayerEngine};
 use axum::{
     body::Body,
-    extract::{Json, State},
+    extract::{ConnectInfo, Json, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -24,9 +25,106 @@ pub async fn version() -> impl IntoResponse {
     }))
 }
 
-pub async fn setup(axum::Extension(token): axum::Extension<Arc<tokio::sync::Mutex<String>>>) -> impl IntoResponse {
-    let token = token.lock().await;
-    Json(serde_json::json!({"token": token.clone()}))
+pub async fn auth_challenge(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+) -> impl IntoResponse {
+    if socket_mode {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "socket_mode": true})),
+        )
+            .into_response();
+    }
+
+    if let Err(_) = rate_limiter.check(addr) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+
+    match challenge_state.issue().await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(AuthChallengeResponse { expires_in: crate::auth_challenge::CHALLENGE_TTL.as_secs() }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to issue auth challenge: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to issue challenge"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn auth_redeem(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(_state): State<AppState>,
+    axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
+    axum::Extension(auth_layer): axum::Extension<crate::security::AuthLayer>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if socket_mode {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "socket_mode": true})),
+        )
+            .into_response();
+    }
+
+    if let Err(_) = rate_limiter.check(addr) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+
+    let presented = match headers.get("X-L337-Challenge").and_then(|v| v.to_str().ok()) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing X-L337-Challenge header"})),
+            )
+                .into_response();
+        }
+    };
+
+    match challenge_state.verify_and_consume(presented).await {
+        Ok(token) => {
+            auth_layer.update_token(token);
+            (
+                StatusCode::OK,
+                Json(AuthRedeemResponse { ok: true }),
+            )
+                .into_response()
+        }
+        Err(crate::auth_challenge::ChallengeError::Io(e)) => {
+            tracing::error!("Challenge redeem IO error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid_or_expired_challenge"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn track_id_missing() -> impl IntoResponse {

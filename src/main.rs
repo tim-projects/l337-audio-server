@@ -1,11 +1,16 @@
 mod api;
+mod auth_challenge;
 mod platform;
 mod player;
+mod rate_limit;
 mod security;
+mod secrets_fs;
 
 use crate::api::handlers::{self, AppState};
+use crate::auth_challenge::ChallengeState;
 use crate::player::engine::PlayerEngine;
 use crate::player::storage::StorageManager;
+use crate::rate_limit::RateLimiter;
 use axum::{
     Router,
     routing::{get, post, put},
@@ -18,8 +23,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +93,12 @@ fn remove_stale_socket(_path: &std::path::Path) -> bool {
 
 fn parse_transport_cli() -> Option<String> {
     std::env::args().find_map(|a| a.strip_prefix("--transport=").map(|v| v.to_string()))
+}
+
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("l337-audio-server")
 }
 
 /// Default `server.ini` written when none exists, so the server always has a
@@ -214,12 +223,12 @@ async fn main() {
         Some(t) if !t.is_empty() => t.clone(),
         _ => load_or_create_token(),
     };
-    let shared_token = Arc::new(Mutex::new(token.clone()));
+    let auth_layer = security::AuthLayer::new(token.clone());
 
     // Spawn SIGHUP config reload: re-read config + env, rotate token if changed.
     #[cfg(unix)]
     {
-        let reload_token = shared_token.clone();
+        let reload_auth_layer = auth_layer.clone();
         let _reload_handle = tokio::spawn(async move {
             let mut signal = match tokio::signal::unix::signal(SignalKind::hangup()) {
                 Ok(s) => s,
@@ -234,10 +243,10 @@ async fn main() {
                     Ok(new_settings) => {
                         if let Some(new_token) = new_settings.server.token {
                             if !new_token.is_empty() {
-                                let mut guard = reload_token.lock().await;
-                                if *guard != new_token {
+                                let current = reload_auth_layer.current_token();
+                                if current != new_token {
                                     tracing::warn!("Rotating auth token");
-                                    *guard = new_token;
+                                    reload_auth_layer.update_token(new_token);
                                 }
                             }
                         }
@@ -248,10 +257,13 @@ async fn main() {
         });
     }
 
+    let challenge_state = Arc::new(ChallengeState::new(config_dir()));
+    let socket_mode = use_socket;
+    let rate_limiter = Arc::new(RateLimiter::new());
+
     // Build our application with routes
     let mut app = Router::new()
         .route("/health", get(handlers::health))
-        .route("/setup", get(handlers::setup))
         .route("/version", get(handlers::version))
         .route("/", get(|| async { "L337 Audio Server" }))
         .route("/player/play", post(handlers::play))
@@ -272,12 +284,17 @@ async fn main() {
         .route("/player/seek", post(handlers::seek))
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
+        .route("/auth/challenge", post(handlers::auth_challenge))
+        .route("/auth/redeem", post(handlers::auth_redeem))
         .with_state(shared_state)
-        .layer(Extension(shared_token.clone()));
+        .layer(Extension(challenge_state.clone()))
+        .layer(Extension(auth_layer.clone()))
+        .layer(Extension(socket_mode))
+        .layer(Extension(rate_limiter.clone()));
 
     // Skip auth layer for Unix socket mode (file permissions provide security).
     if !use_socket {
-        app = app.layer(security::AuthLayer::new(token.clone()));
+        app = app.layer(auth_layer);
     }
     app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
         300 * 1024 * 1024,
@@ -337,7 +354,7 @@ async fn main() {
                     .await
                     .expect("invalid TLS cert/key");
                 axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             }
@@ -355,7 +372,7 @@ async fn main() {
                     addr
                 );
                 axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             }
@@ -388,7 +405,7 @@ async fn main() {
                     .await
                     .expect("invalid TLS cert/key");
                 axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             }
@@ -403,21 +420,12 @@ async fn main() {
                     addr
                 );
                 axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             }
         }
     }
-}
-
-fn generate_token() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..32)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect()
 }
 
 /// Create a default `server.ini` in the official config directory
@@ -448,22 +456,20 @@ fn ensure_config_file() {
         return;
     }
 
-    if let Some(config_dir) = dirs::config_dir() {
-        let xdg_path = config_dir.join("l337-audio-server").join("server.ini");
-        if !xdg_path.exists() {
-            let _ = std::fs::create_dir_all(xdg_path.parent().unwrap());
-            let _ = std::fs::write(&xdg_path, DEFAULT_CONFIG);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
-            }
-            tracing::info!(
-                "No server.ini found; created a default at {}",
-                xdg_path.display()
-            );
-            return;
+    let xdg_path = config_dir().join("server.ini");
+    if !xdg_path.exists() {
+        let _ = std::fs::create_dir_all(xdg_path.parent().unwrap());
+        let _ = std::fs::write(&xdg_path, DEFAULT_CONFIG);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
         }
+        tracing::info!(
+            "No server.ini found; created a default at {}",
+            xdg_path.display()
+        );
+        return;
     }
 
     let cwd_path = std::path::Path::new("server.ini");
@@ -518,17 +524,9 @@ fn load_or_create_token() -> String {
             return t;
         }
     }
-    let generated = generate_token();
-    if let Err(e) = std::fs::write(&path, &generated) {
+    let generated = crate::auth_challenge::generate_token();
+    if let Err(e) = crate::secrets_fs::atomic_write_secret(&path, &generated) {
         tracing::warn!("Could not persist token to {}: {}", path.display(), e);
-    } else if let Ok(meta) = std::fs::metadata(&path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = meta.permissions();
-            perms.set_mode(perms.mode() & 0o7777 | 0o600);
-            let _ = std::fs::set_permissions(&path, perms);
-        }
     }
     tracing::warn!(
         "No [server] token configured. Generated + persisted a token at {}; add it to the \

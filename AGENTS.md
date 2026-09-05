@@ -33,6 +33,12 @@ rm -rf /tmp/l337-build /tmp/cargo-home
 
 Never let cargo write into `./target/`. If a `target/` directory already exists in the repo, it should be moved to `/tmp` or removed.
 
+## Local build targets
+
+Only build for **Linux** locally. All other platforms (Windows, macOS, Android, iOS, etc.) are built and packaged exclusively by GitHub Actions runners. Do not attempt cross-compilation or native builds for non-Linux targets on this machine.
+
+For cross-platform syntax and type checking without producing a binary, `cargo check` is acceptable, but it must still use the `/tmp` cargo home as documented above.
+
 ## Development Guidelines
 
 When implementing new features:

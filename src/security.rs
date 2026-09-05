@@ -47,7 +47,7 @@ impl<S> Layer<S> for AuthLayer {
 /// Paths reachable without a token (liveness probe only).
 pub fn is_public(req: &Request<Body>) -> bool {
     let path = req.uri().path();
-    path == "/health" || path == "/setup" || path == "/"
+    path == "/health" || path == "/" || path == "/auth/challenge" || path == "/auth/redeem"
 }
 
 #[derive(Clone)]

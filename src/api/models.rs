@@ -63,3 +63,13 @@ pub struct CacheManifestEntry {
     pub last_accessed: i64, // Unix timestamp
     pub play_count: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthChallengeResponse {
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthRedeemResponse {
+    pub ok: bool,
+}
