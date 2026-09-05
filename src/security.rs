@@ -8,6 +8,17 @@ use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tower::{Layer, Service};
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for i in 0..a.len() {
+        result |= a[i] ^ b[i];
+    }
+    result == 0
+}
+
 /// Middleware layer that requires a shared bearer token on every request
 /// except those matching `is_public`. The token is compared in constant time.
 /// The token is held in `Arc<Mutex<String>>` so it can be rotated at runtime
@@ -93,8 +104,14 @@ where
                 let token_guard = self.token.lock().expect("token mutex poisoned");
                 let expected = format!("Bearer {}", token_guard.as_str());
                 let token_str = token_guard.as_str();
-                value.len() == expected.len() && value == expected
-                    || (token_str.len() == value.len() && *value == *token_str)
+                let expected_bytes = expected.as_bytes();
+                let value_bytes = value.as_bytes();
+                if expected_bytes.len() == value_bytes.len() {
+                    constant_time_eq(expected_bytes, value_bytes)
+                        || constant_time_eq(token_str.as_bytes(), value_bytes)
+                } else {
+                    false
+                }
             }
             None => false,
         };

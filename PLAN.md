@@ -51,7 +51,7 @@
   `track_id` and `stream_url` are **required** (400 if missing/empty). `track_id` = client-generated stable hash (sha1 of canonical stream URL).
 - `state` serializes **lowercase**: `playing | paused | stopped`.
 - `PlayerStatus`: `{state, volume, speed, current_track?, disk_pool_utilization_bytes, next_cached, prev_cached, position_sec?, duration_sec?}`.
-- Auth: every request (except `GET /health`) requires header `Authorization: Bearer <token>` (alias `X-L337-Token`). 401 otherwise.
+- Auth: every request (except `GET /health`, `POST /auth/challenge`, `POST /auth/redeem`) requires header `Authorization: Bearer <token>` (alias `X-L337-Token`). 401 otherwise.
 - All endpoints served over **HTTPS** (auto-generated self-signed cert if none configured).
 
 ### Routes
@@ -59,6 +59,8 @@
 |---|---|---|---|
 | GET | `/health` | — | Unauthenticated liveness probe |
 | GET | `/` | — | Returns `"L337 Audio Server"` |
+| POST | `/auth/challenge` | — | Public; issues challenge token, writes `challenge-token.txt`, returns `202 { expires_in: 600 }` |
+| POST | `/auth/redeem` | — | Public; verifies `X-L337-Challenge` header, promotes to server token, returns `200 { ok: true }` |
 | POST | `/player/play` | `Track` | Download `stream_url` (or `file://`/local path/YouTube) → `current.stream`, play |
 | POST | `/player/play/stream` | raw bytes + `X-Track-Id` (+`X-Title`/`X-Artist`) | Client pushes audio; write to `current.stream` + play |
 | POST | `/player/cache/next` | `Track` | Background download → `next.stream` |
@@ -114,12 +116,14 @@
 
 ### 3.6 Security: TLS + token — **[DONE]**
 - `config.toml [server]`: `host`, `port`, `token` (optional), `tls_cert`, `tls_key` (optional).
-- Missing token → `generate_token()` (32 char alnum) persisted to `server_token.txt`; logged once.
+- Missing token → `generate_token()` (32 char alnum, dashed groups of 4) persisted to `server_token.txt`; logged once.
 - Missing TLS cert → `security::generate_self_signed(host)` auto-generates via `rcgen`; served via
   `axum-server` + `rustls`. Warns in logs.
-- `security::AuthLayer` middleware: Bearer token or `X-L337-Token`; `/health` exempt; 401 otherwise.
+- `security::AuthLayer` middleware: Bearer token or `X-L337-Token`; `/health`, `/auth/challenge`,
+  `/auth/redeem` exempt; 401 otherwise.
 - `reqwest` uses `rustls-tls` feature (pure-Rust TLS).
 - `platform::init()` called at startup (but module is missing — see BLOCKER).
+- `/setup` removed; replaced with challenge/redeem flow.
 
 ### 3.7 Misc — **[DONE]**
 - `unsafe impl Send/Sync for PlayerEngine` retained: `cpal::Stream` contains
@@ -154,9 +158,11 @@
 | 7 | Remove `unsafe impl Send/Sync` after verification | **DONE** (retained on `PlayerEngine` with justification; removed from `SendableEngine`) |
 | 8 | Rate limiting / request body size limits | **DONE** |
 | 9 | Token rotation via `PUT /player/settings` + SIGHUP reload | **DONE** |
-| 10 | Config file permissions `0o600` on auto-generated files | **DONE** |
-| 11 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
-| 12 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
+| 10 | Challenge/redeem auth flow replacing `/setup` | **DONE** |
+| 11 | Config file permissions `0o600` on auto-generated files | **DONE** |
+| 12 | Token comparison hardening (constant-time) | **TODO** |
+| 13 | Client: `APIClient` HTTPS+token → plugin → source classification/push/transcode | **TODO** |
+| 14 | E2E: localhost verified (dummy mode + l337-player `connect_audio_server()` returns reachable/token_ok) → LAN (separate device, TLS+token) → Tailscale | **PARTIAL** |
 
 ---
 
@@ -174,13 +180,33 @@ binary for release builds. Document as a runtime dependency or embed a Python-ba
 - `PUT /player/settings` accepts optional `token` field; updates auth layer in place.
 - SIGHUP triggers config reload and rotates token if `[server] token` changed.
 
-### 7.2 Rate limiting + body size limits — **[DONE]**
-- `tower_http::limit::RequestBodyLimitLayer::new(300 * 1024 * 1024)` caps uploads at 300 MB.
-- Concurrency limiting deferred; can be added with `tower-governor` if needed.
+### 7.2 Challenge/redeem auth flow — **[DONE]**
+- Removed unauthenticated `/setup` endpoint.
+- Added `POST /auth/challenge` (public) and `POST /auth/redeem` (challenge validation).
+- Challenge token: 32 alnum chars, dashed groups of 4 (`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`).
+- Token written to `challenge-token.txt` with `0o600` permissions; expires after 10 minutes (file mtime).
+- Redeem validates challenge, atomically promotes it to `server_token.txt`, calls `AuthLayer::update_token()`,
+  and deletes `challenge-token.txt` (single-use enforcement).
+- Constant-time comparison used for challenge validation.
+- Per-IP rate limiting on auth endpoints: custom in-process limiter (5 requests / 60s per IP),
+  returning `429 Too Many Requests`. `tower-governor` was evaluated but deferred because the
+  `0.8` release depends on `axum 0.8`, conflicting with this repo's `axum 0.7.9`.
 
 ### 7.3 Config file permissions — **[DONE]**
 - `ensure_config_file()` sets `0o600` on auto-generated `config.toml`.
-- `load_or_create_token()` sets `0o600` on `server_token.txt`.
+- `load_or_create_token()` uses `atomic_write_secret()` for `server_token.txt` with `0o600`.
+- `atomic_write_secret()` helper added in `src/secrets_fs.rs` (tmp-file + rename + chmod).
+
+### 7.4 Rate limiting + body size limits — **[DONE]**
+- `tower_http::limit::RequestBodyLimitLayer::new(300 * 1024 * 1024)` caps uploads at 300 MB.
+- Auth endpoints protected by custom `RateLimiter` (`src/rate_limit.rs`).
+- Concurrency limiting deferred; can be added with `tower-governor` once axum 0.8 compatibility
+  is resolved.
+
+### 7.5 Token comparison hardening — **[TODO]**
+- `src/security.rs` currently uses `String::eq` for bearer-token comparison, which is not
+  constant-time. Replace with a constant-time comparator (e.g. `subtle` crate or manual
+  bytewise XOR accumulator) to mitigate timing side-channels on the auth path.
 
 ---
 
@@ -197,6 +223,8 @@ binary for release builds. Document as a runtime dependency or embed a Python-ba
 - Cache root honors `CACHE_DIRECTORY` then `STATE_DIRECTORY` (systemd), falls back to
   `~/.cache/l337/l337-audio-server/cache/`.
 - Auth token persisted to `STATE_DIRECTORY` or cache dir as `server_token.txt`.
+- Challenge token written to XDG config dir (`~/.config/l337-audio-server/challenge-token.txt`),
+  honoring `XDG_CONFIG_HOME` if set.
 - Default cap is **256 MiB**.
 
 ### 8.3 systemd — **[PARTIAL]**
