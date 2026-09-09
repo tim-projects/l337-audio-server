@@ -269,6 +269,7 @@ async fn main() {
         .route("/player/play", post(handlers::play))
         .route("/player/play/stream", post(handlers::upload_stream))
         .route("/player/pause", post(handlers::pause))
+        .route("/player/stop", post(handlers::stop))
         .route("/player/next", post(handlers::next))
         .route("/player/previous", post(handlers::previous))
         .route("/player/cache/next", post(handlers::cache_next))

@@ -181,6 +181,12 @@ pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
     StatusCode::OK.into_response()
 }
 
+pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
+    let mut engine = state.0.lock().await;
+    engine.stop();
+    StatusCode::OK.into_response()
+}
+
 pub async fn next(State(state): State<AppState>) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.trigger_next().await;
