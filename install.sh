@@ -5,7 +5,8 @@
 # with systemd (Linux) or launchd (macOS).
 #
 # Usage:
-#   ./install.sh                          # install or update
+#   ./install.sh                          # install or update latest stable release
+#   ./install.sh --pre-release            # install or update latest prerelease
 #   ./install.sh --uninstall              # remove installation
 #   ./install.sh --uninstall --remove-data # remove installation and data
 #   ./install.sh --dry-run                # show what would happen
@@ -31,6 +32,7 @@ GROUP_NAME="l337"
 DRY_RUN=false
 UNINSTALL=false
 REMOVE_DATA=false
+INSTALL_PRERELEASE=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,6 +46,8 @@ Downloads prebuilt binaries from GitHub releases and sets up the system service.
 
 Options:
   --dry-run              Show what would happen without making changes
+  --pre-release, --prerelease
+                         Install the latest prerelease instead of stable release
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   -h, --help             Show this help message
@@ -66,6 +70,7 @@ fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
+        --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help) usage ;;
@@ -139,15 +144,81 @@ date_to_epoch() {
 # ---------------------------------------------------------------------------
 # GitHub release helpers
 # ---------------------------------------------------------------------------
+extract_prerelease() {
+    awk '
+        /^  \{/ {
+            release=$0 "\n"
+            in_release=1
+            next
+        }
+        in_release {
+            release=release $0 "\n"
+            if ($0 ~ /^  \},?$/) {
+                if (release ~ /"prerelease"[[:space:]]*:[[:space:]]*true/) {
+                    printf "%s", release
+                    exit
+                }
+                release=""
+                in_release=0
+            }
+        }
+    '
+}
+
 get_latest_release_json() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null || \
-        fail "Failed to query GitHub releases. Check network connectivity."
+    local endpoint
+    local url
+    local response_file
+    local http_code
+    local message
+    local release
+
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        endpoint="releases?per_page=100"
+    else
+        endpoint="releases/latest"
+    fi
+
+    url="https://api.github.com/repos/${REPO}/${endpoint}"
+    response_file=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
+        fail "Could not create a temporary file for GitHub release data."
+
+    if ! http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
+        -o "$response_file" -w '%{http_code}' "$url"); then
+        rm -f "$response_file"
+        fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        message=$(parse_json_field "$(cat "$response_file")" "message" 2>/dev/null || true)
+        rm -f "$response_file"
+        if [ "$INSTALL_PRERELEASE" = true ]; then
+            fail "GitHub returned HTTP $http_code while querying prereleases. ${message:-}"
+        fi
+        fail "GitHub returned HTTP $http_code while querying stable releases. ${message:-} Re-run with --pre-release to install a prerelease."
+    fi
+
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        release=$(extract_prerelease < "$response_file")
+    else
+        release=$(cat "$response_file")
+    fi
+    rm -f "$response_file"
+
+    if [ -z "$release" ]; then
+        if [ "$INSTALL_PRERELEASE" = true ]; then
+            fail "No prerelease found for ${REPO}."
+        fi
+        fail "No stable release found for ${REPO}."
+    fi
+
+    printf '%s\n' "$release"
 }
 
 parse_json_field() {
     local json="$1"
     local field="$2"
-    echo "$json" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+    echo "$json" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true
 }
 
 get_asset_name() {
@@ -507,7 +578,11 @@ fi
 
 if [ "$DRY_RUN" = true ]; then
     info "Dry-run mode — would perform the following actions:"
-    info "  Query GitHub for latest release"
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        info "  Query GitHub for latest prerelease"
+    else
+        info "  Query GitHub for latest stable release"
+    fi
     info "  Download the latest binary for $OS_TYPE/$ARCH_TYPE"
     info "  Install to: $INSTALL_DIR/l337-audio-server"
     case "$OS_TYPE" in
