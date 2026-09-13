@@ -912,7 +912,7 @@ pub async fn download_stream(
     }
 
     let response = reqwest::Client::builder()
-        .user_agent(concat!("l337-audio-server/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?
         .get(url)
@@ -1092,7 +1092,7 @@ async fn stream_http_to_file(
     use futures_util::StreamExt;
 
     let response = reqwest::Client::builder()
-        .user_agent(concat!("l337-audio-server/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?
         .get(url)

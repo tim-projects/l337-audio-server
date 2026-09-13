@@ -21,7 +21,7 @@ pub type AppState = Arc<SendableEngine>;
 
 pub async fn version() -> impl IntoResponse {
     Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("L337_VERSION")
     }))
 }
 

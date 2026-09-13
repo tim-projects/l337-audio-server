@@ -138,7 +138,7 @@ fn load_settings() -> Result<Settings, config::ConfigError> {
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-v") {
-        println!("l337-audio-server {}", env!("CARGO_PKG_VERSION"));
+        println!("l337-audio-server {}", env!("L337_VERSION"));
         return;
     }
 
