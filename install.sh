@@ -335,10 +335,14 @@ setup_systemd() {
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
     chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
 
+    chown "$USER_NAME:$GROUP_NAME" "$CONFIG_DIR" || \
+        fail "Failed to set ownership on $CONFIG_DIR."
+    chmod 0755 "$CONFIG_DIR"
+
     local config_file="$CONFIG_DIR/server.ini"
     local legacy_config_file="$CONFIG_DIR/config.toml"
+    info "Ensuring configuration at $config_file..."
     if [ ! -f "$config_file" ]; then
-        info "Creating default configuration..."
         local token
         token=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 || true)
         if [ "${#token}" -ne 32 ]; then
@@ -348,9 +352,6 @@ setup_systemd() {
             info "Migrating legacy configuration: $legacy_config_file"
             cp "$legacy_config_file" "$config_file" || \
                 fail "Failed to migrate legacy configuration to $config_file."
-            chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
-                fail "Failed to set ownership on $config_file."
-            chmod 0640 "$config_file"
         else
             cat > "$config_file" <<EOF
 [server]
@@ -360,10 +361,6 @@ token = "${token}"
 dummy = false
 transport = "auto"
 EOF
-            chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
-                fail "Failed to set ownership on $config_file."
-            chmod 0640 "$config_file"
-            ok "Configuration written to $config_file"
             echo
             echo "========================================="
             echo " Server Token"
@@ -376,6 +373,11 @@ EOF
             echo
         fi
     fi
+
+    chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
+        fail "Failed to set ownership on $config_file."
+    chmod 0640 "$config_file"
+    ok "Configuration ready at $config_file"
 
     info "Writing systemd unit: $SYSTEMD_SERVICE"
     cat > "$SYSTEMD_SERVICE" <<EOF
