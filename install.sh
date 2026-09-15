@@ -35,6 +35,7 @@ UNINSTALL=false
 REMOVE_DATA=false
 INSTALL_PRERELEASE=false
 FORCE=false
+USER_INSTALL=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,12 +52,14 @@ Options:
   --pre-release, --prerelease
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
+  --user                 Install as a systemd user service (requires PipeWire)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   -h, --help             Show this help message
 
 Platforms:
   Linux (systemd)        Installs to /opt/l337-audio-server
+  Linux (systemd --user) Installs to /opt/l337-audio-server, config in ~/.config/
   macOS (launchd)        Installs to /opt/l337-audio-server
 EOF
     exit 0
@@ -92,6 +95,21 @@ check_dependencies() {
     esac
 }
 
+check_dependencies_user() {
+    case "$OS_TYPE" in
+        linux)
+            check_command "curl"
+            check_command "systemctl"
+            check_command "file"
+            ;;
+        macos)
+            check_command "curl"
+            check_command "launchctl"
+            check_command "file"
+            ;;
+    esac
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         fail "System installation requires root privileges. Run with: sudo $0 [OPTIONS]"
@@ -106,6 +124,7 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=true; shift ;;
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f) FORCE=true; shift ;;
+        --user) USER_INSTALL=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help) usage ;;
@@ -240,6 +259,12 @@ get_asset_name() {
         linux-x86_64)
             if [ "$service_context" = "system" ]; then
                 echo "l337-audio-server-x86_64-linux-alsa"
+            elif [ "$service_context" = "user" ]; then
+                if _check_pipewire; then
+                    echo "l337-audio-server-x86_64-linux-pipewire"
+                else
+                    fail "PipeWire is required for user-level installation. Start PipeWire or use a system-wide installation."
+                fi
             elif _check_pipewire; then
                 echo "l337-audio-server-x86_64-linux-pipewire"
             else
@@ -447,6 +472,118 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Linux: systemd user service setup (PipeWire)
+# ---------------------------------------------------------------------------
+setup_systemd_user() {
+    local bin_path="$1"
+    local real_user="${SUDO_USER:-${USER}}"
+
+    info "Configuring systemd user service..."
+
+    local real_home
+    real_home=$(eval echo "~${real_user}")
+    local user_config_dir="$real_home/.config/l337-audio-server"
+    local user_cache_dir="$real_home/.cache/l337-audio-server"
+    local user_state_dir="$real_home/.local/state/l337-audio-server"
+    local user_runtime_dir="$real_home/.local/run/l337-audio-server"
+    local user_service_dir="$real_home/.config/systemd/user"
+    local user_service_file="$user_service_dir/l337-audio-server.service"
+
+    mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_runtime_dir" "$user_service_dir"
+
+    info "Installing binary to $INSTALL_DIR..."
+    cp "$bin_path" "$INSTALL_DIR/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/l337-audio-server"
+
+    local config_file="$user_config_dir/server.ini"
+    local legacy_config_file="$user_config_dir/config.toml"
+    info "Ensuring configuration at $config_file..."
+    if [ ! -f "$config_file" ]; then
+        local token
+        token=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 || true)
+        if [ "${#token}" -ne 32 ]; then
+            fail "Failed to generate a secure server token."
+        fi
+        if [ -f "$legacy_config_file" ]; then
+            info "Migrating legacy configuration: $legacy_config_file"
+            cp "$legacy_config_file" "$config_file" || \
+                fail "Failed to migrate legacy configuration to $config_file."
+        else
+            cat > "$config_file" <<EOF
+[server]
+host = "127.0.0.1"
+port = 1337
+token = "${token}"
+dummy = false
+transport = "auto"
+EOF
+            echo
+            echo "========================================="
+            echo " Server Token"
+            echo "========================================="
+            echo
+            echo "  ${token}"
+            echo
+            echo "Add this token to your client configuration."
+            echo "========================================="
+            echo
+        fi
+    fi
+
+    chown "$real_user" "$config_file" 2>/dev/null || true
+    chmod 0600 "$config_file"
+    ok "Configuration ready at $config_file"
+
+    info "Writing systemd user unit: $user_service_file"
+    cat > "$user_service_file" <<EOF
+[Unit]
+Description=L337 Audio Server (user service, PipeWire)
+Documentation=https://github.com/${REPO}
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${real_user}
+Group=${real_user}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/l337-audio-server
+Restart=on-failure
+RestartSec=2
+
+Environment=HOME=${real_home}
+Environment=XDG_CONFIG_HOME=${real_home}/.config
+Environment=XDG_CACHE_HOME=${real_home}/.cache
+Environment=XDG_STATE_HOME=${real_home}/.local/state
+Environment=XDG_RUNTIME_DIR=${real_home}/.local/run/l337-audio-server
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=false
+ProtectKernelTunables=false
+RestrictNamespaces=false
+RestrictRealtime=false
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=default.target
+EOF
+
+    chown "$real_user" "$user_service_file" 2>/dev/null || true
+    chmod 0644 "$user_service_file"
+
+    info "Enabling and starting user service..."
+    su - "$real_user" -c "systemctl --user daemon-reload" || true
+    su - "$real_user" -c "systemctl --user enable l337-audio-server.service" || true
+    su - "$real_user" -c "systemctl --user start l337-audio-server.service" || true
+
+    ok "Systemd user service installed and started"
+}
+
+# ---------------------------------------------------------------------------
 # macOS: launchd setup
 # ---------------------------------------------------------------------------
 setup_launchd() {
@@ -608,6 +745,42 @@ uninstall_macos() {
     ok "Uninstallation complete"
 }
 
+uninstall_user_service() {
+    info "Uninstalling systemd user service..."
+
+    local real_user="${SUDO_USER:-${USER}}"
+    local real_home
+    real_home=$(eval echo "~${real_user}")
+    local user_service_dir="$real_home/.config/systemd/user"
+    local user_service_file="$user_service_dir/l337-audio-server.service"
+
+    su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
+    su - "$real_user" -c "systemctl --user disable l337-audio-server.service" 2>/dev/null || true
+
+    rm -f "$user_service_file"
+    su - "$real_user" -c "systemctl --user daemon-reload" 2>/dev/null || true
+
+    rm -rf "$INSTALL_DIR"
+
+    if [ "$REMOVE_DATA" = true ]; then
+        info "Removing user data directories..."
+        rm -rf "$real_home/.config/l337-audio-server" \
+              "$real_home/.cache/l337-audio-server" \
+              "$real_home/.local/state/l337-audio-server" \
+              "$real_home/.local/run/l337-audio-server"
+        ok "User data directories removed"
+    else
+        warn "User data directories retained:"
+        warn "  $real_home/.config/l337-audio-server"
+        warn "  $real_home/.cache/l337-audio-server"
+        warn "  $real_home/.local/state/l337-audio-server"
+        warn "  $real_home/.local/run/l337-audio-server"
+        warn "Re-run with --remove-data to delete them."
+    fi
+
+    ok "User service uninstallation complete"
+}
+
 # ---------------------------------------------------------------------------
 # Version helpers
 # ---------------------------------------------------------------------------
@@ -668,39 +841,52 @@ if [ "$DRY_RUN" = true ]; then
     if [ "$UNINSTALL" = false ]; then
         info "  Download the latest binary for $OS_TYPE/$ARCH_TYPE"
         info "  Install to: $INSTALL_DIR/l337-audio-server"
+        if [ "$USER_INSTALL" = true ]; then
+            info "  Install systemd user service"
+            info "  Config: ~/.config/l337-audio-server/server.ini"
+        else
+            case "$OS_TYPE" in
+                linux)
+                    info "  Configure systemd service: $SYSTEMD_SERVICE"
+                    info "  Create user/group: $USER_NAME/$GROUP_NAME"
+                    info "  Add $USER_NAME to audio group"
+                    info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
+                    ;;
+                macos)
+                    info "  Configure launchd plist"
+                    info "  Create directories: $INSTALL_DIR"
+                    ;;
+            esac
+        fi
+    fi
+    exit 0
+fi
+
+if [ "$UNINSTALL" = true ]; then
+    if [ "$USER_INSTALL" = true ]; then
+        uninstall_user_service
+    else
+        require_root
         case "$OS_TYPE" in
             linux)
-                info "  Configure systemd service: $SYSTEMD_SERVICE"
-                info "  Create user/group: $USER_NAME/$GROUP_NAME"
-                info "  Add $USER_NAME to audio group"
-                info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
+                check_command "systemctl"
+                uninstall_linux
                 ;;
             macos)
-                info "  Configure launchd plist"
-                info "  Create directories: $INSTALL_DIR"
+                check_command "launchctl"
+                uninstall_macos
                 ;;
         esac
     fi
     exit 0
 fi
 
-if [ "$UNINSTALL" = true ]; then
+if [ "$USER_INSTALL" = true ]; then
+    check_dependencies_user
+else
     require_root
-    case "$OS_TYPE" in
-        linux)
-            check_command "systemctl"
-            uninstall_linux
-            ;;
-        macos)
-            check_command "launchctl"
-            uninstall_macos
-            ;;
-    esac
-    exit 0
+    check_dependencies
 fi
-
-require_root
-check_dependencies
 
 info "Checking for latest release..."
 RELEASE_JSON=$(get_latest_release_json)
@@ -714,7 +900,11 @@ fi
 info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
 
 if [ "$OS_TYPE" = "linux" ]; then
-    ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "system")
+    if [ "$USER_INSTALL" = true ]; then
+        ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "user")
+    else
+        ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "system")
+    fi
 else
     ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "")
 fi
@@ -763,6 +953,8 @@ download_binary "$DOWNLOAD_URL" "$TMP_BIN"
 
 if [ "$OS_TYPE" = "linux" ]; then
     setup_systemd "$TMP_BIN"
+elif [ "$USER_INSTALL" = true ]; then
+    setup_systemd_user "$TMP_BIN"
 elif [ "$OS_TYPE" = "macos" ]; then
     setup_launchd "$TMP_BIN"
 fi
@@ -770,7 +962,12 @@ fi
 rm -f "$TMP_BIN"
 ok "Installation complete"
 echo
-if [ "$OS_TYPE" = "linux" ]; then
+if [ "$USER_INSTALL" = true ]; then
+    echo "Next steps:"
+    echo "  Check status:    systemctl --user status l337-audio-server.service"
+    echo "  View logs:       journalctl --user -u l337-audio-server -f"
+    echo "  Configuration:   ~/.config/l337-audio-server/server.ini"
+elif [ "$OS_TYPE" = "linux" ]; then
     echo "Next steps:"
     echo "  Check status:    systemctl status l337-audio-server.service"
     echo "  View logs:       journalctl -u l337-audio-server.service -f"
