@@ -910,6 +910,18 @@ else
 fi
 info "Selected asset: $ASSET_NAME"
 
+# Inform the user if PipeWire is available but they're doing a system-wide
+# install. The user service (--user) is the preferred way to run with PipeWire.
+if [ "$OS_TYPE" = "linux" ] && [ "$USER_INSTALL" = false ] && _check_pipewire; then
+    warn "PipeWire is available on this system."
+    echo
+    echo "  For PipeWire audio, consider using a user-level service instead:"
+    echo "    $0 --user $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$FORCE" = true ] && echo '--force ')-u"
+    echo
+    echo "  Continuing with ALSA system-wide installation..."
+    echo
+fi
+
 # Check if already installed and up-to-date
 INSTALLED_VERSION=""
 if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
