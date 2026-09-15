@@ -12,6 +12,7 @@
 #   ./install.sh --dry-run                # show what would happen
 #   ./install.sh --help
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -64,6 +65,37 @@ ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 
+check_command() {
+    if command -v "$1" &>/dev/null; then
+        return 0
+    else
+        fail "Required command not found: $1"
+    fi
+}
+
+check_dependencies() {
+    case "$OS_TYPE" in
+        linux)
+            check_command "curl"
+            check_command "systemctl"
+            check_command "file"
+            check_command "groupadd"
+            check_command "useradd"
+            ;;
+        macos)
+            check_command "curl"
+            check_command "launchctl"
+            check_command "file"
+            ;;
+    esac
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        fail "System installation requires root privileges. Run with: sudo $0 [OPTIONS]"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -97,30 +129,6 @@ case "$ARCH" in
 esac
 
 info "Platform: $OS_TYPE / $ARCH_TYPE"
-
-# ---------------------------------------------------------------------------
-# Dependency checks
-# ---------------------------------------------------------------------------
-check_command() {
-    if command -v "$1" &>/dev/null; then
-        return 0
-    else
-        fail "Required command not found: $1"
-    fi
-}
-
-case "$OS_TYPE" in
-    linux)
-        check_command "curl"
-        check_command "systemctl"
-        check_command "file"
-        ;;
-    macos)
-        check_command "curl"
-        check_command "launchctl"
-        check_command "file"
-        ;;
-esac
 
 # ---------------------------------------------------------------------------
 # Cross-platform helpers
@@ -287,10 +295,16 @@ setup_systemd() {
 
     info "Configuring systemd service..."
 
+    if ! id -g "$GROUP_NAME" &>/dev/null; then
+        info "Creating system group: $GROUP_NAME"
+        groupadd --system "$GROUP_NAME" || \
+            fail "Failed to create system group $GROUP_NAME. Run the installer with sudo and ensure groupadd is available."
+    fi
+
     if ! id "$USER_NAME" &>/dev/null; then
         info "Creating system user: $USER_NAME"
-        groupadd --system "$GROUP_NAME" 2>/dev/null || true
-        useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$GROUP_NAME" "$USER_NAME" 2>/dev/null || true
+        useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$GROUP_NAME" "$USER_NAME" || \
+            fail "Failed to create system user $USER_NAME. Run the installer with sudo and ensure useradd is available."
     fi
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
@@ -300,11 +314,24 @@ setup_systemd() {
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
     chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
 
-    if [ ! -f "$CONFIG_DIR/config.toml" ]; then
+    local config_file="$CONFIG_DIR/server.ini"
+    local legacy_config_file="$CONFIG_DIR/config.toml"
+    if [ ! -f "$config_file" ]; then
         info "Creating default configuration..."
         local token
-        token=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
-        cat > "$CONFIG_DIR/config.toml" <<EOF
+        token=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 || true)
+        if [ "${#token}" -ne 32 ]; then
+            fail "Failed to generate a secure server token."
+        fi
+        if [ -f "$legacy_config_file" ]; then
+            info "Migrating legacy configuration: $legacy_config_file"
+            cp "$legacy_config_file" "$config_file" || \
+                fail "Failed to migrate legacy configuration to $config_file."
+            chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
+                fail "Failed to set ownership on $config_file."
+            chmod 0640 "$config_file"
+        else
+            cat > "$config_file" <<EOF
 [server]
 host = "0.0.0.0"
 port = 1337
@@ -312,19 +339,21 @@ token = "${token}"
 dummy = false
 transport = "auto"
 EOF
-        chown "$USER_NAME:$GROUP_NAME" "$CONFIG_DIR/config.toml"
-        chmod 0640 "$CONFIG_DIR/config.toml"
-        ok "Configuration written to $CONFIG_DIR/config.toml"
-        echo
-        echo "========================================="
-        echo " Server Token"
-        echo "========================================="
-        echo
-        echo "  ${token}"
-        echo
-        echo "Add this token to your client configuration."
-        echo "========================================="
-        echo
+            chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
+                fail "Failed to set ownership on $config_file."
+            chmod 0640 "$config_file"
+            ok "Configuration written to $config_file"
+            echo
+            echo "========================================="
+            echo " Server Token"
+            echo "========================================="
+            echo
+            echo "  ${token}"
+            echo
+            echo "Add this token to your client configuration."
+            echo "========================================="
+            echo
+        fi
     fi
 
     info "Writing systemd unit: $SYSTEMD_SERVICE"
@@ -397,15 +426,30 @@ setup_launchd() {
     cp "$bin_path" "$INSTALL_DIR/l337-audio-server"
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
+    local real_home
+    real_home=$(eval echo "~${real_user}")
     local config_dir
-    config_dir=$(eval echo "~${real_user}/.config/l337-audio-server")
+    config_dir="$real_home/Library/Application Support/l337-audio-server"
     mkdir -p "$config_dir"
 
-    if [ ! -f "$config_dir/config.toml" ]; then
+    local config_file="$config_dir/server.ini"
+    local legacy_config_file="$config_dir/config.toml"
+    if [ ! -f "$legacy_config_file" ] && [ -f "$real_home/.config/l337-audio-server/config.toml" ]; then
+        legacy_config_file="$real_home/.config/l337-audio-server/config.toml"
+    fi
+    if [ ! -f "$config_file" ]; then
         info "Creating default configuration..."
         local token
-        token=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
-        cat > "$config_dir/config.toml" <<EOF
+        token=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 || true)
+        if [ "${#token}" -ne 32 ]; then
+            fail "Failed to generate a secure server token."
+        fi
+        if [ -f "$legacy_config_file" ]; then
+            info "Migrating legacy configuration: $legacy_config_file"
+            cp "$legacy_config_file" "$config_file" || \
+                fail "Failed to migrate legacy configuration to $config_file."
+        else
+            cat > "$config_file" <<EOF
 [server]
 host = "0.0.0.0"
 port = 1337
@@ -413,17 +457,21 @@ token = "${token}"
 dummy = false
 transport = "auto"
 EOF
-        ok "Configuration written to $config_dir/config.toml"
-        echo
-        echo "========================================="
-        echo " Server Token"
-        echo "========================================="
-        echo
-        echo "  ${token}"
-        echo
-        echo "Add this token to your client configuration."
-        echo "========================================="
-        echo
+            ok "Configuration written to $config_file"
+            echo
+            echo "========================================="
+            echo " Server Token"
+            echo "========================================="
+            echo
+            echo "  ${token}"
+            echo
+            echo "Add this token to your client configuration."
+            echo "========================================="
+            echo
+        fi
+        chown "$real_user" "$config_file" || \
+            fail "Failed to set ownership on $config_file."
+        chmod 0600 "$config_file"
     fi
 
     local plist_dir
@@ -568,36 +616,55 @@ version_eq() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if [ "$UNINSTALL" = true ]; then
-    case "$OS_TYPE" in
-        linux)  uninstall_linux ;;
-        macos)  uninstall_macos ;;
-    esac
-    exit 0
-fi
-
 if [ "$DRY_RUN" = true ]; then
     info "Dry-run mode — would perform the following actions:"
-    if [ "$INSTALL_PRERELEASE" = true ]; then
+    if [ "$UNINSTALL" = true ]; then
+        info "  Remove the service and installed files"
+        if [ "$REMOVE_DATA" = true ]; then
+            info "  Remove configuration and data directories"
+        else
+            info "  Retain configuration and data directories"
+        fi
+    elif [ "$INSTALL_PRERELEASE" = true ]; then
         info "  Query GitHub for latest prerelease"
     else
         info "  Query GitHub for latest stable release"
     fi
-    info "  Download the latest binary for $OS_TYPE/$ARCH_TYPE"
-    info "  Install to: $INSTALL_DIR/l337-audio-server"
+    if [ "$UNINSTALL" = false ]; then
+        info "  Download the latest binary for $OS_TYPE/$ARCH_TYPE"
+        info "  Install to: $INSTALL_DIR/l337-audio-server"
+        case "$OS_TYPE" in
+            linux)
+                info "  Configure systemd service: $SYSTEMD_SERVICE"
+                info "  Create user/group: $USER_NAME/$GROUP_NAME"
+                info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
+                ;;
+            macos)
+                info "  Configure launchd plist"
+                info "  Create directories: $INSTALL_DIR"
+                ;;
+        esac
+    fi
+    exit 0
+fi
+
+if [ "$UNINSTALL" = true ]; then
+    require_root
     case "$OS_TYPE" in
         linux)
-            info "  Configure systemd service: $SYSTEMD_SERVICE"
-            info "  Create user/group: $USER_NAME/$GROUP_NAME"
-            info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
+            check_command "systemctl"
+            uninstall_linux
             ;;
         macos)
-            info "  Configure launchd plist"
-            info "  Create directories: $INSTALL_DIR"
+            check_command "launchctl"
+            uninstall_macos
             ;;
     esac
     exit 0
 fi
+
+require_root
+check_dependencies
 
 info "Checking for latest release..."
 RELEASE_JSON=$(get_latest_release_json)
@@ -653,10 +720,10 @@ if [ "$OS_TYPE" = "linux" ]; then
     echo "Next steps:"
     echo "  Check status:    systemctl status l337-audio-server.service"
     echo "  View logs:       journalctl -u l337-audio-server.service -f"
-    echo "  Configuration:   $CONFIG_DIR/config.toml"
+    echo "  Configuration:   $CONFIG_DIR/server.ini"
 elif [ "$OS_TYPE" = "macos" ]; then
     echo "Next steps:"
     echo "  Check status:    launchctl list | grep $PLIST_LABEL"
     echo "  View logs:       tail -f ~/Library/Logs/$PLIST_LABEL.log"
-    echo "  Configuration:   ~/.config/l337-audio-server/config.toml"
+    echo "  Configuration:   ~/Library/Application Support/l337-audio-server/server.ini"
 fi
