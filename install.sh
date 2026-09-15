@@ -52,7 +52,7 @@ Options:
   --pre-release, --prerelease
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
-  --user                 Install as a systemd user service (requires PipeWire)
+  --user                 Force user-level systemd service (requires PipeWire)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   -h, --help             Show this help message
@@ -61,6 +61,14 @@ Platforms:
   Linux (systemd)        Installs to /opt/l337-audio-server
   Linux (systemd --user) Installs to /opt/l337-audio-server, config in ~/.config/
   macOS (launchd)        Installs to /opt/l337-audio-server
+
+Notes:
+  - On Linux, the installer auto-detects PipeWire and installs accordingly:
+      user PipeWire   → systemd user service (PipeWire)
+      system PipeWire → system-wide service (PipeWire)
+      no PipeWire     → system-wide service (ALSA)
+  - Use --user to force a user-level service even when system PipeWire is present.
+  - All Linux installs require sudo because /opt/l337-audio-server is system-owned.
 EOF
     exit 0
 }
@@ -257,18 +265,18 @@ get_asset_name() {
     local service_context="${3:-}"
     case "$os-$arch" in
         linux-x86_64)
-            if [ "$service_context" = "system" ]; then
-                echo "l337-audio-server-x86_64-linux-alsa"
-            elif [ "$service_context" = "user" ]; then
+            if [ "$service_context" = "user" ]; then
                 if _check_pipewire; then
                     echo "l337-audio-server-x86_64-linux-pipewire"
                 else
                     fail "PipeWire is required for user-level installation. Start PipeWire or use a system-wide installation."
                 fi
-            elif _check_pipewire; then
-                echo "l337-audio-server-x86_64-linux-pipewire"
             else
-                echo "l337-audio-server-x86_64-linux-alsa"
+                if _check_pipewire; then
+                    echo "l337-audio-server-x86_64-linux-pipewire"
+                else
+                    echo "l337-audio-server-x86_64-linux-alsa"
+                fi
             fi
             ;;
         linux-aarch64)
@@ -287,25 +295,56 @@ get_asset_name() {
     esac
 }
 
+# Detect whether PipeWire is running and how it is installed.
+# Returns one of: user, system, none
+detect_pipewire_mode() {
+    local check_user="${SUDO_USER:-${USER}}"
+    local user_uid
+    user_uid=$(id -u "$check_user" 2>/dev/null || echo "")
+
+    # 1. Check for per-user PipeWire socket/runtime dir
+    if [ -n "$user_uid" ] && [ -d "/run/user/$user_uid" ]; then
+        if [ -S "/run/user/$user_uid/pipewire-0" ] || [ -S "/run/user/$user_uid/pulse/native" ]; then
+            echo "user"
+            return
+        fi
+    fi
+
+    # 2. Check for system-wide PipeWire socket/runtime dir
+    if [ -S "/run/pipewire/0" ] || [ -d "/run/pipewire" ]; then
+        echo "system"
+        return
+    fi
+
+    # 3. Check via systemctl (as the relevant user)
+    if [ "$check_user" != "root" ] && [ -n "$check_user" ]; then
+        if su - "$check_user" -c "systemctl --user is-active --quiet pipewire 2>/dev/null" 2>/dev/null; then
+            echo "user"
+            return
+        fi
+    fi
+
+    if systemctl is-active --quiet pipewire 2>/dev/null; then
+        echo "system"
+        return
+    fi
+
+    # 4. Fallback: pactl/pw-info checks as the desktop user
+    if [ "$check_user" != "root" ] && [ -n "$check_user" ]; then
+        if su - "$check_user" -c 'command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1' 2>/dev/null; then
+            echo "user"
+            return
+        fi
+    fi
+
+    echo "none"
+}
+
 # PipeWire/PulseAudio availability must be checked as the desktop user, not
 # root, because the audio sockets live in the user's runtime dir. When the
 # installer is invoked via sudo, SUDO_USER points to the real user.
 _check_pipewire() {
-    local check_user="${SUDO_USER:-${USER}}"
-    if [ "$check_user" != "root" ] && [ -n "$check_user" ]; then
-        local user_rt="/run/user/$(id -u "$check_user")"
-        if [ -d "$user_rt" ]; then
-            if [ -S "$user_rt/pipewire-0" ] || [ -S "$user_rt/pulse/native" ]; then
-                return 0
-            fi
-        fi
-        if command -v sudo >/dev/null 2>&1; then
-            sudo -u "$check_user" -- bash -c '
-                command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1
-            ' 2>/dev/null && return 0
-        fi
-    fi
-    command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1
+    [ "$(detect_pipewire_mode)" != "none" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -899,6 +938,23 @@ fi
 
 info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
 
+# Auto-detect PipeWire installation mode when the user did not explicitly
+# request --user. We match the server's service model to the existing
+# PipeWire model: user PipeWire → user service, system PipeWire → system
+# service, no PipeWire → system service with ALSA.
+if [ "$OS_TYPE" = "linux" ] && [ "$USER_INSTALL" = false ]; then
+    PW_MODE=$(detect_pipewire_mode)
+    info "Detected PipeWire mode: $PW_MODE"
+    if [ "$PW_MODE" = "user" ]; then
+        USER_INSTALL=true
+        info "User-level PipeWire detected; installing as systemd user service."
+    elif [ "$PW_MODE" = "system" ]; then
+        info "System-level PipeWire detected; installing system-wide."
+    else
+        info "No PipeWire detected; installing system-wide with ALSA."
+    fi
+fi
+
 if [ "$OS_TYPE" = "linux" ]; then
     if [ "$USER_INSTALL" = true ]; then
         ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "user")
@@ -909,18 +965,6 @@ else
     ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "")
 fi
 info "Selected asset: $ASSET_NAME"
-
-# Inform the user if PipeWire is available but they're doing a system-wide
-# install. The user service (--user) is the preferred way to run with PipeWire.
-if [ "$OS_TYPE" = "linux" ] && [ "$USER_INSTALL" = false ] && _check_pipewire; then
-    warn "PipeWire is available on this system."
-    echo
-    echo "  For PipeWire audio, consider using a user-level service instead:"
-    echo "    $0 --user $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$FORCE" = true ] && echo '--force ')-u"
-    echo
-    echo "  Continuing with ALSA system-wide installation..."
-    echo
-fi
 
 # Check if already installed and up-to-date
 INSTALLED_VERSION=""
@@ -963,10 +1007,10 @@ TMP_BIN="/tmp/${ASSET_NAME}.tmp"
 
 download_binary "$DOWNLOAD_URL" "$TMP_BIN"
 
-if [ "$OS_TYPE" = "linux" ]; then
-    setup_systemd "$TMP_BIN"
-elif [ "$USER_INSTALL" = true ]; then
+if [ "$USER_INSTALL" = true ]; then
     setup_systemd_user "$TMP_BIN"
+elif [ "$OS_TYPE" = "linux" ]; then
+    setup_systemd "$TMP_BIN"
 elif [ "$OS_TYPE" = "macos" ]; then
     setup_launchd "$TMP_BIN"
 fi
