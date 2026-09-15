@@ -234,7 +234,7 @@ get_asset_name() {
     local arch="$2"
     case "$os-$arch" in
         linux-x86_64)
-            if command -v pactl &>/dev/null && pactl info &>/dev/null 2>&1; then
+            if _check_pipewire; then
                 echo "l337-audio-server-x86_64-linux-pipewire"
             else
                 echo "l337-audio-server-x86_64-linux-alsa"
@@ -254,6 +254,27 @@ get_asset_name() {
             fail "Unsupported platform: $os/$arch"
             ;;
     esac
+}
+
+# PipeWire/PulseAudio availability must be checked as the desktop user, not
+# root, because the audio sockets live in the user's runtime dir. When the
+# installer is invoked via sudo, SUDO_USER points to the real user.
+_check_pipewire() {
+    local check_user="${SUDO_USER:-${USER}}"
+    if [ "$check_user" != "root" ] && [ -n "$check_user" ]; then
+        local user_rt="/run/user/$(id -u "$check_user")"
+        if [ -d "$user_rt" ]; then
+            if [ -S "$user_rt/pipewire-0" ] || [ -S "$user_rt/pulse/native" ]; then
+                return 0
+            fi
+        fi
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -u "$check_user" -- bash -c '
+                command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1
+            ' 2>/dev/null && return 0
+        fi
+    fi
+    command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------

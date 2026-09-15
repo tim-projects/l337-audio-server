@@ -95,12 +95,6 @@ fn parse_transport_cli() -> Option<String> {
     std::env::args().find_map(|a| a.strip_prefix("--transport=").map(|v| v.to_string()))
 }
 
-fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("l337-audio-server")
-}
-
 /// Default `server.ini` written when none exists, so the server always has a
 /// usable configuration and never panics on a missing file.
 const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n";
@@ -114,15 +108,6 @@ fn load_settings() -> Result<Settings, config::ConfigError> {
                 .format(config::FileFormat::Ini)
                 .required(false),
         );
-
-    if let Some(config_dir) = dirs::config_dir() {
-        let xdg_path = config_dir.join("l337-audio-server").join("server.ini");
-        builder = builder.add_source(
-            config::File::from(xdg_path)
-                .format(config::FileFormat::Ini)
-                .required(false),
-        );
-    }
 
     builder = builder
         .add_source(
@@ -174,9 +159,8 @@ async fn main() {
     ensure_config_file();
 
     // Load configuration. The official location is /etc/l337-audio-server/
-    // (systemd ConfigurationDirectory); fall back to XDG ~/.config/
-    // then to a server.ini next to the binary (CWD) for local/dev runs.
-    // Environment vars (L337__*) win last.
+    // (systemd ConfigurationDirectory), with CWD ./server.ini as a local/dev
+    // fallback. Environment vars (L337__*) win last.
     let mut settings = load_settings().expect("Failed to load config");
 
     let max_pool = settings
@@ -257,7 +241,16 @@ async fn main() {
         });
     }
 
-    let challenge_state = Arc::new(ChallengeState::new(config_dir()));
+    let challenge_dir = std::env::var("STATE_DIRECTORY")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("l337-audio-server")
+        });
+    let challenge_state = Arc::new(ChallengeState::new(challenge_dir));
     let socket_mode = use_socket;
     let rate_limiter = Arc::new(RateLimiter::new());
 
@@ -432,8 +425,8 @@ async fn main() {
 /// Create a default `server.ini` in the official config directory
 /// (/etc/l337-audio-server) when none exists, so the server always has a valid
 /// configuration on first run instead of panicking on a missing section. When
-/// that directory is not present (local/dev runs) it falls back to the XDG
-/// config directory, then to `server.ini` next to the binary (CWD).
+/// that directory is not present (local/dev runs) it falls back to
+/// `server.ini` next to the binary (CWD).
 fn ensure_config_file() {
     let etc_path = std::path::Path::new("/etc/l337-audio-server/server.ini");
     if etc_path.exists() {
@@ -454,22 +447,6 @@ fn ensure_config_file() {
             }
             Err(e) => tracing::warn!("Could not create default server.ini: {}", e),
         }
-        return;
-    }
-
-    let xdg_path = config_dir().join("server.ini");
-    if !xdg_path.exists() {
-        let _ = std::fs::create_dir_all(xdg_path.parent().unwrap());
-        let _ = std::fs::write(&xdg_path, DEFAULT_CONFIG);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&xdg_path, std::fs::Permissions::from_mode(0o600));
-        }
-        tracing::info!(
-            "No server.ini found; created a default at {}",
-            xdg_path.display()
-        );
         return;
     }
 
