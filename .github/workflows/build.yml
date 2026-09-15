@@ -44,13 +44,17 @@ jobs:
           TODAY=$(date -u +"%Y.%m.%d")
           echo "Today: $TODAY"
 
-          EXISTING=$(gh release list --repo "$GH_REPO" --limit 100 --json tagName --jq '.[].tagName' | grep "^${TODAY}-" | sort -V | tail -1 || true)
+          EXISTING=$(
+            {
+              gh release list --repo "$GH_REPO" --limit 100 --json tagName --jq '.[].tagName';
+              git ls-remote --tags origin | grep -oP "refs/tags/${TODAY}-\d+" | sed "s|refs/tags/${TODAY}-||";
+            } | sed "s/^${TODAY}-//" | sort -V | tail -1 || true
+          )
 
           if [ -z "$EXISTING" ]; then
               BUILD_NUM=1
           else
-              BUILD_NUM=${EXISTING#"${TODAY}-"}
-              BUILD_NUM=$((BUILD_NUM + 1))
+              BUILD_NUM=$((EXISTING + 1))
           fi
 
           TAG="${TODAY}-${BUILD_NUM}"
@@ -195,6 +199,8 @@ jobs:
     continue-on-error: true
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
     - uses: actions/checkout@v4
     - name: Download all artifacts
@@ -219,9 +225,17 @@ jobs:
       run: |
         echo "Artifacts downloaded:"
         find ./release-artifacts -type f -exec ls -lh {} \;
+    - name: Delete stale release/tag if exists
+      run: |
+        TAG="${{ needs.determine-version.outputs.tag }}"
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "Deleting stale release and tag $TAG"
+          gh release delete "$TAG" --yes
+        elif git ls-remote --tags origin | grep -q "refs/tags/${TAG}"; then
+          echo "Deleting orphaned tag $TAG"
+          git push origin --delete tag "$TAG"
+        fi
     - name: Create GitHub Release
-      env:
-        GH_TOKEN: ${{ github.token }}
       run: |
         gh release create "${{ needs.determine-version.outputs.tag }}" \
           --title "L337 Audio Server ${{ needs.determine-version.outputs.tag }}" \
