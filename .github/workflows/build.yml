@@ -157,6 +157,10 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
     - name: Install Android NDK
       run: |
         sudo apt-get update
