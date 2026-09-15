@@ -34,6 +34,7 @@ DRY_RUN=false
 UNINSTALL=false
 REMOVE_DATA=false
 INSTALL_PRERELEASE=false
+FORCE=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +50,7 @@ Options:
   --dry-run              Show what would happen without making changes
   --pre-release, --prerelease
                          Install the latest prerelease instead of stable release
+  --force, -f            Force reinstall even if the same version is already installed
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   -h, --help             Show this help message
@@ -103,6 +105,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
+        --force|-f) FORCE=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help) usage ;;
@@ -669,6 +672,7 @@ if [ "$DRY_RUN" = true ]; then
             linux)
                 info "  Configure systemd service: $SYSTEMD_SERVICE"
                 info "  Create user/group: $USER_NAME/$GROUP_NAME"
+                info "  Add $USER_NAME to audio group"
                 info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
                 ;;
             macos)
@@ -725,13 +729,27 @@ if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
     if [ -n "$INSTALLED_VERSION" ]; then
         info "Installed version: $INSTALLED_VERSION"
         if version_eq "$INSTALLED_VERSION" "$LATEST_TAG"; then
-            ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
-            exit 0
+            if [ "$FORCE" = true ]; then
+                info "Force reinstall requested for the same version ($INSTALLED_VERSION)"
+            else
+                ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
+                echo
+                echo "To reinstall anyway, run with --force:"
+                echo "  sudo $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')-u"
+                exit 0
+            fi
         elif version_gt "$LATEST_TAG" "$INSTALLED_VERSION"; then
             info "Update available ($INSTALLED_VERSION -> $LATEST_TAG)"
         else
-            ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($LATEST_TAG)"
-            exit 0
+            if [ "$FORCE" = true ]; then
+                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($LATEST_TAG)"
+            else
+                ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($LATEST_TAG)"
+                echo
+                echo "To reinstall anyway, run with --force:"
+                echo "  sudo $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
+                exit 0
+            fi
         fi
     else
         warn "Could not determine installed version; will reinstall"
