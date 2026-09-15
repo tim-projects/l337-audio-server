@@ -232,9 +232,12 @@ parse_json_field() {
 get_asset_name() {
     local os="$1"
     local arch="$2"
+    local service_context="${3:-}"
     case "$os-$arch" in
         linux-x86_64)
-            if _check_pipewire; then
+            if [ "$service_context" = "system" ]; then
+                echo "l337-audio-server-x86_64-linux-alsa"
+            elif _check_pipewire; then
                 echo "l337-audio-server-x86_64-linux-pipewire"
             else
                 echo "l337-audio-server-x86_64-linux-alsa"
@@ -326,6 +329,12 @@ setup_systemd() {
         info "Creating system user: $USER_NAME"
         useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$GROUP_NAME" "$USER_NAME" || \
             fail "Failed to create system user $USER_NAME. Run the installer with sudo and ensure useradd is available."
+    fi
+
+    if ! groups "$USER_NAME" 2>/dev/null | grep -qw "audio"; then
+        info "Adding $USER_NAME to audio group for ALSA access"
+        usermod -aG audio "$USER_NAME" || \
+            warn "Failed to add $USER_NAME to audio group; ALSA access may not be available."
     fi
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
@@ -700,7 +709,11 @@ fi
 
 info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
 
-ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")
+if [ "$OS_TYPE" = "linux" ]; then
+    ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "system")
+else
+    ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE" "")
+fi
 info "Selected asset: $ASSET_NAME"
 
 # Check if already installed and up-to-date
