@@ -41,7 +41,7 @@ impl AudioBackend for PipeWireAudioBackend {
 
         let core_leaked = Box::leak(core);
 
-        let playing = Arc::new(AtomicBool::new(true));
+        let playing = Arc::new(AtomicBool::new(false));
 
         let props = pipewire::properties::properties! {
             *pipewire::keys::MEDIA_TYPE => "Audio",
@@ -72,44 +72,79 @@ impl AudioBackend for PipeWireAudioBackend {
 
                 let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
-                let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
 
-                if let Some(mut buffer) = stream.dequeue_buffer() {
-                    let datas = buffer.datas_mut();
-                    if datas.is_empty() {
-                        return;
+                if available > 0 {
+                    let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(mut buffer) = stream.dequeue_buffer() {
+                        let datas = buffer.datas_mut();
+                        if datas.is_empty() {
+                            return;
+                        }
+
+                        let data = &mut datas[0];
+                        let slice = if let Some(s) = data.data() {
+                            s
+                        } else {
+                            return;
+                        };
+
+                        let f32_len = slice.len() / 4;
+                        if f32_len == 0 {
+                            return;
+                        }
+
+                        let f32_slice = unsafe {
+                            std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
+                        };
+
+                        let to_copy = f32_len.min(available);
+                        for (d, s) in f32_slice.iter_mut().zip(buf.pcm[buf.read_pos..].iter()) {
+                            *d = s * v;
+                        }
+                        buf.read_pos += to_copy;
+
+                        for sample in &mut f32_slice[to_copy..] {
+                            *sample = 0.0;
+                        }
+
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = (*channels as i32) * 4;
+                        *chunk.size_mut() = (to_copy * 4) as u32;
                     }
+                } else {
+                    drop(buf);
+                    if let Some(mut buffer) = stream.dequeue_buffer() {
+                        let datas = buffer.datas_mut();
+                        if datas.is_empty() {
+                            return;
+                        }
 
-                    let data = &mut datas[0];
-                    let slice = if let Some(s) = data.data() {
-                        s
-                    } else {
-                        return;
-                    };
+                        let data = &mut datas[0];
+                        let slice = if let Some(s) = data.data() {
+                            s
+                        } else {
+                            return;
+                        };
 
-                    let f32_len = slice.len() / 4;
-                    if f32_len == 0 {
-                        return;
+                        let f32_len = slice.len() / 4;
+                        if f32_len == 0 {
+                            return;
+                        }
+
+                        let f32_slice = unsafe {
+                            std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
+                        };
+
+                        for sample in f32_slice.iter_mut() {
+                            *sample = 0.0;
+                        }
+
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = (*channels as i32) * 4;
+                        *chunk.size_mut() = 0;
                     }
-
-                    let f32_slice = unsafe {
-                        std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
-                    };
-
-                    let to_copy = f32_len.min(available);
-                    for (d, s) in f32_slice.iter_mut().zip(buf.pcm[buf.read_pos..].iter()) {
-                        *d = s * v;
-                    }
-                    buf.read_pos += to_copy;
-
-                    for sample in &mut f32_slice[to_copy..] {
-                        *sample = 0.0;
-                    }
-
-                    let chunk = data.chunk_mut();
-                    *chunk.offset_mut() = 0;
-                    *chunk.stride_mut() = (*channels as i32) * 4;
-                    *chunk.size_mut() = (to_copy * 4) as u32;
                 }
             })
             .register()

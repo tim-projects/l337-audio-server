@@ -225,6 +225,7 @@ impl AlsaAudioOutputStream {
                         break;
                     }
                 }
+                thread::sleep(Duration::from_millis(10));
             } else {
                 drop(buf);
                 thread::sleep(Duration::from_millis(10));

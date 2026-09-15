@@ -344,6 +344,12 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         buf.pitch = self.pitch;
         drop(buf);
 
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(e) = stream.play() {
+                error!("load_and_play: stream.play failed: {}", e);
+            }
+        }
+
         self.position_sec = 0;
         self.state = PlayerStateLabel::Playing;
         info!(
@@ -382,6 +388,11 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         buf.pcm.clear();
         buf.read_pos = 0;
         drop(buf);
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(e) = stream.pause() {
+                error!("stop: stream.pause failed: {}", e);
+            }
+        }
         self.position_sec = 0;
         self.state = PlayerStateLabel::Stopped;
     }
