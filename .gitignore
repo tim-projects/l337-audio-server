@@ -1,6 +1,9 @@
 # .tasks tracking
 .tasks/
 
+# Kilo agent metadata
+.kilo/
+
 # Infrastructure repos mapping
 infra-repos.md
 
