@@ -348,6 +348,20 @@ _check_pipewire() {
 }
 
 # ---------------------------------------------------------------------------
+# Service lifecycle helpers
+# ---------------------------------------------------------------------------
+stop_service_systemd() {
+    local service="$1"
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        info "Stopping $service..."
+        systemctl stop "$service" 2>/dev/null || true
+    fi
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        fail "Service $service failed to stop"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 download_binary() {
@@ -405,15 +419,6 @@ setup_systemd() {
     fi
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
-
-    info "Installing binary to $INSTALL_DIR..."
-    cp "$bin_path" "$INSTALL_DIR/l337-audio-server"
-    chmod 0755 "$INSTALL_DIR/l337-audio-server"
-    chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
-
-    chown "$USER_NAME:$GROUP_NAME" "$CONFIG_DIR" || \
-        fail "Failed to set ownership on $CONFIG_DIR."
-    chmod 0755 "$CONFIG_DIR"
 
     local config_file="$CONFIG_DIR/server.ini"
     local legacy_config_file="$CONFIG_DIR/config.toml"
@@ -498,16 +503,44 @@ EOF
 
     chmod 0644 "$SYSTEMD_SERVICE"
 
-    if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
-        info "Stopping running service..."
-        systemctl stop l337-audio-server.service || true
+    stop_service_systemd "l337-audio-server.service"
+
+    info "Replacing binary..."
+    if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
+        mv "$INSTALL_DIR/l337-audio-server" "$INSTALL_DIR/l337-audio-server.bak"
     fi
+    mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/l337-audio-server"
+    chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
 
     systemctl daemon-reload
     systemctl enable l337-audio-server.service
     systemctl start l337-audio-server.service
 
-    ok "Systemd service installed and started"
+    sleep 1
+    if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
+        ok "Systemd service installed and started"
+        rm -f "$INSTALL_DIR/l337-audio-server.bak"
+        rm -rf "$INSTALL_DIR/.tmp"
+        return 0
+    fi
+
+    journalctl -u l337-audio-server.service --since "1 minute ago" --no-pager || true
+    warn "New binary failed to start. Rolling back..."
+    systemctl stop l337-audio-server.service 2>/dev/null || true
+    if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
+        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
+        chmod 0755 "$INSTALL_DIR/l337-audio-server"
+        chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
+        systemctl start l337-audio-server.service 2>/dev/null || true
+        sleep 1
+        if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
+            warn "Rollback successful — old binary restored and running"
+        else
+            fail "Rollback failed — manual recovery required"
+        fi
+    fi
+    fail "Installation aborted: new binary failed validation"
 }
 
 # ---------------------------------------------------------------------------
@@ -529,10 +562,6 @@ setup_systemd_user() {
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
     mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_runtime_dir" "$user_service_dir"
-
-    info "Installing binary to $INSTALL_DIR..."
-    cp "$bin_path" "$INSTALL_DIR/l337-audio-server"
-    chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
     local config_file="$user_config_dir/server.ini"
     local legacy_config_file="$user_config_dir/config.toml"
@@ -614,12 +643,46 @@ EOF
     chown "$real_user" "$user_service_file" 2>/dev/null || true
     chmod 0644 "$user_service_file"
 
-    info "Enabling and starting user service..."
+    info "Stopping user service..."
+    su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
+    if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+        fail "Service l337-audio-server.service failed to stop"
+    fi
+
+    info "Replacing binary..."
+    if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
+        mv "$INSTALL_DIR/l337-audio-server" "$INSTALL_DIR/l337-audio-server.bak"
+    fi
+    mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/l337-audio-server"
+
     su - "$real_user" -c "systemctl --user daemon-reload" || true
     su - "$real_user" -c "systemctl --user enable l337-audio-server.service" || true
     su - "$real_user" -c "systemctl --user start l337-audio-server.service" || true
 
-    ok "Systemd user service installed and started"
+    sleep 1
+    if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+        ok "Systemd user service installed and started"
+        rm -f "$INSTALL_DIR/l337-audio-server.bak"
+        rm -rf "$INSTALL_DIR/.tmp"
+        return 0
+    fi
+
+    su - "$real_user" -c "journalctl --user -u l337-audio-server.service --since '1 minute ago' --no-pager" 2>/dev/null || true
+    warn "New binary failed to start. Rolling back..."
+    su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
+    if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
+        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
+        chmod 0755 "$INSTALL_DIR/l337-audio-server"
+        su - "$real_user" -c "systemctl --user start l337-audio-server.service" 2>/dev/null || true
+        sleep 1
+        if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+            warn "Rollback successful — old binary restored and running"
+        else
+            fail "Rollback failed — manual recovery required"
+        fi
+    fi
+    fail "Installation aborted: new binary failed validation"
 }
 
 # ---------------------------------------------------------------------------
@@ -632,10 +695,6 @@ setup_launchd() {
     info "Configuring launchd service..."
 
     mkdir -p "$INSTALL_DIR"
-
-    info "Installing binary to $INSTALL_DIR..."
-    cp "$bin_path" "$INSTALL_DIR/l337-audio-server"
-    chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
     local real_home
     real_home=$(eval echo "~${real_user}")
@@ -738,8 +797,36 @@ EOF
         launchctl unload "$plist_path" 2>/dev/null || true
     fi
 
+    info "Replacing binary..."
+    if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
+        mv "$INSTALL_DIR/l337-audio-server" "$INSTALL_DIR/l337-audio-server.bak"
+    fi
+    mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
+    chmod 0755 "$INSTALL_DIR/l337-audio-server"
+
     launchctl load "$plist_path"
-    ok "Launchd service installed and started"
+    if launchctl list | grep -q "$PLIST_LABEL"; then
+        ok "Launchd service installed and started"
+        rm -f "$INSTALL_DIR/l337-audio-server.bak"
+        rm -rf "$INSTALL_DIR/.tmp"
+        return 0
+    fi
+
+    warn "New binary failed to load. Rolling back..."
+    if launchctl list | grep -q "$PLIST_LABEL"; then
+        launchctl unload "$plist_path" 2>/dev/null || true
+    fi
+    if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
+        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
+        chmod 0755 "$INSTALL_DIR/l337-audio-server"
+        launchctl load "$plist_path"
+        if launchctl list | grep -q "$PLIST_LABEL"; then
+            warn "Rollback successful — old binary restored"
+        else
+            fail "Rollback failed — manual recovery required"
+        fi
+    fi
+    fail "Installation aborted: new binary failed validation"
 }
 
 # ---------------------------------------------------------------------------
@@ -1033,19 +1120,26 @@ if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
 fi
 
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET_NAME}"
-TMP_BIN="/tmp/${ASSET_NAME}.tmp"
-
-download_binary "$DOWNLOAD_URL" "$TMP_BIN"
-
-if [ "$USER_INSTALL" = true ]; then
-    setup_systemd_user "$TMP_BIN"
-elif [ "$OS_TYPE" = "linux" ]; then
-    setup_systemd "$TMP_BIN"
-elif [ "$OS_TYPE" = "macos" ]; then
-    setup_launchd "$TMP_BIN"
+NEW_BIN=""
+if mkdir -p "$INSTALL_DIR/.tmp" 2>/dev/null && [ -w "$INSTALL_DIR/.tmp" ]; then
+    NEW_BIN="$INSTALL_DIR/.tmp/l337-audio-server.new"
+else
+    warn "Cannot write to $INSTALL_DIR/.tmp; falling back to /tmp (non-atomic copy)"
+    NEW_BIN="/tmp/${ASSET_NAME}.tmp"
 fi
 
-rm -f "$TMP_BIN"
+download_binary "$DOWNLOAD_URL" "$NEW_BIN"
+
+if [ "$USER_INSTALL" = true ]; then
+    setup_systemd_user "$NEW_BIN"
+elif [ "$OS_TYPE" = "linux" ]; then
+    setup_systemd "$NEW_BIN"
+elif [ "$OS_TYPE" = "macos" ]; then
+    setup_launchd "$NEW_BIN"
+fi
+
+rm -f "$NEW_BIN"
+rm -rf "$INSTALL_DIR/.tmp"
 ok "Installation complete"
 echo
 if [ "$USER_INSTALL" = true ]; then
