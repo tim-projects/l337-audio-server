@@ -156,10 +156,6 @@ fn instance_lock_candidates() -> Vec<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        use dirs;
-        if let Some(cache) = dirs::cache_dir() {
-            paths.push(cache.join("l337").join("l337-audio-server").join("instance.lock"));
-        }
         paths.push(PathBuf::from("/tmp/l337-audio-server-runtime").join("instance.lock"));
     }
 

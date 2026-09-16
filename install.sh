@@ -419,6 +419,7 @@ setup_systemd() {
     fi
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
+    chmod 0755 "$CONFIG_DIR"
 
     local config_file="$CONFIG_DIR/server.ini"
     local legacy_config_file="$CONFIG_DIR/config.toml"

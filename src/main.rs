@@ -25,16 +25,19 @@ use tokio::sync::Mutex;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Settings {
+    #[serde(default)]
     server: ServerSettings,
     #[serde(default)]
     storage: StorageSettings,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ServerSettings {
+    #[serde(default = "default_host")]
     host: String,
+    #[serde(default = "default_port")]
     port: u16,
     #[serde(default)]
     token: Option<String>,
@@ -60,12 +63,17 @@ struct StorageSettings {
 
 const DEFAULT_MAX_POOL: u64 = 256 * 1024 * 1024; // 256 MiB
 
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_port() -> u16 {
+    1337
+}
+
 /// Path to the Unix domain socket used for local IPC.
 fn socket_path() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("l337")
-        .join("l337-audio-server")
+    platform::common::runtime_dir()
         .join("l337.sock")
 }
 
