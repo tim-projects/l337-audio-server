@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
+use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer, ensure_runtime_dir};
 
 mod ffi {
     #![allow(non_camel_case_types)]
@@ -147,6 +147,7 @@ struct AlsaState {
     volume: Arc<Mutex<f32>>,
     playing: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
     pcm: Mutex<SendSyncPcm>,
 }
 
@@ -169,6 +170,10 @@ impl AlsaAudioOutputStream {
                 break;
             }
 
+            if state.backend_error.load(Ordering::Relaxed) {
+                break;
+            }
+
             let playing = state.playing.load(Ordering::Relaxed);
 
             let pcm_ptr = match state.pcm.lock() {
@@ -180,6 +185,18 @@ impl AlsaAudioOutputStream {
             }
 
             let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+
+            if buf.pcm.len() > buf.max_bytes / 4 {
+                tracing::warn!("ALSA writer: AudioBuffer exceeded max_bytes, clearing");
+                buf.pcm.clear();
+                buf.read_pos = 0;
+                buf.backend_error.store(true, Ordering::SeqCst);
+            }
+
+            if buf.backend_error.load(Ordering::SeqCst) {
+                break;
+            }
+
             let available = buf.pcm.len().saturating_sub(buf.read_pos);
 
             if available > 0 {
@@ -207,6 +224,8 @@ impl AlsaAudioOutputStream {
                 if result < 0 {
                     let recovered = unsafe { (funcs.snd_pcm_recover)(pcm_ptr, result as i32, 1) };
                     if recovered < 0 {
+                        state.buffer.lock().unwrap_or_else(|e| e.into_inner())
+                            .backend_error.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -222,6 +241,8 @@ impl AlsaAudioOutputStream {
                 if result < 0 {
                     let recovered = unsafe { (funcs.snd_pcm_recover)(pcm_ptr, result as i32, 1) };
                     if recovered < 0 {
+                        state.buffer.lock().unwrap_or_else(|e| e.into_inner())
+                            .backend_error.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -512,6 +533,7 @@ impl AudioBackend for AlsaAudioBackend {
             volume,
             playing: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
+            backend_error: Arc::new(AtomicBool::new(false)),
             pcm: Mutex::new(SendSyncPcm(pcm)),
         });
 

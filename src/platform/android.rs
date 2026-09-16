@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
@@ -51,6 +52,7 @@ mod ffi {
     pub const AAUDIO_SHARING_MODE_SHARED: AAudioSharingMode = AAudioSharingMode::Shared;
     pub const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: AAudioPerformanceMode = AAudioPerformanceMode::LowLatency;
     pub const AAUDIO_CALLBACK_RESULT_CONTINUE: c_int = 0;
+    pub const AAUDIO_CALLBACK_RESULT_ERROR: c_int = -5;
     pub const AAUDIO_OK: c_int = 0;
 
     #[link(name = "aaudio")]
@@ -162,6 +164,14 @@ extern "C" fn data_callback(
     }
 
     let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    if buf.pcm.len() > buf.max_bytes / 4 {
+        buf.pcm.clear();
+        buf.read_pos = 0;
+        buf.backend_error.store(true, Ordering::SeqCst);
+        drop(buf);
+        tracing::warn!("AAudio buffer cap exceeded, signalling backend error");
+        return ffi::AAUDIO_CALLBACK_RESULT_ERROR;
+    }
     let available = buf.pcm.len().saturating_sub(buf.read_pos);
     let to_copy = available.min(total_samples);
 
@@ -282,6 +292,10 @@ impl AudioBackend for AndroidAudioBackend {
 impl AudioOutputStream for AndroidAudioOutputStream {
     fn play(&mut self) -> Result<(), String> {
         let state = unsafe { &*self.state };
+        {
+            let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.backend_error.store(false, Ordering::SeqCst);
+        }
         state.playing.store(true, Ordering::Relaxed);
 
         let result = unsafe { ffi::AAudioStream_requestStart(self.stream) };
@@ -293,6 +307,10 @@ impl AudioOutputStream for AndroidAudioOutputStream {
 
     fn pause(&mut self) -> Result<(), String> {
         let state = unsafe { &*self.state };
+        {
+            let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.backend_error.store(false, Ordering::SeqCst);
+        }
         state.playing.store(false, Ordering::Relaxed);
 
         let result = unsafe { ffi::AAudioStream_requestPause(self.stream) };

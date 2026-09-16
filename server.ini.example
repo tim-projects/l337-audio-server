@@ -1,0 +1,49 @@
+[server]
+# ---------------------------------------------------------------------------
+# Simple settings — safe to tweak for everyday use.
+# ---------------------------------------------------------------------------
+
+# Interface to bind. Use 127.0.0.1 for local-only, 0.0.0.0 for all interfaces.
+host = "127.0.0.1"
+
+# TCP port (only used when transport is "http" or "auto" on non-Unix).
+port = 1337
+
+# Transport mode: "auto" (Unix socket on Unix, TCP on Windows),
+# "socket" (force Unix socket), or "http" (force TCP/HTTPS).
+transport = "auto"
+
+# Run without opening a real audio device (for testing / headless).
+dummy = false
+
+# Auth token required for HTTP API access. Leave empty to auto-generate
+# and persist one under ~/.cache/l337-audio-server/server_token.txt.
+# For Unix socket mode, auth is skipped (socket permissions provide security).
+token = ""
+
+# Paths to TLS certificate and key. When both are set, the server uses
+# HTTPS. When empty, a self-signed cert is auto-generated.
+tls_cert = ""
+tls_key = ""
+
+# ---------------------------------------------------------------------------
+# Advanced settings — tweak only if you know why.
+# ---------------------------------------------------------------------------
+
+# Maximum size of the in-memory PCM buffer in bytes before the watchdog
+# clears it to prevent runaway growth if the backend stops draining.
+# Default: 8388608 (8 MiB). Lower = more aggressive protection, higher =
+# more tolerance for slow backends.
+buffer_max_bytes = 8388608
+
+# ---------------------------------------------------------------------------
+# Storage / cache
+# ---------------------------------------------------------------------------
+
+# Maximum disk pool size in bytes. Default: 268435456 (256 MiB).
+# Set to 0 for unlimited (not recommended).
+max_cache_size_bytes = 268435456
+
+# Directory for cached tracks. Defaults to ~/.cache/l337-audio-server on
+# Unix, %LOCALAPPDATA%\l337-audio-server on Windows.
+cache_dir = ""

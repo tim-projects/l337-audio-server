@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tracing::warn;
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
@@ -76,6 +77,7 @@ struct PulseAudioState {
     volume: Arc<Mutex<f32>>,
     playing: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
     simple: Mutex<SendSyncPulseAudio>,
 }
 
@@ -98,6 +100,10 @@ impl PulseAudioAudioOutputStream {
                 break;
             }
 
+            if state.backend_error.load(Ordering::SeqCst) {
+                break;
+            }
+
             let playing = state.playing.load(Ordering::Relaxed);
 
             let simple_ptr = match state.simple.lock() {
@@ -109,6 +115,14 @@ impl PulseAudioAudioOutputStream {
             }
 
             let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.pcm.len() > buf.max_bytes / 4 {
+                buf.pcm.clear();
+                buf.read_pos = 0;
+                buf.backend_error.store(true, Ordering::SeqCst);
+                drop(buf);
+                tracing::warn!("PulseAudio buffer cap exceeded, signalling backend error");
+                break;
+            }
             let available = buf.pcm.len().saturating_sub(buf.read_pos);
 
             if available > 0 {
@@ -135,6 +149,8 @@ impl PulseAudioAudioOutputStream {
                 };
 
                 if result < 0 {
+                    state.backend_error.store(true, Ordering::SeqCst);
+                    tracing::warn!("PulseAudio pa_simple_write failed, signalling backend error");
                     break;
                 }
             } else if !playing {
@@ -148,6 +164,8 @@ impl PulseAudioAudioOutputStream {
                     )
                 };
                 if result < 0 {
+                    state.backend_error.store(true, Ordering::SeqCst);
+                    tracing::warn!("PulseAudio pa_simple_write (silence) failed, signalling backend error");
                     break;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -235,6 +253,7 @@ impl AudioBackend for PulseAudioAudioBackend {
             volume,
             playing: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
+            backend_error: Arc::new(AtomicBool::new(false)),
             simple: Mutex::new(SendSyncPulseAudio(simple)),
         });
 
@@ -254,16 +273,19 @@ impl AudioBackend for PulseAudioAudioBackend {
 
 impl AudioOutputStream for PulseAudioAudioOutputStream {
     fn play(&mut self) -> Result<(), String> {
+        self.state.backend_error.store(false, Ordering::SeqCst);
         self.state.playing.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
+        self.state.backend_error.store(false, Ordering::SeqCst);
         self.state.playing.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn stop(&mut self) {
+        self.state.backend_error.store(false, Ordering::SeqCst);
         self.state.cancel.store(true, Ordering::Relaxed);
 
         let simple_ptr = match self.state.simple.lock() {

@@ -301,7 +301,7 @@ pub async fn seek(
 }
 
 pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
-    let engine = state.0.lock().await;
+    let mut engine = state.0.lock().await;
     let status = engine.get_status().await;
     Json(status).into_response()
 }

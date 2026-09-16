@@ -20,7 +20,7 @@ impl PlatformInfo {
     #[cfg(target_os = "android")]
     let (os, display_name) = ("android", "Android");
     #[cfg(target_os = "macos")]
-    let (os, display_name) = ("macos", "macOS");
+    let (os, display_name) = ("macOS");
     #[cfg(target_os = "windows")]
     let (os, display_name) = ("windows", "Windows");
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
@@ -41,8 +41,9 @@ impl PlatformInfo {
     }
 }
 
+
 /// Audio buffer shared between the engine and the native audio backend callback.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AudioBuffer {
     pub pcm: Vec<f32>,
     pub read_pos: usize,
@@ -51,6 +52,10 @@ pub struct AudioBuffer {
     pub file_sample_rate: u32,
     pub speed: f32,
     pub pitch: f32,
+    pub backend_error: std::sync::atomic::AtomicBool,
+    /// Backend watchdog cap in bytes. Backends clear the buffer and flag an error
+    /// when `pcm.len() * 4` (size of f32 samples) exceeds this value.
+    pub max_bytes: usize,
 }
 
 impl AudioBuffer {
@@ -63,17 +68,23 @@ impl AudioBuffer {
             file_sample_rate,
             speed: 1.0,
             pitch: 1.0,
+            backend_error: std::sync::atomic::AtomicBool::new(false),
+            max_bytes: 8 * 1024 * 1024,
         }
     }
 }
 
 /// Runtime directory for the platform's session bus / IPC.
-/// On Linux with PipeWire this is `/run/l337-audio-server`.
+/// On Linux, honours XDG_RUNTIME_DIR when set (systemd user services) and falls
+/// back to /run/l337-audio-server for traditional runs.
 /// On other platforms it falls back to a cache dir.
 pub fn runtime_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        PathBuf::from("/run/l337-audio-server")
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && *p != PathBuf::from("/"))
+            .unwrap_or_else(|| PathBuf::from("/run/l337-audio-server"))
     }
     #[cfg(target_os = "android")]
     {

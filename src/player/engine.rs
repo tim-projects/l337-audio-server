@@ -75,6 +75,7 @@ impl std::fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 pub struct PlayerEngine {
+    backend: Box<dyn AudioBackend>,
     stream: Option<Box<dyn AudioOutputStream>>,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
     volume: Arc<Mutex<f32>>,
@@ -92,8 +93,10 @@ pub struct PlayerEngine {
 }
 
 impl PlayerEngine {
-    pub fn new(storage: StorageManager) -> Result<Self, String> {
-        let audio_buffer = Arc::new(Mutex::new(AudioBuffer::new(48000, 0)));
+    pub fn new(storage: StorageManager, buffer_max_bytes: u64) -> Result<Self, String> {
+        let mut audio_buffer = AudioBuffer::new(48000, 0);
+        audio_buffer.max_bytes = buffer_max_bytes as usize;
+        let audio_buffer = Arc::new(Mutex::new(audio_buffer));
         let volume = Arc::new(Mutex::new(1.0));
 
         let backend: Box<dyn AudioBackend> = {
@@ -144,6 +147,7 @@ impl PlayerEngine {
         )?;
 
         Ok(Self {
+            backend,
             stream: Some(stream),
             audio_buffer,
             volume: volume.clone(),
@@ -163,6 +167,7 @@ impl PlayerEngine {
 
     pub fn new_dummy(storage: StorageManager) -> Self {
         Self {
+            backend: Box::new(crate::platform::common::NoopAudioBackend),
             stream: Some(Box::new(crate::platform::common::NoopAudioOutputStream)),
             audio_buffer: Arc::new(Mutex::new(AudioBuffer::new(48000, 0))),
             volume: Arc::new(Mutex::new(1.0)),
@@ -180,7 +185,132 @@ impl PlayerEngine {
         }
     }
 
-pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
+    fn has_backend_error(&mut self) -> bool {
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if buf.backend_error.load(Ordering::SeqCst) {
+            buf.pcm.clear();
+            buf.read_pos = 0;
+            buf.backend_error.store(false, Ordering::SeqCst);
+            self.state = PlayerStateLabel::Stopped;
+            self.position_sec = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn check_backend_error(&self) -> bool {
+        let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.backend_error.load(Ordering::SeqCst)
+    }
+
+    fn calculate_position(&self, buf: &AudioBuffer) -> u64 {
+        if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
+            self.position_sec
+        } else {
+            let consumed = buf.read_pos as u64;
+            let orig_frames =
+                (consumed as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
+                    as u64;
+            let buffer_sec = orig_frames / buf.file_sample_rate as u64;
+            self.position_sec + buffer_sec
+        }
+    }
+
+    fn take_backend_error(&mut self) -> Option<u64> {
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if buf.backend_error.load(Ordering::SeqCst) {
+            let position = self.calculate_position(&buf);
+            buf.pcm.clear();
+            buf.read_pos = 0;
+            buf.backend_error.store(false, Ordering::SeqCst);
+            self.state = PlayerStateLabel::Stopped;
+            self.position_sec = 0;
+            Some(position)
+        } else {
+            None
+        }
+    }
+
+    fn seek_and_resume(&mut self, position: u64) -> Result<(), String> {
+        let path = self.storage.get_active_slot_path("current");
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let decode =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)));
+        let (mut pcm, file_sample_rate, channels) = match decode {
+            Ok(Ok(result)) => result,
+            _ => return Err("decode failed".to_string()),
+        };
+
+        let target_orig_pos = (position as u64) * (file_sample_rate as u64);
+        let start_sample = (target_orig_pos * channels as u64) as usize;
+        if start_sample < pcm.len() {
+            pcm = pcm.split_off(start_sample);
+        }
+
+        let device_rate = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.sample_rate
+        };
+        let playback_pcm =
+            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
+
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.pcm = playback_pcm;
+        buf.read_pos = 0;
+        buf.channels = channels;
+        buf.file_sample_rate = file_sample_rate;
+        buf.speed = self.speed;
+        buf.pitch = self.pitch;
+        self.file_sample_rate = file_sample_rate;
+        self.channels = channels;
+
+        Ok(())
+    }
+
+    pub(crate) fn try_recover(&mut self) -> Result<(), String> {
+        let position = match self.take_backend_error() {
+            Some(pos) => pos,
+            None => return Ok(()),
+        };
+
+        if let Some(mut stream) = self.stream.take() {
+            stream.stop();
+        }
+
+        let new_stream = self.backend.start_stream(
+            "l337-audio-server",
+            48000,
+            2,
+            self.audio_buffer.clone(),
+            self.volume.clone(),
+        )?;
+        self.stream = Some(new_stream);
+
+        let is_file_playback = self.file_sample_rate > 0 && self.channels > 0;
+
+        if is_file_playback && position > 0 && self.current_track.is_some() {
+            self.seek_and_resume(position)?;
+        }
+
+        if let Some(stream) = self.stream.as_mut() {
+            stream.play()?;
+        }
+
+        if is_file_playback && position > 0 && self.current_track.is_some() {
+            self.state = PlayerStateLabel::Playing;
+        } else {
+            self.state = PlayerStateLabel::Stopped;
+        }
+
+        Ok(())
+    }
+
+    pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
+        if self.check_backend_error() {
+            self.try_recover().map_err(EngineError::Other)?;
+        }
+
         self.stop();
         self.current_track = Some(track.clone());
 
@@ -278,6 +408,10 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
     }
 
     pub async fn load_and_play(&mut self, slot: &str) {
+        if self.has_backend_error() {
+            return;
+        }
+
         let path = self.storage.get_active_slot_path(slot);
 
         let bytes = match tokio::fs::read(&path).await {
@@ -523,6 +657,10 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
     }
 
     pub fn seek(&mut self, position: u64) {
+        if self.check_backend_error() {
+            let _ = self.try_recover();
+        }
+
         if self.streaming.is_some() {
             tracing::warn!("seek ignored during streaming playback");
             return;
@@ -629,7 +767,27 @@ pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
         self.load_and_play("current").await;
     }
 
-    pub async fn get_status(&self) -> PlayerStatus {
+    pub async fn get_status(&mut self) -> PlayerStatus {
+        if self.check_backend_error() {
+            let _ = self.try_recover();
+        }
+
+        if self.state == PlayerStateLabel::Stopped && self.stream.is_none() {
+            return PlayerStatus {
+                state: PlayerStateLabel::Stopped,
+                volume: self.volume_val,
+                speed: self.speed,
+                pitch: self.pitch,
+                current_track: self.current_track.clone(),
+                disk_pool_utilization_bytes: self.storage.get_total_size().await,
+                next_cached: self.storage.get_active_slot_path("next").exists(),
+                prev_cached: self.storage.get_active_slot_path("prev").exists(),
+                position_sec: Some(0),
+                duration_sec: self.duration_sec,
+                audio_available: self.stream.is_some(),
+            };
+        }
+
         let next_cached = self.storage.get_active_slot_path("next").exists();
         let prev_cached = self.storage.get_active_slot_path("prev").exists();
         let utilization = self.storage.get_total_size().await;

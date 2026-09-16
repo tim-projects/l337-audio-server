@@ -2,11 +2,13 @@ use crate::platform::common::{runtime_dir, ensure_runtime_dir, AudioBackend, Aud
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing::warn;
 
 pub struct WasapiAudioBackend;
 
 pub struct WasapiAudioOutputStream {
     playing: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
     _audio_client: wasapi::AudioClient,
     _render_client: wasapi::RenderClient,
 }
@@ -75,6 +77,8 @@ impl AudioBackend for WasapiAudioBackend {
         let vol = volume.clone();
         let playing = Arc::new(AtomicBool::new(false));
         let playing_thread = playing.clone();
+        let backend_error = Arc::new(AtomicBool::new(false));
+        let backend_error_thread = backend_error.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -84,6 +88,10 @@ impl AudioBackend for WasapiAudioBackend {
                         winapi::um::winbase::INFINITE,
                     )
                 };
+
+                if backend_error_thread.load(Ordering::SeqCst) {
+                    continue;
+                }
 
                 if !playing_thread.load(Ordering::SeqCst) {
                     if let Ok(mut buffer) = render_client.get_buffer(buffer_frames as u32) {
@@ -98,16 +106,32 @@ impl AudioBackend for WasapiAudioBackend {
 
                 let mut buffer = match render_client.get_buffer(buffer_frames as u32) {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(e) => {
+                        backend_error_thread.store(true, Ordering::SeqCst);
+                        tracing::warn!("WASAPI get_buffer failed: {}, signalling backend error", e);
+                        break;
+                    }
                 };
 
                 let data = buffer.data_mut();
                 if data.is_empty() {
                     let _ = render_client.release_buffer(buffer_frames as u32, 0);
+                    backend_error_thread.store(true, Ordering::SeqCst);
+                    tracing::warn!("WASAPI render buffer empty, signalling backend error");
                     break;
                 }
 
                 let mut buf = ab.lock().unwrap();
+                if buf.pcm.len() > buf.max_bytes / 4 {
+                    buf.pcm.clear();
+                    buf.read_pos = 0;
+                    buf.backend_error.store(true, Ordering::SeqCst);
+                    drop(buf);
+                    tracing::warn!("WASAPI buffer cap exceeded, signalling backend error");
+                    let _ = render_client.release_buffer(buffer_frames as u32, 0);
+                    break;
+                }
+
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
                 let v = *vol.lock().unwrap();
 
@@ -131,6 +155,7 @@ impl AudioBackend for WasapiAudioBackend {
 
         Ok(Box::new(WasapiAudioOutputStream {
             playing,
+            backend_error,
             _audio_client: audio_client,
             _render_client: render_client,
         }))
@@ -139,16 +164,19 @@ impl AudioBackend for WasapiAudioBackend {
 
 impl AudioOutputStream for WasapiAudioOutputStream {
     fn play(&mut self) -> Result<(), String> {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     fn stop(&mut self) {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
     }
 }

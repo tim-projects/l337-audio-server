@@ -11,7 +11,16 @@ pub struct PipeWireAudioBackend;
 
 pub struct PipeWireAudioOutputStream {
     playing: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
     _stream: Option<SendSyncStream>,
+}
+
+fn terminal_pw_state(new: &pipewire::stream::StreamState) -> bool {
+    matches!(
+        new,
+        pipewire::stream::StreamState::Error(_)
+            | pipewire::stream::StreamState::Unconnected
+    )
 }
 
 impl AudioBackend for PipeWireAudioBackend {
@@ -42,6 +51,7 @@ impl AudioBackend for PipeWireAudioBackend {
         let core_leaked = Box::leak(core);
 
         let playing = Arc::new(AtomicBool::new(false));
+        let backend_error = Arc::new(AtomicBool::new(false));
 
         let props = pipewire::properties::properties! {
             *pipewire::keys::MEDIA_TYPE => "Audio",
@@ -61,8 +71,17 @@ impl AudioBackend for PipeWireAudioBackend {
 
         let listener = stream
             .add_local_listener_with_user_data((ab, vol, playing_cb, channels_captured))
-            .state_changed(|_stream, _user_data, old, new| {
-                tracing::info!("PipeWire stream state changed: {:?} -> {:?}", old, new);
+            .state_changed(|_stream, user_data, old, new| {
+                if terminal_pw_state(&new) {
+                    tracing::warn!("PipeWire stream entered error state: {:?} -> {:?}", old, new);
+                    let (ab, _vol, playing_cb, _channels) = user_data;
+                    playing_cb.store(false, Ordering::SeqCst);
+                    if let Ok(mut buf) = ab.lock() {
+                        buf.backend_error.store(true, Ordering::SeqCst);
+                        buf.pcm.clear();
+                        buf.read_pos = 0;
+                    }
+                }
             })
             .process(move |stream, (ab, vol, playing_cb, channels)| {
                 let playing = playing_cb.load(Ordering::SeqCst);
@@ -71,6 +90,18 @@ impl AudioBackend for PipeWireAudioBackend {
                 }
 
                 let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
+
+                if buf.backend_error.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                if buf.pcm.len() > buf.max_bytes / 4 {
+                    tracing::warn!("AudioBuffer exceeded max_bytes, clearing to prevent runaway growth");
+                    buf.pcm.clear();
+                    buf.read_pos = 0;
+                    buf.backend_error.store(true, Ordering::SeqCst);
+                }
+
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
 
                 if available > 0 {
@@ -223,6 +254,7 @@ impl AudioBackend for PipeWireAudioBackend {
 
         Ok(Box::new(PipeWireAudioOutputStream {
             playing,
+            backend_error,
             _stream: Some(SendSyncStream(stream)),
         }))
     }
@@ -230,16 +262,19 @@ impl AudioBackend for PipeWireAudioBackend {
 
 impl AudioOutputStream for PipeWireAudioOutputStream {
     fn play(&mut self) -> Result<(), String> {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     fn stop(&mut self) {
+        self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         self._stream = None;
     }

@@ -46,6 +46,8 @@ struct ServerSettings {
     transport: Option<String>,
     #[serde(default)]
     dummy: bool,
+    #[serde(default)]
+    buffer_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -97,7 +99,7 @@ fn parse_transport_cli() -> Option<String> {
 
 /// Default `server.ini` written when none exists, so the server always has a
 /// usable configuration and never panics on a missing file.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n";
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\nbuffer_max_bytes = 8388608\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
     let mut builder = config::Config::builder();
@@ -183,13 +185,14 @@ async fn main() {
     };
 
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
+    let buffer_max_bytes = settings.server.buffer_max_bytes.unwrap_or(8 * 1024 * 1024);
     let engine = if dummy_mode {
         tracing::warn!(
             "Running in DUMMY output mode. No audio will be produced. Testing only."
         );
         PlayerEngine::new_dummy(storage)
     } else {
-        match PlayerEngine::new(storage) {
+        match PlayerEngine::new(storage, buffer_max_bytes) {
             Ok(engine) => engine,
             Err(e) => {
                 tracing::error!("Failed to initialize audio device: {}", e);
@@ -199,6 +202,25 @@ async fn main() {
     };
 
     let shared_state: AppState = Arc::new(handlers::SendableEngine(Mutex::new(engine)));
+
+    let recovery_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recovery_state = Arc::clone(&shared_state);
+    let recovery_cancel_clone = Arc::clone(&recovery_cancel);
+    tokio::spawn(async move {
+        use std::time::Duration;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if recovery_cancel_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let mut engine = recovery_state.0.lock().await;
+            if engine.check_backend_error() {
+                if let Err(e) = engine.try_recover() {
+                    tracing::error!("Backend recovery failed: {}", e);
+                }
+            }
+        }
+    });
 
     // Resolve the auth token: reuse configured value, else load/persist a stable
     // generated token so the client only needs to copy it once.
