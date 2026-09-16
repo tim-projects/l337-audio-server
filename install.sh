@@ -706,6 +706,17 @@ EOF
     <array>
         <string>${INSTALL_DIR}/l337-audio-server</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${real_home}</string>
+        <key>XDG_CONFIG_HOME</key>
+        <string>${real_home}/.config</string>
+        <key>XDG_CACHE_HOME</key>
+        <string>${real_home}/.cache</string>
+        <key>XDG_STATE_HOME</key>
+        <string>${real_home}/.local/state</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -770,6 +781,8 @@ uninstall_macos() {
     info "Uninstalling from macOS..."
 
     local real_user="${SUDO_USER:-${USER}}"
+    local real_home
+    real_home=$(eval echo "~${real_user}")
     local plist_dir
     plist_dir=$(eval echo "~${real_user}/Library/LaunchAgents")
     local plist_path="${plist_dir}/${PLIST_LABEL}.plist"
@@ -780,6 +793,18 @@ uninstall_macos() {
 
     rm -f "$plist_path"
     rm -rf "$INSTALL_DIR"
+
+    if [ "$REMOVE_DATA" = true ]; then
+        info "Removing user data directories..."
+        rm -rf "${real_home}/Library/Application Support/l337-audio-server"
+        rm -f "${real_home}/Library/Logs/${PLIST_LABEL}.log"
+        ok "User data directories removed"
+    else
+        warn "User data directories retained:"
+        warn "  ${real_home}/Library/Application Support/l337-audio-server"
+        warn "  ${real_home}/Library/Logs/${PLIST_LABEL}.log"
+        warn "Re-run with --remove-data to delete them."
+    fi
 
     ok "Uninstallation complete"
 }
@@ -892,8 +917,9 @@ if [ "$DRY_RUN" = true ]; then
                     info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
                     ;;
                 macos)
-                    info "  Configure launchd plist"
-                    info "  Create directories: $INSTALL_DIR"
+                    info "  Configure launchd plist (user-level service, no --user flag needed)"
+                    info "  Config: ~/Library/Application Support/l337-audio-server/server.ini"
+                    info "  Logs:   ~/Library/Logs/${PLIST_LABEL}.log"
                     ;;
             esac
         fi
