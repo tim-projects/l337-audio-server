@@ -1,10 +1,12 @@
-use crate::platform::common::{runtime_dir, AudioBackend, AudioOutputStream, AudioBuffer};
+use crate::platform::common::{runtime_dir, ensure_runtime_dir, AudioBackend, AudioOutputStream, AudioBuffer};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 pub struct CoreAudioAudioBackend;
 
 pub struct CoreAudioAudioOutputStream {
+    playing: Arc<AtomicBool>,
     _audio_unit: coreaudio::audio_unit::AudioUnit,
 }
 
@@ -24,9 +26,19 @@ impl AudioBackend for CoreAudioAudioBackend {
 
         let ab = audio_buffer.clone();
         let vol = volume.clone();
+        let playing = Arc::new(AtomicBool::new(false));
+        let playing_cb = playing.clone();
 
         audio_unit
             .set_render_callback(move |data: &mut [f32], _| {
+                let playing = playing_cb.load(Ordering::SeqCst);
+                if !playing {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
+                    return Ok(());
+                }
+
                 let mut buf = ab.lock().unwrap();
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
                 let vol = *vol.lock().unwrap();
@@ -58,19 +70,30 @@ impl AudioBackend for CoreAudioAudioBackend {
             .map_err(|e| format!("Failed to start AudioUnit: {}", e))?;
 
         Ok(Box::new(CoreAudioAudioOutputStream {
+            playing,
             _audio_unit: audio_unit,
         }))
     }
 }
 
 impl AudioOutputStream for CoreAudioAudioOutputStream {
-    fn play(&mut self) -> Result<(), String> { Ok(()) }
-    fn pause(&mut self) -> Result<(), String> { Ok(()) }
-    fn stop(&mut self) {}
+    fn play(&mut self) -> Result<(), String> {
+        self.playing.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), String> {
+        self.playing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.playing.store(false, Ordering::SeqCst);
+    }
 }
 
 pub fn init() {
-    let _dir = runtime_dir();
+    ensure_runtime_dir();
 }
 
 #[cfg(test)]

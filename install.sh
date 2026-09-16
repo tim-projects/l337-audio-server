@@ -710,6 +710,8 @@ EOF
     <dict>
         <key>HOME</key>
         <string>${real_home}</string>
+        <key>L337__SERVER__TOKEN</key>
+        <string>${token}</string>
         <key>XDG_CONFIG_HOME</key>
         <string>${real_home}/.config</string>
         <key>XDG_CACHE_HOME</key>
@@ -717,6 +719,8 @@ EOF
         <key>XDG_STATE_HOME</key>
         <string>${real_home}/.local/state</string>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>${real_home}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
