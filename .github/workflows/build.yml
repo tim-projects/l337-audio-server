@@ -121,7 +121,6 @@ jobs:
         name: l337-audio-server-x86_64-pc-windows-msvc
         path: |
           target/x86_64-pc-windows-msvc/release/l337-audio-server.exe
-          target/x86_64-pc-windows-msvc/release/*.pdb
         retention-days: 90
 
   build-macos:
