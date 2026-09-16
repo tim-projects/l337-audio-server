@@ -1,10 +1,12 @@
-use crate::platform::common::{runtime_dir, AudioBackend, AudioOutputStream, AudioBuffer};
+use crate::platform::common::{runtime_dir, ensure_runtime_dir, AudioBackend, AudioOutputStream, AudioBuffer};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 pub struct WasapiAudioBackend;
 
 pub struct WasapiAudioOutputStream {
+    playing: Arc<AtomicBool>,
     _audio_client: wasapi::AudioClient,
     _render_client: wasapi::RenderClient,
 }
@@ -71,6 +73,8 @@ impl AudioBackend for WasapiAudioBackend {
 
         let ab = audio_buffer.clone();
         let vol = volume.clone();
+        let playing = Arc::new(AtomicBool::new(false));
+        let playing_thread = playing.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -80,6 +84,17 @@ impl AudioBackend for WasapiAudioBackend {
                         winapi::um::winbase::INFINITE,
                     )
                 };
+
+                if !playing_thread.load(Ordering::SeqCst) {
+                    if let Ok(mut buffer) = render_client.get_buffer(buffer_frames as u32) {
+                        let data = buffer.data_mut();
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        let _ = render_client.release_buffer(buffer_frames as u32, 0);
+                    }
+                    continue;
+                }
 
                 let mut buffer = match render_client.get_buffer(buffer_frames as u32) {
                     Ok(b) => b,
@@ -115,6 +130,7 @@ impl AudioBackend for WasapiAudioBackend {
             .map_err(|e| format!("Failed to start AudioClient: {}", e))?;
 
         Ok(Box::new(WasapiAudioOutputStream {
+            playing,
             _audio_client: audio_client,
             _render_client: render_client,
         }))
@@ -122,12 +138,24 @@ impl AudioBackend for WasapiAudioBackend {
 }
 
 impl AudioOutputStream for WasapiAudioOutputStream {
-    fn play(&mut self) -> Result<(), String> { Ok(()) }
-    fn pause(&mut self) -> Result<(), String> { Ok(()) }
-    fn stop(&mut self) {}
+    fn play(&mut self) -> Result<(), String> {
+        self.playing.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pause(&mut self) -> Result<(), String> {
+        self.playing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.playing.store(false, Ordering::SeqCst);
+    }
 }
 
-pub fn init() {}
+pub fn init() {
+    ensure_runtime_dir();
+}
 
 #[cfg(test)]
 mod tests {
