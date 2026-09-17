@@ -36,6 +36,7 @@ REMOVE_DATA=false
 INSTALL_PRERELEASE=false
 FORCE=false
 USER_INSTALL=false
+NO_AUDIO=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,6 +54,7 @@ Options:
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
   --user                 Force user-level systemd service (requires PipeWire)
+  --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   -h, --help             Show this help message
@@ -133,6 +135,7 @@ while [ $# -gt 0 ]; do
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f) FORCE=true; shift ;;
         --user) USER_INSTALL=true; shift ;;
+        --no-audio) NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help) usage ;;
@@ -435,12 +438,16 @@ setup_systemd() {
             cp "$legacy_config_file" "$config_file" || \
                 fail "Failed to migrate legacy configuration to $config_file."
         else
+            local dummy_value="false"
+            if [ "$NO_AUDIO" = "true" ]; then
+                dummy_value="true"
+            fi
             cat > "$config_file" <<EOF
 [server]
 host = "0.0.0.0"
 port = 1337
 token = "${token}"
-dummy = false
+dummy = ${dummy_value}
 transport = "auto"
 EOF
             echo
@@ -578,12 +585,16 @@ setup_systemd_user() {
             cp "$legacy_config_file" "$config_file" || \
                 fail "Failed to migrate legacy configuration to $config_file."
         else
+            local dummy_value="false"
+            if [ "$NO_AUDIO" = "true" ]; then
+                dummy_value="true"
+            fi
             cat > "$config_file" <<EOF
 [server]
 host = "127.0.0.1"
 port = 1337
 token = "${token}"
-dummy = false
+dummy = ${dummy_value}
 transport = "auto"
 EOF
             echo
@@ -720,12 +731,16 @@ setup_launchd() {
             cp "$legacy_config_file" "$config_file" || \
                 fail "Failed to migrate legacy configuration to $config_file."
         else
+            local dummy_value="false"
+            if [ "$NO_AUDIO" = "true" ]; then
+                dummy_value="true"
+            fi
             cat > "$config_file" <<EOF
 [server]
 host = "0.0.0.0"
 port = 1337
 token = "${token}"
-dummy = false
+dummy = ${dummy_value}
 transport = "auto"
 EOF
             ok "Configuration written to $config_file"
