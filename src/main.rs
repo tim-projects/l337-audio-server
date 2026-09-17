@@ -166,6 +166,11 @@ async fn main() {
     // Ensure a config file exists in the official config directory
     // (/etc/l337-audio-server) so a fresh install starts cleanly instead of
     // crashing on a missing [server] section.
+    //
+    // In systemd deployments the installer already writes this file and
+    // ProtectSystem=strict may make /etc read-only at runtime, so failures
+    // here are expected and non-fatal. The fallback CWD server.ini and env
+    // vars still allow the server to start.
     ensure_config_file();
 
     // Load configuration. The official location is /etc/l337-audio-server/
@@ -203,8 +208,11 @@ async fn main() {
         match PlayerEngine::new(storage, buffer_max_bytes) {
             Ok(engine) => engine,
             Err(e) => {
-                tracing::error!("Failed to initialize audio device: {}", e);
-                std::process::exit(1);
+                tracing::warn!(
+                    "Failed to initialize audio device: {}. Falling back to DUMMY mode.",
+                    e
+                );
+                PlayerEngine::new_dummy(storage)
             }
         }
     };
@@ -475,7 +483,7 @@ fn ensure_config_file() {
                     etc_path.display()
                 )
             }
-            Err(e) => tracing::warn!("Could not create default server.ini: {}", e),
+            Err(e) => tracing::debug!("Could not create default server.ini at {}: {}", etc_path.display(), e),
         }
         return;
     }
@@ -496,7 +504,7 @@ fn ensure_config_file() {
                 cwd_path.display()
             )
         }
-        Err(e) => tracing::warn!("Could not create default server.ini: {}", e),
+        Err(e) => tracing::debug!("Could not create default server.ini at {}: {}", cwd_path.display(), e),
     }
 }
 
