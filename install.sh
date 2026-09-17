@@ -785,8 +785,7 @@ EOF
 
     chown "$real_user" "$config_file" || \
         fail "Failed to set ownership on $config_file."
-        chmod 0600 "$config_file"
-    fi
+    chmod 0600 "$config_file"
 
     local plist_dir
     plist_dir=$(eval echo "~${real_user}/Library/LaunchAgents")
