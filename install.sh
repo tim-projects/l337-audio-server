@@ -461,6 +461,12 @@ EOF
             echo "========================================="
             echo
         fi
+    elif [ "$NO_AUDIO" = "true" ]; then
+        if grep -qE '^dummy\s*=' "$config_file" 2>/dev/null; then
+            sed -i 's/^dummy\s*=.*/dummy = true/' "$config_file"
+        else
+            sed -i '/^\[server\]/a dummy = true' "$config_file"
+        fi
     fi
 
     chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
@@ -523,7 +529,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable l337-audio-server.service
-    systemctl start l337-audio-server.service
+    systemctl start l337-audio-server.service || true
 
     sleep 1
     if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
@@ -537,16 +543,20 @@ EOF
     warn "New binary failed to start. Rolling back..."
     systemctl stop l337-audio-server.service 2>/dev/null || true
     if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
-        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
-        chmod 0755 "$INSTALL_DIR/l337-audio-server"
-        chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
-        systemctl start l337-audio-server.service 2>/dev/null || true
-        sleep 1
-        if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
-            warn "Rollback successful — old binary restored and running"
-        else
-            fail "Rollback failed — manual recovery required"
+        if mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server" 2>/dev/null; then
+            chmod 0755 "$INSTALL_DIR/l337-audio-server"
+            chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
+            systemctl daemon-reload
+            systemctl start l337-audio-server.service 2>/dev/null || true
+            sleep 1
+            if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
+                warn "Rollback successful — old binary restored and running"
+                rm -f "$INSTALL_DIR/l337-audio-server.bak"
+                rm -rf "$INSTALL_DIR/.tmp"
+                return 0
+            fi
         fi
+        fail "Rollback failed — manual recovery required"
     fi
     fail "Installation aborted: new binary failed validation"
 }
@@ -607,6 +617,12 @@ EOF
             echo "Add this token to your client configuration."
             echo "========================================="
             echo
+        fi
+    elif [ "$NO_AUDIO" = "true" ]; then
+        if grep -qE '^dummy\s*=' "$config_file" 2>/dev/null; then
+            sed -i 's/^dummy\s*=.*/dummy = true/' "$config_file"
+        else
+            sed -i '/^\[server\]/a dummy = true' "$config_file"
         fi
     fi
 
@@ -684,15 +700,19 @@ EOF
     warn "New binary failed to start. Rolling back..."
     su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
     if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
-        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
-        chmod 0755 "$INSTALL_DIR/l337-audio-server"
-        su - "$real_user" -c "systemctl --user start l337-audio-server.service" 2>/dev/null || true
-        sleep 1
-        if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
-            warn "Rollback successful — old binary restored and running"
-        else
-            fail "Rollback failed — manual recovery required"
+        if mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server" 2>/dev/null; then
+            chmod 0755 "$INSTALL_DIR/l337-audio-server"
+            su - "$real_user" -c "systemctl --user daemon-reload" || true
+            su - "$real_user" -c "systemctl --user start l337-audio-server.service" 2>/dev/null || true
+            sleep 1
+            if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+                warn "Rollback successful — old binary restored and running"
+                rm -f "$INSTALL_DIR/l337-audio-server.bak"
+                rm -rf "$INSTALL_DIR/.tmp"
+                return 0
+            fi
         fi
+        fail "Rollback failed — manual recovery required"
     fi
     fail "Installation aborted: new binary failed validation"
 }
@@ -755,8 +775,16 @@ EOF
             echo "========================================="
             echo
         fi
-        chown "$real_user" "$config_file" || \
-            fail "Failed to set ownership on $config_file."
+    elif [ "$NO_AUDIO" = "true" ]; then
+        if grep -qE '^dummy\s*=' "$config_file" 2>/dev/null; then
+            sed -i 's/^dummy\s*=.*/dummy = true/' "$config_file"
+        else
+            sed -i '/^\[server\]/a dummy = true' "$config_file"
+        fi
+    fi
+
+    chown "$real_user" "$config_file" || \
+        fail "Failed to set ownership on $config_file."
         chmod 0600 "$config_file"
     fi
 
@@ -820,7 +848,7 @@ EOF
     mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
-    launchctl load "$plist_path"
+    launchctl load "$plist_path" || true
     if launchctl list | grep -q "$PLIST_LABEL"; then
         ok "Launchd service installed and started"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
@@ -833,14 +861,17 @@ EOF
         launchctl unload "$plist_path" 2>/dev/null || true
     fi
     if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
-        mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server"
-        chmod 0755 "$INSTALL_DIR/l337-audio-server"
-        launchctl load "$plist_path"
-        if launchctl list | grep -q "$PLIST_LABEL"; then
-            warn "Rollback successful — old binary restored"
-        else
-            fail "Rollback failed — manual recovery required"
+        if mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server" 2>/dev/null; then
+            chmod 0755 "$INSTALL_DIR/l337-audio-server"
+            launchctl load "$plist_path" || true
+            if launchctl list | grep -q "$PLIST_LABEL"; then
+                warn "Rollback successful — old binary restored"
+                rm -f "$INSTALL_DIR/l337-audio-server.bak"
+                rm -rf "$INSTALL_DIR/.tmp"
+                return 0
+            fi
         fi
+        fail "Rollback failed — manual recovery required"
     fi
     fail "Installation aborted: new binary failed validation"
 }
