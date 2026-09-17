@@ -210,7 +210,7 @@ async fn main() {
             Err(e) => {
                 tracing::error!(
                     "Failed to initialize audio device: {}. \
-                     Set dummy = true in [server] to run without audio hardware.",
+                     Set dummy = true in server.ini to run without audio hardware.",
                     e
                 );
                 std::process::exit(1);
