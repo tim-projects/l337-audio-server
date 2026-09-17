@@ -62,13 +62,22 @@ The audio server must take security very seriously in all aspects:
 
 ## Dummy mode (no soundcard)
 
-This server requires a soundcard at runtime. On headless / CI / dev boxes without audio hardware, run with `--dummy`:
+This server requires a soundcard at runtime by default. Dummy mode is an
+**explicit opt-in** — there is **no automatic fallback**. If no audio
+backend is available, audio initialization fails and the server exits with
+an error telling the operator to set `dummy = true` in server.ini.
+
+To enable dummy mode, set `dummy = true` in the `[server]` section of
+server.ini, or pass the `--dummy` CLI flag:
 
 ```bash
 ./bin/l337-audio-server --dummy
 ```
 
-In dummy mode `PlayerEngine::new_dummy()` is used: no cpal output stream is opened, all API endpoints still work, and `pause()`/`stop()` are no-ops. Tests already use `PlayerEngine::new_dummy()` so `cargo test` works headless.
+In dummy mode `PlayerEngine::new_dummy()` is used: no cpal output stream is
+opened, all API endpoints still work, and `pause()`/`stop()` are no-ops.
+Tests already use `PlayerEngine::new_dummy()` so `cargo test` works
+headless.
 
 ## Run
 
