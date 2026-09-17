@@ -208,11 +208,12 @@ async fn main() {
         match PlayerEngine::new(storage, buffer_max_bytes) {
             Ok(engine) => engine,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize audio device: {}. Falling back to DUMMY mode.",
+                tracing::error!(
+                    "Failed to initialize audio device: {}. \
+                     Set dummy = true in [server] to run without audio hardware.",
                     e
                 );
-                PlayerEngine::new_dummy(storage)
+                std::process::exit(1);
             }
         }
     };
