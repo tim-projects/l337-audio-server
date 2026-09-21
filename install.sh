@@ -35,17 +35,31 @@ case "$ARCH" in
 esac
 
 # --- Determine release tag ---
+RELEASE_RESPONSE=$(mktemp)
 if [ "$INSTALL_PRERELEASE" = true ]; then
-    RELEASE_JSON=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-        "https://api.github.com/repos/${REPO}/releases?per_page=100")
-    TAG=$(echo "$RELEASE_JSON" | awk '/^  \{/{r=$0;in_r=1;next} in_r{r=r"\n"$0;if($0~/^  \},?$/){if(r~/"prerelease"[[:space:]]*:[[:space:]]*true/){printf "%s",r;exit};r="";in_r=0}}' | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if ! curl -sS -L --connect-timeout 15 --max-time 60 \
+        -o "$RELEASE_RESPONSE" \
+        "https://api.github.com/repos/${REPO}/releases?per_page=100"; then
+        rm -f "$RELEASE_RESPONSE"
+        fail "Failed to contact GitHub Releases API. Check network connectivity."
+    fi
+    TAG=$(awk '/^  \{/{r=$0;in_r=1;next} in_r{r=r"\n"$0;if($0~/^  \},?$/){if(r~/"prerelease"[[:space:]]*:[[:space:]]*true/){printf "%s",r;exit};r="";in_r=0}}' "$RELEASE_RESPONSE" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 else
-    TAG=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-        "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if ! curl -sS -L --connect-timeout 15 --max-time 60 \
+        -o "$RELEASE_RESPONSE" \
+        "https://api.github.com/repos/${REPO}/releases/latest"; then
+        rm -f "$RELEASE_RESPONSE"
+        fail "Failed to contact GitHub Releases API. Check network connectivity."
+    fi
+    TAG=$(grep '"tag_name"' "$RELEASE_RESPONSE" | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || true
 fi
+rm -f "$RELEASE_RESPONSE"
 
 if [ -z "$TAG" ]; then
-    fail "Could not determine latest release tag"
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        fail "Could not determine latest prerelease tag for ${REPO}."
+    fi
+    fail "Could not determine latest stable release tag for ${REPO}. Re-run with --pre-release to install a prerelease."
 fi
 
 # --- Determine script to download ---
