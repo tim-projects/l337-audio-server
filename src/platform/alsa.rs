@@ -255,6 +255,18 @@ impl AlsaAudioOutputStream {
     }
 }
 
+fn parse_pcm_device(name: &str) -> Option<(u32, u32)> {
+    let name = name.strip_prefix("pcmC")?;
+    let name = name.strip_suffix('p')?;
+    let parts: Vec<&str> = name.split('D').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let card = parts[0].parse().ok()?;
+    let device = parts[1].parse().ok()?;
+    Some((card, device))
+}
+
 impl AudioBackend for AlsaAudioBackend {
     fn start_stream(
         &self,
@@ -388,24 +400,58 @@ impl AudioBackend for AlsaAudioBackend {
             snd_strerror: *snd_strerror,
         };
 
-        let mut pcm: *mut ffi::snd_pcm_t = std::ptr::null_mut();
-        let open_result = unsafe {
-            (funcs.snd_pcm_open)(
-                &mut pcm,
-                b"default\0" as *const u8 as *const std::os::raw::c_char,
-                ffi::SND_PCM_STREAM_PLAYBACK,
-                0,
-            )
+        let mut last_error = String::new();
+        let candidates = {
+            let mut list = vec!["default".to_string(), "sysdefault".to_string()];
+            if let Ok(entries) = std::fs::read_dir("/dev/snd") {
+                let mut seen = std::collections::BTreeSet::new();
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if let Some((card, device)) = parse_pcm_device(&name) {
+                        let key = (card, device);
+                        if seen.insert(key) {
+                            list.push(format!("plughw:{},{}", card, device));
+                        }
+                    }
+                }
+            }
+            list
         };
 
-        if open_result < 0 || pcm.is_null() {
-            return Err(format!(
-                "snd_pcm_open failed: {}",
+        let mut pcm: *mut ffi::snd_pcm_t = std::ptr::null_mut();
+        for device in &candidates {
+            let mut pcm_try: *mut ffi::snd_pcm_t = std::ptr::null_mut();
+            let open_result = unsafe {
+                (funcs.snd_pcm_open)(
+                    &mut pcm_try,
+                    device.as_ptr() as *const std::os::raw::c_char,
+                    ffi::SND_PCM_STREAM_PLAYBACK,
+                    0,
+                )
+            };
+
+            if open_result >= 0 && !pcm_try.is_null() {
+                tracing::info!("Opened ALSA playback device: {}", device);
+                pcm = pcm_try;
+                break;
+            }
+
+            last_error = format!(
+                "snd_pcm_open failed for '{}': {}",
+                device,
                 unsafe {
                     std::ffi::CStr::from_ptr((funcs.snd_strerror)(open_result))
                         .to_string_lossy()
                         .into_owned()
                 }
+            );
+        }
+
+        if pcm.is_null() {
+            return Err(format!(
+                "snd_pcm_open failed: {}. \
+                 No usable ALSA playback device found. Set dummy = true in server.ini to run without audio hardware.",
+                last_error
             ));
         }
 
