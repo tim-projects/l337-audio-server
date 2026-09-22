@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
+use coreaudio::audio_unit::{AudioUnit, Element, Scope, StreamFormat};
+use coreaudio::audio_unit::audio_format::LinearPcmFlags;
+use coreaudio::audio_unit::render_callback::{Args, Raw};
 
 pub struct CoreAudioAudioBackend;
 
@@ -34,18 +37,38 @@ impl AudioBackend for CoreAudioAudioBackend {
         let backend_error_cb = backend_error.clone();
 
         audio_unit
-            .set_render_callback(move |data: &mut [f32], _| {
+            .set_render_callback(move |args: Args<Raw>| {
                 if backend_error_cb.load(Ordering::SeqCst) {
-                    for sample in data.iter_mut() {
-                        *sample = 0.0;
+                    let buf_list = unsafe { &*args.data };
+                    for i in 0..buf_list.mNumberBuffers {
+                        let buffer = &buf_list.mBuffers[i as usize];
+                        if !buffer.mData.is_null() {
+                            let len = buffer.mDataByteSize as usize / std::mem::size_of::<f32>();
+                            let slice = unsafe {
+                                std::slice::from_raw_parts_mut(buffer.mData as *mut f32, len)
+                            };
+                            for sample in slice.iter_mut() {
+                                *sample = 0.0;
+                            }
+                        }
                     }
                     return Ok(());
                 }
 
                 let playing = playing_cb.load(Ordering::SeqCst);
                 if !playing {
-                    for sample in data.iter_mut() {
-                        *sample = 0.0;
+                    let buf_list = unsafe { &*args.data };
+                    for i in 0..buf_list.mNumberBuffers {
+                        let buffer = &buf_list.mBuffers[i as usize];
+                        if !buffer.mData.is_null() {
+                            let len = buffer.mDataByteSize as usize / std::mem::size_of::<f32>();
+                            let slice = unsafe {
+                                std::slice::from_raw_parts_mut(buffer.mData as *mut f32, len)
+                            };
+                            for sample in slice.iter_mut() {
+                                *sample = 0.0;
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -57,32 +80,65 @@ impl AudioBackend for CoreAudioAudioBackend {
                     buf.backend_error.store(true, Ordering::SeqCst);
                     drop(buf);
                     tracing::warn!("CoreAudio buffer cap exceeded, signalling backend error");
-                    return Err(coreaudio::Error::Io);
+                    return Err(coreaudio::Error::Unspecified);
                 }
 
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
                 let vol = *vol.lock().unwrap();
 
-                let to_copy = data.len().min(available);
-                for (d, s) in data.iter_mut().zip(buf.pcm[buf.read_pos..].iter()) {
-                    *d = s * vol;
+                let buf_list = unsafe { &*args.data };
+                let num_channels = buf_list.mNumberBuffers as usize;
+                if num_channels == 0 {
+                    return Ok(());
                 }
-                buf.read_pos += to_copy;
+                let frames_to_copy = available / num_channels;
+                let buffer_frames = if buf_list.mBuffers[0].mDataByteSize > 0 {
+                    (buf_list.mBuffers[0].mDataByteSize as usize / std::mem::size_of::<f32>()) / num_channels
+                } else {
+                    0
+                };
+                let frames = frames_to_copy.min(buffer_frames);
 
-                for sample in &mut data[to_copy..] {
-                    *sample = 0.0;
+                for ch in 0..num_channels {
+                    let buffer = &buf_list.mBuffers[ch];
+                    if buffer.mData.is_null() {
+                        continue;
+                    }
+                    let len = buffer.mDataByteSize as usize / std::mem::size_of::<f32>();
+                    let slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer.mData as *mut f32, len)
+                    };
+                    for frame in 0..frames {
+                        let src_idx = buf.read_pos + frame * num_channels + ch;
+                        if src_idx < buf.pcm.len() {
+                            slice[frame] = buf.pcm[src_idx] * vol;
+                        } else {
+                            slice[frame] = 0.0;
+                        }
+                    }
+                    for frame in frames..len {
+                        slice[frame] = 0.0;
+                    }
                 }
+                buf.read_pos += frames * num_channels;
 
                 Ok(())
             })
             .map_err(|e| format!("Failed to set render callback: {}", e))?;
 
-        let stream_format = coreaudio::audio_unit::StreamFormat::new()
-            .with_sample_rate(sample_rate as f64)
-            .with_channels(channels as usize);
+        let asbd = StreamFormat {
+            sample_rate: sample_rate as f64,
+            sample_format: coreaudio::audio_unit::SampleFormat::F32,
+            flags: LinearPcmFlags::empty(),
+            channels_per_frame: channels as u32,
+        }
+        .to_asbd();
+
+        let stream_format = StreamFormat::from_asbd(asbd)
+            .map_err(|e| format!("Failed to create stream format: {}", e))?;
 
         audio_unit
-            .set_stream_format(&stream_format)
+            .set_stream_format(&stream_format, Scope::Output)
             .map_err(|e| format!("Failed to set stream format: {}", e))?;
 
         audio_unit
