@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use tracing::warn;
 use coreaudio::audio_unit::{AudioUnit, IOType, Scope, StreamFormat, Type};
 use coreaudio::audio_unit::audio_format::LinearPcmFlags;
-use coreaudio::audio_unit::render_callback::{Args, Data, Raw};
+use coreaudio::audio_unit::render_callback::{Args, Data};
+use coreaudio::audio_unit::render_callback::data::Raw;
 
 pub struct CoreAudioAudioBackend;
 

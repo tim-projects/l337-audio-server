@@ -20,7 +20,7 @@ impl PlatformInfo {
     #[cfg(target_os = "android")]
     let (os, display_name) = ("android", "Android");
     #[cfg(target_os = "macos")]
-    let (os, display_name) = ("macOS");
+    let (os, display_name) = ("macos", "macOS");
     #[cfg(target_os = "windows")]
     let (os, display_name) = ("windows", "Windows");
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
