@@ -40,7 +40,7 @@ impl AudioBackend for CoreAudioAudioBackend {
         audio_unit
             .set_render_callback(move |args: Args<Raw>| {
                 if backend_error_cb.load(Ordering::SeqCst) {
-                    let buf_list = unsafe { &*args.data };
+                    let buf_list = unsafe { &*args.data.data };
                     for i in 0..buf_list.mNumberBuffers {
                         let buffer = &buf_list.mBuffers[i as usize];
                         if !buffer.mData.is_null() {
@@ -58,7 +58,7 @@ impl AudioBackend for CoreAudioAudioBackend {
 
                 let playing = playing_cb.load(Ordering::SeqCst);
                 if !playing {
-                    let buf_list = unsafe { &*args.data };
+                    let buf_list = unsafe { &*args.data.data };
                     for i in 0..buf_list.mNumberBuffers {
                         let buffer = &buf_list.mBuffers[i as usize];
                         if !buffer.mData.is_null() {
@@ -87,7 +87,7 @@ impl AudioBackend for CoreAudioAudioBackend {
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
                 let vol = *vol.lock().unwrap();
 
-                let buf_list = unsafe { &*args.data };
+                let buf_list = unsafe { &*args.data.data };
                 let num_channels = buf_list.mNumberBuffers as usize;
                 if num_channels == 0 {
                     return Ok(());
