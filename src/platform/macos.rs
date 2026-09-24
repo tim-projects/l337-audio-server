@@ -3,16 +3,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
-use coreaudio::audio_unit::{AudioUnit, Element, Scope, StreamFormat};
+use coreaudio::audio_unit::{AudioUnit, IOType, Scope, StreamFormat, Type};
 use coreaudio::audio_unit::audio_format::LinearPcmFlags;
-use coreaudio::audio_unit::render_callback::{Args, Raw};
+use coreaudio::audio_unit::render_callback::{Args, Data, Raw};
 
 pub struct CoreAudioAudioBackend;
 
 pub struct CoreAudioAudioOutputStream {
     playing: Arc<AtomicBool>,
     backend_error: Arc<AtomicBool>,
-    _audio_unit: coreaudio::audio_unit::AudioUnit,
+    _audio_unit: Mutex<AudioUnit>,
 }
 
 impl AudioBackend for CoreAudioAudioBackend {
@@ -25,7 +25,7 @@ impl AudioBackend for CoreAudioAudioBackend {
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
         let mut audio_unit = coreaudio::audio_unit::AudioUnit::new(
-            coreaudio::audio_unit::AudioUnitType::Output,
+            Type::IO(IOType::DefaultOutput),
         )
         .map_err(|e| format!("Failed to create AudioUnit: {}", e))?;
 
@@ -80,7 +80,7 @@ impl AudioBackend for CoreAudioAudioBackend {
                     buf.backend_error.store(true, Ordering::SeqCst);
                     drop(buf);
                     tracing::warn!("CoreAudio buffer cap exceeded, signalling backend error");
-                    return Err(coreaudio::Error::Unspecified);
+                    return Err(());
                 }
 
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
@@ -138,7 +138,7 @@ impl AudioBackend for CoreAudioAudioBackend {
             .map_err(|e| format!("Failed to create stream format: {}", e))?;
 
         audio_unit
-            .set_stream_format(&stream_format, Scope::Output)
+            .set_stream_format(stream_format, Scope::Output)
             .map_err(|e| format!("Failed to set stream format: {}", e))?;
 
         audio_unit
@@ -148,7 +148,7 @@ impl AudioBackend for CoreAudioAudioBackend {
         Ok(Box::new(CoreAudioAudioOutputStream {
             playing,
             backend_error,
-            _audio_unit: audio_unit,
+            _audio_unit: Mutex::new(audio_unit),
         }))
     }
 }
