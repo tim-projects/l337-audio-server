@@ -447,6 +447,7 @@ EOF
         ok "Systemd user service installed and started for $real_user"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
+        run_as_user "$real_user" -- systemctl --user status l337-audio-server.service --no-pager || true
         return 0
     fi
 

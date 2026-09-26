@@ -467,6 +467,7 @@ EOF
         ok "Systemd service installed and started"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
+        systemctl status l337-audio-server.service --no-pager || true
         return 0
     fi
 
