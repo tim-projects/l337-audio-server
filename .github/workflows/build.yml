@@ -223,12 +223,14 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'riscv64-linux-alsa' }}
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_AR: riscv64-linux-gnu-ar
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies (Linux RISC-V)
       run: |
         sudo apt-get update
-        sudo apt-get install -y pkg-config riscv64-linux-gnu-gcc
+        sudo apt-get install -y pkg-config gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
