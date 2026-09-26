@@ -633,7 +633,7 @@ if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
                 ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
                 echo
                 echo "To reinstall anyway, run with --force:"
-                echo "  sudo $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
+                echo "  sudo ./install.sh --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
                 exit 0
             fi
         elif version_gt "$LATEST_TAG" "$INSTALLED_VERSION"; then
