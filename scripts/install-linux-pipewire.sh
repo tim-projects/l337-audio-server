@@ -307,8 +307,10 @@ setup_systemd_user() {
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
     mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_runtime_dir" "$user_service_dir"
-    chown "${real_user}:${real_user}" "$user_runtime_dir"
-    chmod 0700 "$user_runtime_dir"
+    if [ -d "$user_runtime_dir" ]; then
+        chown "${real_user}:${real_user}" "$user_runtime_dir"
+        chmod 0700 "$user_runtime_dir"
+    fi
 
     local config_file="$user_config_dir/server.ini"
     local legacy_config_file="$user_config_dir/config.toml"
@@ -380,7 +382,6 @@ Environment=HOME=${real_home}
 Environment=XDG_CONFIG_HOME=${real_home}/.config
 Environment=XDG_CACHE_HOME=${real_home}/.cache
 Environment=XDG_STATE_HOME=${real_home}/.local/state
-Environment=XDG_RUNTIME_DIR=${real_home}/.local/run/l337-audio-server
 
 NoNewPrivileges=true
 PrivateTmp=true
