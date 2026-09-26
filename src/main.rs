@@ -75,7 +75,6 @@ fn default_port() -> u16 {
 
 fn socket_mode_from_settings(settings: &ServerSettings) -> u32 {
     settings
-        .server
         .socket_mode
         .as_deref()
         .and_then(|s| u32::from_str_radix(s.trim(), 8).ok())
@@ -360,7 +359,7 @@ async fn main() {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
                 let mut perms = meta.permissions();
-                perms.set_mode(socket_mode_from_settings(&settings));
+                perms.set_mode(socket_mode_from_settings(&settings.server));
                 let _ = std::fs::set_permissions(&path, perms);
             }
         }

@@ -27,7 +27,7 @@ pub async fn version() -> impl IntoResponse {
 
 pub async fn auth_challenge(
     axum::Extension(socket_mode): axum::Extension<bool>,
-    ConnectInfo(addr): Option<ConnectInfo<SocketAddr>>,
+    maybe_addr: Option<ConnectInfo<SocketAddr>>,
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
@@ -39,7 +39,7 @@ pub async fn auth_challenge(
             .into_response();
     }
 
-    if let Some(addr) = addr {
+    if let Some(ConnectInfo(addr)) = maybe_addr {
         if let Err(_) = rate_limiter.check(addr) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -68,7 +68,7 @@ pub async fn auth_challenge(
 
 pub async fn auth_redeem(
     axum::Extension(socket_mode): axum::Extension<bool>,
-    ConnectInfo(addr): Option<ConnectInfo<SocketAddr>>,
+    maybe_addr: Option<ConnectInfo<SocketAddr>>,
     State(_state): State<AppState>,
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(auth_layer): axum::Extension<crate::security::AuthLayer>,
@@ -83,7 +83,7 @@ pub async fn auth_redeem(
             .into_response();
     }
 
-    if let Some(addr) = addr {
+    if let Some(ConnectInfo(addr)) = maybe_addr {
         if let Err(_) = rate_limiter.check(addr) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
