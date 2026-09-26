@@ -3,52 +3,28 @@ A simple rust based audio server designed to handle playing music or podcasts wi
 
 ## Quick Install
 
-No clone required. Pick the command for your platform:
+No clone required. One command for all platforms:
 
-### Linux
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | sudo bash -s -- --pre-release
-```
-
-### macOS
-```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | bash -s -- --pre-release
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --force
 ```
 
 Or with `wget`:
 ```bash
-wget -qO- https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | sudo bash -s -- --pre-release
+wget -qO- https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --force
 ```
+
+`install.sh` auto-detects your OS and audio backend (PipeWire, ALSA, or macOS), downloads the matching binary, and sets up the service.
 
 ## Install Options
 
 | Flag | Description |
 |------|-------------|
-| `--pre-release` | Install the latest prerelease instead of stable |
 | `--force` | Force reinstall even if the same version is already installed |
 | `--no-audio` | Run without audio hardware (`dummy = true`) |
 | `--dry-run` | Show what would happen without making changes |
 | `--uninstall` | Remove the service and installed files |
 | `--remove-data` | Also remove configuration and data directories |
-
-## Platform-Specific Installers
-
-If you prefer to call the platform installer directly:
-
-### Linux PipeWire
-```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/scripts/install-linux-pipewire.sh | sudo bash
-```
-
-### Linux ALSA
-```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/scripts/install-linux-alsa.sh | sudo bash
-```
-
-### macOS
-```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/scripts/install-macos.sh | bash
-```
 
 ## Post-Install
 
@@ -84,16 +60,12 @@ tail -f ~/Library/Logs/com.l337.audio-server.log
 ## Uninstall
 
 ```bash
-# Linux
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | sudo bash -s -- --uninstall
-
-# macOS
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall
 ```
 
 Or remove data too:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tim-projects/l337-audio-server/main/install.sh | sudo bash -s -- --uninstall --remove-data
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall --remove-data
 ```
 
 ## Runtime Dependencies
