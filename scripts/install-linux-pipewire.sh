@@ -74,9 +74,9 @@ run_as_user() {
         local user_uid
         user_uid=$(id -u "$user" 2>/dev/null || echo "")
         if [ -n "$user_uid" ]; then
-            sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$user_uid" -- "$@"
+            sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$user_uid" "$@"
         else
-            sudo -u "$user" -- "$@"
+            sudo -u "$user" "$@"
         fi
     elif command -v runuser &>/dev/null; then
         runuser -u "$user" -- "$@"
