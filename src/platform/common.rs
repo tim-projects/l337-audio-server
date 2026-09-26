@@ -34,7 +34,9 @@ impl PlatformInfo {
         let arch = "armv7";
         #[cfg(target_arch = "x86")]
         let arch = "x86";
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm", target_arch = "x86")))]
+        #[cfg(target_arch = "riscv64")]
+        let arch = "riscv64";
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm", target_arch = "x86", target_arch = "riscv64")))]
         let arch = "unknown";
 
         Self { os, arch, display_name }

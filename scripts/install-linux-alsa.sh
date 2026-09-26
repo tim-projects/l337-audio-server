@@ -154,6 +154,7 @@ case "$ARCH" in
     x86_64|amd64)  ARCH_TYPE="x86_64" ;;
     aarch64|arm64) ARCH_TYPE="aarch64" ;;
     armv7l|armhf)  ARCH_TYPE="armv7" ;;
+    riscv64)       ARCH_TYPE="riscv64" ;;
     *)             fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -251,6 +252,9 @@ get_asset_name() {
             ;;
         linux-armv7)
             echo "l337-audio-server-armv7-linux-alsa"
+            ;;
+        linux-riscv64)
+            echo "l337-audio-server-riscv64-linux-alsa"
             ;;
         *)
             fail "Unsupported platform: $os/$arch"

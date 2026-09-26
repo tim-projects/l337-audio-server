@@ -23,6 +23,7 @@ on:
           - aarch64-linux-alsa
           - aarch64-linux-android
           - armv7-linux-alsa
+          - riscv64-linux-alsa
 
 env:
   CARGO_TERM_COLOR: always
@@ -215,6 +216,33 @@ jobs:
           target/armv7-unknown-linux-gnueabihf/release/l337-audio-server
         retention-days: 90
 
+  build-linux-riscv64:
+    name: Build - riscv64-linux (alsa)
+    runs-on: ubuntu-24.04-arm
+    needs: determine-version
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'riscv64-linux-alsa' }}
+    env:
+      L337_VERSION: ${{ needs.determine-version.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies (Linux RISC-V)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: riscv64gc-unknown-linux-gnu
+    - name: Build release binary
+      run: cargo build --verbose --release --target riscv64gc-unknown-linux-gnu --no-default-features --features alsa
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: l337-audio-server-riscv64-linux-alsa
+        path: |
+          target/riscv64gc-unknown-linux-gnu/release/l337-audio-server
+        retention-days: 90
+
   build-android:
     name: Build - aarch64-linux-android (${{ matrix.variant }})
     runs-on: ubuntu-latest
@@ -285,7 +313,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [determine-version, build-linux, build-windows, build-macos, build-macos-arm64, build-linux-arm64, build-linux-arm32, build-android]
+    needs: [determine-version, build-linux, build-windows, build-macos, build-macos-arm64, build-linux-arm64, build-linux-arm32, build-linux-riscv64, build-android]
     if: ${{ github.event_name != 'pull_request' && always() }}
     continue-on-error: true
     permissions:

@@ -33,6 +33,7 @@ case "$ARCH" in
     x86_64|amd64)  ARCH_TYPE="x86_64" ;;
     aarch64|arm64) ARCH_TYPE="aarch64" ;;
     armv7l|armhf)  ARCH_TYPE="armv7" ;;
+    riscv64)       ARCH_TYPE="riscv64" ;;
     *)             fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -66,7 +67,7 @@ fi
 
 # --- Determine script to download ---
 if [ "$OS_TYPE" = "linux" ]; then
-    if [ "$ARCH_TYPE" = "armv7" ]; then
+    if [ "$ARCH_TYPE" = "armv7" ] || [ "$ARCH_TYPE" = "riscv64" ]; then
         SCRIPT_NAME="install-linux-alsa"
     else
         PW_DETECTED=false
