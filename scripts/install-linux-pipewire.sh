@@ -307,6 +307,8 @@ setup_systemd_user() {
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
     mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_runtime_dir" "$user_service_dir"
+    chown "${real_user}:${real_user}" "$user_runtime_dir"
+    chmod 0700 "$user_runtime_dir"
 
     local config_file="$user_config_dir/server.ini"
     local legacy_config_file="$user_config_dir/config.toml"

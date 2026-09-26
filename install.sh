@@ -9,6 +9,7 @@ fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 
 # --- Argument parsing ---
 INSTALL_PRERELEASE=false
+ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
@@ -16,7 +17,7 @@ while [ $# -gt 0 ]; do
             echo "Usage: $0 [--pre-release] [--uninstall] [--force] ..."
             echo "Delegates to platform-specific installer on GitHub."
             exit 0 ;;
-        *) break ;;
+        *) shift ;;
     esac
 done
 
@@ -97,4 +98,4 @@ if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$SCRIPT_PATH" "$SCRIPT_UR
     fail "Failed to download installer script from $SCRIPT_URL"
 fi
 chmod +x "$SCRIPT_PATH"
-exec "$SCRIPT_PATH" "$@"
+exec "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
