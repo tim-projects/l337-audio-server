@@ -194,12 +194,14 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'armv7-linux-alsa' }}
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_AR: arm-linux-gnueabihf-ar
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies (Linux ARM32)
       run: |
         sudo apt-get update
-        sudo apt-get install -y pkg-config gcc-arm-linux-gnueabihf
+        sudo apt-get install -y pkg-config gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -226,7 +228,7 @@ jobs:
     - name: Install dependencies (Linux RISC-V)
       run: |
         sudo apt-get update
-        sudo apt-get install -y pkg-config
+        sudo apt-get install -y pkg-config riscv64-linux-gnu-gcc
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
