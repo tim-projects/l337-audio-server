@@ -13,12 +13,17 @@ port = 1337
 # "socket" (force Unix socket), or "http" (force TCP/HTTPS).
 transport = "auto"
 
+# Permissions for the Unix domain socket (octal). Default: 600.
+socket_mode = "600"
+
 # Run without opening a real audio device (for testing / headless).
 dummy = false
 
 # Auth token required for HTTP API access. Leave empty to auto-generate
 # and persist one under ~/.cache/l337-audio-server/server_token.txt.
-# For Unix socket mode, auth is skipped (socket permissions provide security).
+# Unix socket clients must still present the token (Authorization: Bearer
+# or X-L337-Token). Socket permissions control who can connect; the token
+# controls what they can do.
 token = ""
 
 # Paths to TLS certificate and key. When both are set, the server uses

@@ -25,6 +25,7 @@ wget -qO- https://github.com/tim-projects/l337-audio-server/raw/main/install.sh 
 | `--dry-run` | Show what would happen without making changes |
 | `--uninstall` | Remove the service and installed files |
 | `--remove-data` | Also remove configuration and data directories |
+| `--group-access` | *(ALSA only)* Add local users to the service group so they can reach the Unix socket |
 
 ## Post-Install
 

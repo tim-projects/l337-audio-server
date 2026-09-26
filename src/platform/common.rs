@@ -112,12 +112,13 @@ pub fn runtime_dir() -> PathBuf {
 /// Ensure the platform runtime directory exists with correct permissions.
 pub fn ensure_runtime_dir() {
     let dir = runtime_dir();
-    if !dir.exists() {
+    let created = !dir.exists();
+    if created {
         let _ = std::fs::create_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
-    {
+    if created {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(&dir) {
             let mut perms = meta.permissions();

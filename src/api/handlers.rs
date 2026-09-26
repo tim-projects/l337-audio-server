@@ -26,10 +26,10 @@ pub async fn version() -> impl IntoResponse {
 }
 
 pub async fn auth_challenge(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    ConnectInfo(addr): Option<ConnectInfo<SocketAddr>>,
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
-    axum::Extension(socket_mode): axum::Extension<bool>,
 ) -> impl IntoResponse {
     if socket_mode {
         return (
@@ -39,12 +39,14 @@ pub async fn auth_challenge(
             .into_response();
     }
 
-    if let Err(_) = rate_limiter.check(addr) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "rate_limited"})),
-        )
-            .into_response();
+    if let Some(addr) = addr {
+        if let Err(_) = rate_limiter.check(addr) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
     }
 
     match challenge_state.issue().await {
@@ -65,12 +67,12 @@ pub async fn auth_challenge(
 }
 
 pub async fn auth_redeem(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    ConnectInfo(addr): Option<ConnectInfo<SocketAddr>>,
     State(_state): State<AppState>,
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(auth_layer): axum::Extension<crate::security::AuthLayer>,
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
-    axum::Extension(socket_mode): axum::Extension<bool>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if socket_mode {
@@ -81,12 +83,14 @@ pub async fn auth_redeem(
             .into_response();
     }
 
-    if let Err(_) = rate_limiter.check(addr) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "rate_limited"})),
-        )
-            .into_response();
+    if let Some(addr) = addr {
+        if let Err(_) = rate_limiter.check(addr) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
     }
 
     let presented = match headers.get("X-L337-Challenge").and_then(|v| v.to_str().ok()) {

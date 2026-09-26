@@ -48,6 +48,8 @@ struct ServerSettings {
     #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
+    socket_mode: Option<String>,
+    #[serde(default)]
     dummy: bool,
     #[serde(default)]
     buffer_max_bytes: Option<u64>,
@@ -69,6 +71,16 @@ fn default_host() -> String {
 
 fn default_port() -> u16 {
     1337
+}
+
+fn socket_mode_from_settings(settings: &ServerSettings) -> u32 {
+    settings
+        .server
+        .socket_mode
+        .as_deref()
+        .and_then(|s| u32::from_str_radix(s.trim(), 8).ok())
+        .map(|m| m & 0o777)
+        .unwrap_or(0o600)
 }
 
 /// Path to the Unix domain socket used for local IPC.
@@ -241,7 +253,6 @@ async fn main() {
 
     // Resolve the auth token: reuse configured value, else load/persist a stable
     // generated token so the client only needs to copy it once.
-    // For Unix socket mode, auth is skipped (socket file permissions provide security).
     let token = match &settings.server.token {
         Some(t) if !t.is_empty() => t.clone(),
         _ => load_or_create_token(),
@@ -325,10 +336,7 @@ async fn main() {
         .layer(Extension(socket_mode))
         .layer(Extension(rate_limiter.clone()));
 
-    // Skip auth layer for Unix socket mode (file permissions provide security).
-    if !use_socket {
-        app = app.layer(auth_layer);
-    }
+    app = app.layer(auth_layer);
     app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
         300 * 1024 * 1024,
     ));
@@ -352,7 +360,7 @@ async fn main() {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
                 let mut perms = meta.permissions();
-                perms.set_mode(0o600);
+                perms.set_mode(socket_mode_from_settings(&settings));
                 let _ = std::fs::set_permissions(&path, perms);
             }
         }

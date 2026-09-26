@@ -681,10 +681,18 @@ curl -k -X POST https://127.0.0.1:1337/player/play \
 ./bin/l337-audio-server --transport=socket
 ```
 - Confirm socket is created at `~/.cache/l337/l337-audio-server/l337.sock` (or configured path).
-- Confirm `curl --unix-socket` can reach `/health` and `/setup`.
+- Confirm `curl --unix-socket` can reach `/health` without a token.
+- Confirm player endpoints require a token:
+  ```bash
+  curl --unix-socket ~/.cache/l337/l337-audio-server/l337.sock \
+    -k https://localhost/player/status
+  # → 401 missing or invalid token
+  ```
 
 #### 10.6 Play a local audio file over Unix socket
 ```bash
+TOKEN="<token-from-config>"
+
 curl --unix-socket ~/.cache/l337/l337-audio-server/l337.sock \
   -k -X POST https://localhost/player/play \
   -H "Authorization: Bearer $TOKEN" \

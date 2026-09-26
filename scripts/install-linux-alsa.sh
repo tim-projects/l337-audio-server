@@ -41,6 +41,7 @@ NO_AUDIO=false
 TARGET_USER=""
 TARGET_GROUP=""
 NO_AUDIO_GROUP=false
+GROUP_ACCESS=false
 PREFIX_INSTALL_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -78,16 +79,17 @@ require_root() {
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run) DRY_RUN=true; shift ;;
-        --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
-        --force|-f) FORCE=true; shift ;;
-        --user) TARGET_USER="$2"; shift 2 ;;
-        --group) TARGET_GROUP="$2"; shift 2 ;;
-        --no-audio-group) NO_AUDIO_GROUP=true; shift ;;
-        --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
-        --no-audio) NO_AUDIO=true; shift ;;
-        --uninstall|-u) UNINSTALL=true; shift ;;
-        --remove-data) REMOVE_DATA=true; shift ;;
+         --dry-run) DRY_RUN=true; shift ;;
+         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
+         --force|-f) FORCE=true; shift ;;
+         --user) TARGET_USER="$2"; shift 2 ;;
+         --group) TARGET_GROUP="$2"; shift 2 ;;
+         --group-access) GROUP_ACCESS=true; shift ;;
+         --no-audio-group) NO_AUDIO_GROUP=true; shift ;;
+         --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
+         --no-audio) NO_AUDIO=true; shift ;;
+         --uninstall|-u) UNINSTALL=true; shift ;;
+         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help)
             cat <<EOF
 Usage: $0 [OPTIONS]
@@ -102,6 +104,7 @@ Options:
   --force, -f            Force reinstall even if the same version is already installed
   --user <username>      Run service as this user (default: create l337 system user)
   --group <groupname>    Run service under this group (default: l337)
+  --group-access         Add local users to the service group for Unix socket access
   --no-audio-group       Do not add service user to the audio group
   --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
@@ -352,6 +355,21 @@ setup_systemd() {
         fi
     fi
 
+    if [ "$GROUP_ACCESS" = true ]; then
+        local client_users=()
+        [ -n "${SUDO_USER:-}" ] && client_users+=("$SUDO_USER")
+        [ -n "$TARGET_USER" ] && client_users+=("$TARGET_USER")
+        for u in "${client_users[@]}"; do
+            if id "$u" &>/dev/null; then
+                if ! id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$GROUP_NAME"; then
+                    info "Adding $u to group $GROUP_NAME (Unix socket access)"
+                    usermod -aG "$GROUP_NAME" "$u" || \
+                        warn "Failed to add $u to $GROUP_NAME; they will not be able to reach the socket."
+                fi
+            fi
+        done
+    fi
+
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
     chmod 0755 "$CONFIG_DIR"
 
@@ -373,6 +391,10 @@ setup_systemd() {
             if [ "$NO_AUDIO" = "true" ]; then
                 dummy_value="true"
             fi
+            local socket_mode_value="600"
+            if [ "$GROUP_ACCESS" = true ]; then
+                socket_mode_value="660"
+            fi
             cat > "$config_file" <<EOF
 [server]
 host = "0.0.0.0"
@@ -380,6 +402,7 @@ port = 1337
 token = "${token}"
 dummy = ${dummy_value}
 transport = "auto"
+socket_mode = "${socket_mode_value}"
 EOF
             echo
             echo "========================================="
@@ -426,7 +449,7 @@ StateDirectory=l337-audio-server
 CacheDirectory=l337-audio-server
 ConfigurationDirectory=l337-audio-server
 RuntimeDirectory=l337-audio-server
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0750
 
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -468,6 +491,21 @@ EOF
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
         systemctl status l337-audio-server.service --no-pager || true
+        if [ "$GROUP_ACCESS" = true ]; then
+            echo
+            echo "========================================="
+            echo " Unix Socket Access"
+            echo "========================================="
+            echo
+            echo "  Socket: /run/l337-audio-server/l337.sock"
+            echo "  Group:  $GROUP_NAME (mode 0660)"
+            echo
+            echo "  Token auth is enforced on the socket."
+            echo "  Log out and back in (or run \`newgrp $GROUP_NAME\`)"
+            echo "  before the client can connect."
+            echo "========================================="
+            echo
+        fi
         return 0
     fi
 
