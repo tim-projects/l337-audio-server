@@ -70,10 +70,16 @@ require_root() {
 run_as_user() {
     local user="$1"
     shift
-    if command -v runuser &>/dev/null; then
+    if command -v sudo &>/dev/null; then
+        local user_uid
+        user_uid=$(id -u "$user" 2>/dev/null || echo "")
+        if [ -n "$user_uid" ]; then
+            sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$user_uid" -- "$@"
+        else
+            sudo -u "$user" -- "$@"
+        fi
+    elif command -v runuser &>/dev/null; then
         runuser -u "$user" -- "$@"
-    elif command -v sudo &>/dev/null; then
-        sudo -u "$user" "$@"
     else
         su - "$user" -c "$*"
     fi
