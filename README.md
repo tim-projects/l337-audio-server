@@ -68,6 +68,15 @@ Or remove data too:
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall --remove-data
 ```
 
+## Runtime Dependencies
+
+- **yt-dlp** — required for YouTube URL playback. Install separately:
+  - Debian/Ubuntu: `sudo apt install yt-dlp`
+  - macOS: `brew install yt-dlp`
+  - pip: `pip install yt-dlp`
+
+The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return an error and the `/health` endpoint will show `yt_dlp: false`.
+
 ## Troubleshooting
 
 ### Installer falls back to the wrong backend or won’t run
@@ -126,12 +135,3 @@ sudo mv /opt/l337-audio-server/l337-audio-server.bak /opt/l337-audio-server/l337
 sudo systemctl daemon-reload
 sudo systemctl start l337-audio-server.service
 ```
-
-## Runtime Dependencies
-
-- **yt-dlp** — required for YouTube URL playback. Install separately:
-  - Debian/Ubuntu: `sudo apt install yt-dlp`
-  - macOS: `brew install yt-dlp`
-  - pip: `pip install yt-dlp`
-
-The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return an error and the `/health` endpoint will show `yt_dlp: false`.
