@@ -22,6 +22,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 # ---------------------------------------------------------------------------
 REPO="tim-projects/l337-audio-server"
 INSTALL_DIR="/opt/l337-audio-server"
+PREFIX_INSTALL_DIR=""
 USER_NAME="l337"
 GROUP_NAME="l337"
 
@@ -66,6 +67,18 @@ require_root() {
     fi
 }
 
+run_as_user() {
+    local user="$1"
+    shift
+    if command -v runuser &>/dev/null; then
+        runuser -u "$user" -- "$@"
+    elif command -v sudo &>/dev/null; then
+        sudo -u "$user" "$@"
+    else
+        su - "$user" -c "$*"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -75,6 +88,7 @@ while [ $# -gt 0 ]; do
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f) FORCE=true; shift ;;
         --user) TARGET_USER="$2"; shift 2 ;;
+        --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
         --no-audio) NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
@@ -92,6 +106,7 @@ Options:
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
   --user <username>      Install for a specific user only (default: all PipeWire users)
+  --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
@@ -101,6 +116,8 @@ EOF
         *) fail "Unknown option: $1" ;;
     esac
 done
+
+INSTALL_DIR="${PREFIX_INSTALL_DIR:-/opt/l337-audio-server}"
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -209,7 +226,7 @@ get_asset_name() {
             echo "l337-audio-server-x86_64-linux-pipewire"
             ;;
         linux-aarch64)
-            fail "aarch64 Linux binaries are not yet available in GitHub releases. Please build from source."
+            echo "l337-audio-server-aarch64-linux-pipewire"
             ;;
         *)
             fail "Unsupported platform: $os/$arch"
@@ -277,11 +294,11 @@ user_has_pipewire() {
         return 0
     fi
 
-    if su - "$user" -c "systemctl --user is-active --quiet pipewire 2>/dev/null" 2>/dev/null; then
+    if run_as_user "$user" -- systemctl --user is-active --quiet pipewire 2>/dev/null; then
         return 0
     fi
 
-    if su - "$user" -c 'command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1' 2>/dev/null; then
+    if run_as_user "$user" -- sh -c 'command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1' 2>/dev/null; then
         return 0
     fi
 
@@ -299,14 +316,17 @@ setup_systemd_user() {
 
     local real_home
     real_home=$(eval echo "~${real_user}")
-    local user_config_dir="$real_home/.config/l337-audio-server"
-    local user_cache_dir="$real_home/.cache/l337-audio-server"
-    local user_state_dir="$real_home/.local/state/l337-audio-server"
-    local user_runtime_dir="$real_home/.local/run/l337-audio-server"
+    local xdg_env
+    xdg_env=$(run_as_user "$real_user" sh -c 'echo XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-} XDG_CACHE_HOME=${XDG_CACHE_HOME:-} XDG_STATE_HOME=${XDG_STATE_HOME:-} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}') || true
+    eval "$xdg_env" 2>/dev/null || true
+    local user_config_dir="${XDG_CONFIG_HOME:-$real_home/.config}/l337-audio-server"
+    local user_cache_dir="${XDG_CACHE_HOME:-$real_home/.cache}/l337-audio-server"
+    local user_state_dir="${XDG_STATE_HOME:-$real_home/.local/state}/l337-audio-server"
+    local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$real_user")}/l337-audio-server"
     local user_service_dir="$real_home/.config/systemd/user"
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
-    mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_runtime_dir" "$user_service_dir"
+    mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_service_dir"
     if [ -d "$user_runtime_dir" ]; then
         chown "${real_user}:${real_user}" "$user_runtime_dir"
         chmod 0700 "$user_runtime_dir"
@@ -378,10 +398,8 @@ ExecStart=${INSTALL_DIR}/l337-audio-server
 Restart=on-failure
 RestartSec=2
 
-Environment=HOME=${real_home}
-Environment=XDG_CONFIG_HOME=${real_home}/.config
-Environment=XDG_CACHE_HOME=${real_home}/.cache
-Environment=XDG_STATE_HOME=${real_home}/.local/state
+RuntimeDirectory=l337-audio-server
+RuntimeDirectoryMode=0700
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -402,8 +420,8 @@ EOF
     chmod 0644 "$user_service_file"
 
     info "Stopping user service..."
-    su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
-    if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+    run_as_user "$real_user" -- systemctl --user stop l337-audio-server.service 2>/dev/null || true
+    if run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null; then
         fail "Service l337-audio-server.service failed to stop"
     fi
 
@@ -414,28 +432,28 @@ EOF
     mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
-    su - "$real_user" -c "systemctl --user daemon-reload" || true
-    su - "$real_user" -c "systemctl --user enable l337-audio-server.service" || true
-    su - "$real_user" -c "systemctl --user start l337-audio-server.service" || true
+    run_as_user "$real_user" -- systemctl --user daemon-reload || true
+    run_as_user "$real_user" -- systemctl --user enable l337-audio-server.service || true
+    run_as_user "$real_user" -- systemctl --user start l337-audio-server.service || true
 
     sleep 1
-    if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+    if run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null; then
         ok "Systemd user service installed and started for $real_user"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
         return 0
     fi
 
-    su - "$real_user" -c "journalctl --user -u l337-audio-server.service --since '1 minute ago' --no-pager" 2>/dev/null || true
+    run_as_user "$real_user" -- journalctl --user -u l337-audio-server.service --since '1 minute ago' --no-pager 2>/dev/null || true
     warn "New binary failed to start for $real_user. Rolling back..."
-    su - "$real_user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
+    run_as_user "$real_user" -- systemctl --user stop l337-audio-server.service 2>/dev/null || true
     if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
         if mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server" 2>/dev/null; then
             chmod 0755 "$INSTALL_DIR/l337-audio-server"
-            su - "$real_user" -c "systemctl --user daemon-reload" || true
-            su - "$real_user" -c "systemctl --user start l337-audio-server.service" 2>/dev/null || true
+            run_as_user "$real_user" -- systemctl --user daemon-reload || true
+            run_as_user "$real_user" -- systemctl --user start l337-audio-server.service 2>/dev/null || true
             sleep 1
-            if su - "$real_user" -c "systemctl --user is-active --quiet l337-audio-server.service" 2>/dev/null; then
+            if run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null; then
                 warn "Rollback successful — old binary restored and running for $real_user"
                 rm -f "$INSTALL_DIR/l337-audio-server.bak"
                 rm -rf "$INSTALL_DIR/.tmp"
@@ -497,6 +515,13 @@ uninstall_user_service() {
     while IFS= read -r user; do
         local real_home
         real_home=$(eval echo "~${user}")
+        local xdg_env
+        xdg_env=$(run_as_user "$user" sh -c 'echo XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-} XDG_CACHE_HOME=${XDG_CACHE_HOME:-} XDG_STATE_HOME=${XDG_STATE_HOME:-} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}') || true
+        eval "$xdg_env" 2>/dev/null || true
+        local user_config_dir="${XDG_CONFIG_HOME:-$real_home/.config}/l337-audio-server"
+        local user_cache_dir="${XDG_CACHE_HOME:-$real_home/.cache}/l337-audio-server"
+        local user_state_dir="${XDG_STATE_HOME:-$real_home/.local/state}/l337-audio-server"
+        local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$user")}/l337-audio-server"
         local user_service_dir="$real_home/.config/systemd/user"
         local user_service_file="$user_service_dir/l337-audio-server.service"
 
@@ -506,22 +531,22 @@ uninstall_user_service() {
 
         any_installed=true
         info "Removing user service for $user..."
-        su - "$user" -c "systemctl --user stop l337-audio-server.service" 2>/dev/null || true
-        su - "$user" -c "systemctl --user disable l337-audio-server.service" 2>/dev/null || true
+        run_as_user "$user" -- systemctl --user stop l337-audio-server.service 2>/dev/null || true
+        run_as_user "$user" -- systemctl --user disable l337-audio-server.service 2>/dev/null || true
 
         rm -f "$user_service_file"
-        su - "$user" -c "systemctl --user daemon-reload" 2>/dev/null || true
+        run_as_user "$user" -- systemctl --user daemon-reload 2>/dev/null || true
 
         if [ "$REMOVE_DATA" = true ]; then
             info "Removing user data for $user..."
-            rm -rf "$real_home/.config/l337-audio-server" \
-                  "$real_home/.cache/l337-audio-server" \
-                  "$real_home/.local/state/l337-audio-server" \
-                  "$real_home/.local/run/l337-audio-server"
+            rm -rf "$user_config_dir" \
+                  "$user_cache_dir" \
+                  "$user_state_dir" \
+                  "$user_runtime_dir"
             ok "Data removed for $user"
         else
             warn "User data retained for $user:"
-            warn "  $real_home/.config/l337-audio-server"
+            warn "  $user_config_dir"
         fi
     done < <(get_all_login_users)
 

@@ -20,12 +20,14 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 # ---------------------------------------------------------------------------
 REPO="tim-projects/l337-audio-server"
 INSTALL_DIR="/opt/l337-audio-server"
+PREFIX_INSTALL_DIR=""
 CONFIG_DIR="/etc/l337-audio-server"
 STATE_DIR="/var/lib/l337-audio-server"
 CACHE_DIR="/var/cache/l337-audio-server"
 SYSTEMD_SERVICE="/etc/systemd/system/l337-audio-server.service"
 USER_NAME="l337"
 GROUP_NAME="l337"
+CREATED_USER=false
 
 # ---------------------------------------------------------------------------
 # Flags
@@ -36,6 +38,10 @@ REMOVE_DATA=false
 INSTALL_PRERELEASE=false
 FORCE=false
 NO_AUDIO=false
+TARGET_USER=""
+TARGET_GROUP=""
+NO_AUDIO_GROUP=false
+PREFIX_INSTALL_DIR=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,6 +81,10 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=true; shift ;;
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f) FORCE=true; shift ;;
+        --user) TARGET_USER="$2"; shift 2 ;;
+        --group) TARGET_GROUP="$2"; shift 2 ;;
+        --no-audio-group) NO_AUDIO_GROUP=true; shift ;;
+        --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
         --no-audio) NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
@@ -90,6 +100,10 @@ Options:
   --pre-release, --prerelease
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
+  --user <username>      Run service as this user (default: create l337 system user)
+  --group <groupname>    Run service under this group (default: l337)
+  --no-audio-group       Do not add service user to the audio group
+  --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
@@ -99,6 +113,31 @@ EOF
         *) fail "Unknown option: $1" ;;
     esac
 done
+
+INSTALL_DIR="${PREFIX_INSTALL_DIR:-/opt/l337-audio-server}"
+
+detect_nologin_shell() {
+    for shell in /usr/sbin/nologin /sbin/nologin /bin/false; do
+        if [ -f "$shell" ]; then
+            echo "$shell"
+            return
+        fi
+    done
+    echo "/bin/false"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    USER_NAME="${TARGET_USER:-$(id -un)}"
+    GROUP_NAME="${TARGET_GROUP:-$(id -gn)}"
+else
+    if [ -n "$TARGET_USER" ]; then
+        USER_NAME="$TARGET_USER"
+        GROUP_NAME="${TARGET_GROUP:-$TARGET_USER}"
+    else
+        USER_NAME="${USER_NAME:-l337}"
+        GROUP_NAME="${GROUP_NAME:-l337}"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -114,6 +153,7 @@ esac
 case "$ARCH" in
     x86_64|amd64)  ARCH_TYPE="x86_64" ;;
     aarch64|arm64) ARCH_TYPE="aarch64" ;;
+    armv7l|armhf)  ARCH_TYPE="armv7" ;;
     *)             fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -207,7 +247,10 @@ get_asset_name() {
             echo "l337-audio-server-x86_64-linux-alsa"
             ;;
         linux-aarch64)
-            fail "aarch64 Linux binaries are not yet available in GitHub releases. Please build from source."
+            echo "l337-audio-server-aarch64-linux-alsa"
+            ;;
+        linux-armv7)
+            echo "l337-audio-server-armv7-linux-alsa"
             ;;
         *)
             fail "Unsupported platform: $os/$arch"
@@ -268,22 +311,41 @@ setup_systemd() {
 
     info "Configuring systemd service..."
 
-    if ! id -g "$GROUP_NAME" &>/dev/null; then
-        info "Creating system group: $GROUP_NAME"
-        groupadd --system "$GROUP_NAME" || \
-            fail "Failed to create system group $GROUP_NAME. Run the installer with sudo and ensure groupadd is available."
-    fi
-
-    if ! id "$USER_NAME" &>/dev/null; then
-        info "Creating system user: $USER_NAME"
-        useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$GROUP_NAME" "$USER_NAME" || \
-            fail "Failed to create system user $USER_NAME. Run the installer with sudo and ensure useradd is available."
-    fi
-
-    if ! groups "$USER_NAME" 2>/dev/null | grep -qw "audio"; then
-        info "Adding $USER_NAME to audio group for ALSA access"
-        usermod -aG audio "$USER_NAME" || \
-            warn "Failed to add $USER_NAME to audio group; ALSA access may not be available."
+    if [ "$(id -u)" -ne 0 ]; then
+        USER_NAME="${TARGET_USER:-$(id -un)}"
+        GROUP_NAME="${TARGET_GROUP:-$(id -gn)}"
+        info "Non-root install: using existing user $USER_NAME / group $GROUP_NAME"
+    else
+        if [ -n "$TARGET_USER" ]; then
+            USER_NAME="$TARGET_USER"
+            GROUP_NAME="${TARGET_GROUP:-$USER_NAME}"
+            info "Using specified user $USER_NAME / group $GROUP_NAME"
+        else
+            USER_NAME="${USER_NAME:-l337}"
+            GROUP_NAME="${GROUP_NAME:-l337}"
+            if ! id -g "$GROUP_NAME" &>/dev/null; then
+                info "Creating system group: $GROUP_NAME"
+                groupadd --system "$GROUP_NAME" || \
+                    fail "Failed to create system group $GROUP_NAME. Run the installer with sudo and ensure groupadd is available."
+            fi
+            if ! id "$USER_NAME" &>/dev/null; then
+                info "Creating system user: $USER_NAME"
+                local nologin_shell
+                nologin_shell=$(detect_nologin_shell)
+                useradd --system --no-create-home --shell "$nologin_shell" --gid "$GROUP_NAME" "$USER_NAME" || \
+                    fail "Failed to create system user $USER_NAME. Run the installer with sudo and ensure useradd is available."
+                CREATED_USER=true
+            fi
+            if [ "$NO_AUDIO_GROUP" = false ]; then
+                if ! groups "$USER_NAME" 2>/dev/null | grep -qw "audio"; then
+                    info "Adding $USER_NAME to audio group for ALSA access"
+                    usermod -aG audio "$USER_NAME" || \
+                        warn "Failed to add $USER_NAME to audio group; ALSA access may not be available."
+                fi
+            else
+                info "Skipping audio group membership (--no-audio-group)"
+            fi
+        fi
     fi
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
@@ -334,7 +396,7 @@ EOF
         fi
     fi
 
-    chown "$USER_NAME:$GROUP_NAME" "$config_file" || \
+    chown "$USER_NAME:$GROUP_NAME" "$config_file" 2>/dev/null || \
         fail "Failed to set ownership on $config_file."
     chmod 0640 "$config_file"
     ok "Configuration ready at $config_file"
@@ -487,11 +549,15 @@ uninstall_linux() {
     if [ "$REMOVE_DATA" = true ]; then
         info "Removing data directories..."
         rm -rf "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"
-        if id "$USER_NAME" &>/dev/null; then
-            userdel "$USER_NAME" 2>/dev/null || true
-        fi
-        if getent group "$GROUP_NAME" &>/dev/null; then
-            groupdel "$GROUP_NAME" 2>/dev/null || true
+        if [ "$CREATED_USER" = true ]; then
+            if id "$USER_NAME" &>/dev/null; then
+                userdel "$USER_NAME" 2>/dev/null || true
+            fi
+            if getent group "$GROUP_NAME" &>/dev/null; then
+                groupdel "$GROUP_NAME" 2>/dev/null || true
+            fi
+        else
+            info "Skipping user/group removal (not created by installer)"
         fi
         ok "Data directories removed"
     else
@@ -522,8 +588,16 @@ if [ "$DRY_RUN" = true ]; then
         info "  Download the latest ALSA binary for $OS_TYPE/$ARCH_TYPE"
         info "  Install to: $INSTALL_DIR/l337-audio-server"
         info "  Configure systemd service: $SYSTEMD_SERVICE"
-        info "  Create user/group: $USER_NAME/$GROUP_NAME"
-        info "  Add $USER_NAME to audio group"
+        if [ "$(id -u)" -ne 0 ] || [ -n "$TARGET_USER" ]; then
+            info "  Run as existing user: $USER_NAME / group: $GROUP_NAME"
+        else
+            info "  Create user/group: $USER_NAME/$GROUP_NAME"
+            if [ "$NO_AUDIO_GROUP" = true ]; then
+                info "  Skip audio group membership (--no-audio-group)"
+            else
+                info "  Add $USER_NAME to audio group"
+            fi
+        fi
         info "  Create directories: $INSTALL_DIR, $STATE_DIR, $CACHE_DIR, $CONFIG_DIR"
     fi
     exit 0

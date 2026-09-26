@@ -32,7 +32,8 @@ esac
 case "$ARCH" in
     x86_64|amd64)  ARCH_TYPE="x86_64" ;;
     aarch64|arm64) ARCH_TYPE="aarch64" ;;
-    *) fail "Unsupported architecture: $ARCH" ;;
+    armv7l|armhf)  ARCH_TYPE="armv7" ;;
+    *)             fail "Unsupported architecture: $ARCH" ;;
 esac
 
 # --- Determine release tag ---
@@ -65,25 +66,29 @@ fi
 
 # --- Determine script to download ---
 if [ "$OS_TYPE" = "linux" ]; then
-    PW_DETECTED=false
-    if systemctl is-active --quiet pipewire.service 2>/dev/null || \
-       [ -S "/run/pipewire/0" ] || [ -d "/run/pipewire" ]; then
-        PW_DETECTED=true
-    fi
-    if [ "$PW_DETECTED" = false ]; then
-        while IFS=: read -r username _ uid _ _ home _; do
-            if [ "$uid" -ge 1000 ] && [ -d "/run/user/$uid" ]; then
-                if [ -S "/run/user/$uid/pipewire-0" ] || [ -S "/run/user/$uid/pulse/native" ]; then
-                    PW_DETECTED=true
-                    break
-                fi
-            fi
-        done < /etc/passwd
-    fi
-    if [ "$PW_DETECTED" = true ]; then
-        SCRIPT_NAME="install-linux-pipewire"
-    else
+    if [ "$ARCH_TYPE" = "armv7" ]; then
         SCRIPT_NAME="install-linux-alsa"
+    else
+        PW_DETECTED=false
+        if systemctl is-active --quiet pipewire.service 2>/dev/null || \
+           [ -S "/run/pipewire/0" ] || [ -d "/run/pipewire" ]; then
+            PW_DETECTED=true
+        fi
+        if [ "$PW_DETECTED" = false ]; then
+            while IFS=: read -r username _ uid _ _ home _; do
+                if [ "$uid" -ge 1000 ] && [ -d "/run/user/$uid" ]; then
+                    if [ -S "/run/user/$uid/pipewire-0" ] || [ -S "/run/user/$uid/pulse/native" ]; then
+                        PW_DETECTED=true
+                        break
+                    fi
+                fi
+            done < /etc/passwd
+        fi
+        if [ "$PW_DETECTED" = true ]; then
+            SCRIPT_NAME="install-linux-pipewire"
+        else
+            SCRIPT_NAME="install-linux-alsa"
+        fi
     fi
 elif [ "$OS_TYPE" = "macos" ]; then
     SCRIPT_NAME="install-macos"
