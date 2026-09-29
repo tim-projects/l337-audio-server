@@ -143,6 +143,29 @@ fn load_settings() -> Result<Settings, config::ConfigError> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("l337-audio-server {}", env!("L337_VERSION"));
+        println!();
+        println!("Usage: l337-audio-server [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("  --dummy          Run without audio hardware (no soundcard required)");
+        println!("  --transport=MODE Set transport: auto, socket, http (default: auto)");
+        println!("  --token          Print the path to the persisted auth token file and exit");
+        println!("  --version, -v    Print version and exit");
+        println!("  --help, -h       Print this help message");
+        println!();
+        println!("Configuration: /etc/l337-audio-server/server.ini or ./server.ini");
+        println!("Docs: https://github.com/tim-projects/l337-audio-server");
+        return;
+    }
+
+    if std::env::args().any(|a| a == "--token") {
+        let path = token_file_path();
+        println!("{}", path.display());
+        return;
+    }
+
     if std::env::args().any(|a| a == "--version" || a == "-v") {
         println!("l337-audio-server {}", env!("L337_VERSION"));
         return;
@@ -516,11 +539,11 @@ fn ensure_config_file() {
     }
 }
 
-/// Load a previously generated token from the cache dir, or create + persist one.
-/// Keeps the token stable across restarts when none is configured explicitly.
-fn load_or_create_token() -> String {
-    // Prefer the systemd-provided STATE_DIRECTORY (persistent, l337-owned),
-    // falling back to ~/.cache/... for dev/desktop runs.
+/// Compute the path to the persisted auth token file.
+///
+/// This mirrors the directory selection in `load_or_create_token()` so that
+/// `--token` reports the same path the server would use at runtime.
+fn token_file_path() -> PathBuf {
     let dir = if let Ok(dir) = std::env::var("STATE_DIRECTORY") {
         if !dir.is_empty() {
             PathBuf::from(dir)
@@ -536,8 +559,14 @@ fn load_or_create_token() -> String {
             .join("l337")
             .join("l337-audio-server")
     };
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("server_token.txt");
+    dir.join("server_token.txt")
+}
+
+/// Load a previously generated token from the cache dir, or create + persist one.
+///
+/// Keeps the token stable across restarts when none is configured explicitly.
+fn load_or_create_token() -> String {
+    let path = token_file_path();
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
@@ -549,6 +578,7 @@ fn load_or_create_token() -> String {
         }
     }
     let generated = crate::auth_challenge::generate_token();
+    let _ = std::fs::create_dir_all(path.parent().expect("token path has a parent"));
     if let Err(e) = crate::secrets_fs::atomic_write_secret(&path, &generated) {
         tracing::warn!("Could not persist token to {}: {}", path.display(), e);
     }
