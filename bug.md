@@ -95,12 +95,46 @@ The client user (`vscode`) cannot access either the socket or the token file. Ad
 - Player should be able to connect to the systemd audio server.
 - Token should be auto-discoverable, or pairing should be available for local sockets.
 
+## Player-Side Changes (implemented in l337-player)
+
+The server-side fix (socket-mode-restricted `/setup`) changed the player's token
+discovery landscape. The player was updated to handle both transports:
+
+### Local Unix socket
+`connect_audio_server()` calls `fetch_setup_token(url)` on `unix://` URLs as a
+fallback, which now succeeds against the server's socket-mode `/setup`. When
+that endpoint is unavailable, the token stays empty and the auth probe reports
+it as missing rather than hiding the failure.
+
+### Remote TCP server
+`/setup` returns 404 here by design. `APIClient.get_setup_token()` now raises
+`SetupEndpointUnavailable` on 404 so callers can distinguish "the server
+disabled the endpoint" from a transient error, and never retry discovery.
+
+Changes:
+
+1. **`api_client.py`**: `get_setup_token()` raises `SetupEndpointUnavailable`
+   on 404; `fetch_setup_token()` propagates it and always closes the client.
+2. **`audio_server_manager.py`**: `_handle_token_rejection()` (renamed from
+   `_handle_remote_token_rejection()`) now runs for **both** transports. Remote
+   servers try `/setup` once; on 404, or for local sockets, it falls through to
+   manual entry. `AcceptTokenScreen` gained a `password` input so the user can
+   paste a token when none could be auto-discovered.
+3. **`startup.py`**: `_try_discover_remote_token()` surfaces a clear
+   "enter `server_token` manually" warning on 404. Local mode gained
+   `_warn_local_token_rejected()`, which reports the socket path and the
+   `--group-access` hint instead of offering to install a second local server.
+
 ## Related code
 - `src/client/core/audio_servers.py:_check_systemd_audio_server_socket()`
 - `src/client/core/audio_servers.py:_read_systemd_server_token()`
 - `src/client/core/audio_servers.py:connect_audio_server()`
+- `src/client/core/audio_servers.py:fetch_setup_token()`
+- `src/client/core/audio_servers.py:set_active_paired_device()`
 - `src/client/tui/startup.py:_run_audio_server_checks()`
-- `src/client/tui/audio_server_manager.py:_handle_remote_token_rejection()`
+- `src/client/tui/startup.py:_warn_local_token_rejected()`
+- `src/client/tui/audio_server_manager.py:_handle_token_rejection()`
+- `src/client/core/api_client.py:APIClient.get_setup_token()`
 
 ## Notes
 - Port discrepancy: The bug report shows port `5355`, but the current installer
