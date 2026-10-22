@@ -330,6 +330,7 @@ async fn main() {
     let mut app = Router::new()
         .route("/health", get(handlers::health))
         .route("/version", get(handlers::version))
+        .route("/setup", get(handlers::setup))
         .route("/", get(|| async { "L337 Audio Server" }))
         .route("/player/play", post(handlers::play))
         .route("/player/play/stream", post(handlers::upload_stream))

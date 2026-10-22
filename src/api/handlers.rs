@@ -25,6 +25,26 @@ pub async fn version() -> impl IntoResponse {
     }))
 }
 
+/// Unauthenticated setup endpoint that returns the server's auth token.
+///
+/// This exists so that clients running on the same host (e.g., via Unix socket)
+/// can discover the token when they cannot read it from the config or cache
+/// files directly (e.g., different user, systemd isolation).
+pub async fn setup(
+    axum::Extension(auth_layer): axum::Extension<crate::security::AuthLayer>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+) -> impl IntoResponse {
+    let token = auth_layer.current_token();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "socket_mode": socket_mode
+        })),
+    )
+        .into_response()
+}
+
 pub async fn auth_challenge(
     axum::Extension(socket_mode): axum::Extension<bool>,
     maybe_addr: Option<ConnectInfo<SocketAddr>>,

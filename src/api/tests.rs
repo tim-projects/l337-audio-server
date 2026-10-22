@@ -1,9 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use crate::api::handlers::{AppState, SendableEngine, get_status, pause, play, seek, set_speed, set_volume, upload_stream};
+    use crate::api::handlers::{AppState, SendableEngine, get_status, pause, play, seek, set_speed, set_volume, upload_stream, setup};
     use crate::api::models::{SeekPayload, SpeedPayload, Track, VolumePayload};
     use crate::player::engine::PlayerEngine;
     use crate::player::storage::StorageManager;
+    use crate::security::AuthLayer;
     use axum::body::Body;
     use axum::extract::{Json, State};
     use axum::http::{HeaderMap, HeaderValue};
@@ -174,5 +175,22 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["state"], "playing");
         assert_eq!(json["current_track"]["track_id"], "upload-track");
+    }
+
+    #[tokio::test]
+    async fn test_api_setup() {
+        let auth_layer = AuthLayer::new("test-token-1234".to_string());
+        let socket_mode = false;
+        let response = setup(
+            axum::Extension(auth_layer),
+            axum::Extension(socket_mode),
+        )
+        .await;
+        let resp = response.into_response();
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["token"], "test-token-1234");
+        assert_eq!(json["socket_mode"], false);
     }
 }
