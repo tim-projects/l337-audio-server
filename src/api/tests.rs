@@ -179,6 +179,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_setup() {
+        // When socket_mode is true (Unix socket), /setup returns the token.
+        let auth_layer = AuthLayer::new("test-token-1234".to_string());
+        let socket_mode = true;
+        let response = setup(
+            axum::Extension(auth_layer),
+            axum::Extension(socket_mode),
+        )
+        .await;
+        let resp = response.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["token"], "test-token-1234");
+        assert_eq!(json["socket_mode"], true);
+
+        // When socket_mode is false (TCP), /setup returns 404.
         let auth_layer = AuthLayer::new("test-token-1234".to_string());
         let socket_mode = false;
         let response = setup(
@@ -187,10 +204,6 @@ mod tests {
         )
         .await;
         let resp = response.into_response();
-        let body = resp.into_body();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["token"], "test-token-1234");
-        assert_eq!(json["socket_mode"], false);
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }
