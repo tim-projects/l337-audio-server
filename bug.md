@@ -282,28 +282,56 @@ this branch; `test_token_discovery.py` adds 16 new tests covering: socket-/tcp-`
 
 ## 9. Validation results (current `main` + fix, live)
 
-A fresh release binary of current `main` with the engine.rs fix was built and tested live on a
-dummy-mode Unix-socket server (`XDG_RUNTIME_DIR=/tmp/l337-test/rt3`, token `test-token-xyz`).
-Endpoints and playback were driven through the player's own `APIClient`:
+Two binaries were validated. Both confirm the fix.
+
+### (a) Locally built binary — `cargo build --release --no-default-features` (§2)
+Built from the worktree with the fix applied (`bin/` md5 `19f4491`). Dummy-mode Unix-socket server
+(`XDG_RUNTIME_DIR=/tmp/l337-test/rt3`, token `test-token-xyz`), driven by the player's `APIClient`:
 
 | Step | Result |
 |------|--------|
 | `GET /version` | `200 {"version":"0.0.0-dev"}` |
 | `GET /health` | `200 {"capabilities":{"yt_dlp":true},"status":"ok"}` (first call ~7 s: lazy yt-dlp probe) |
 | `/player/status` no token | `401 missing or invalid token` (auth layer active) |
-| `APIClient.get_setup_token()` (`GET /setup`) | returns `test-token-xyz` — **token discovery works, no manual entry needed** |
-| **stream AAC** (`test_a440.m4a`, `channels: None`) | server log: `WARN decode_to_pcm: channel layout unknown, assuming stereo codec=CodecType(4100)` → then `INFO load_and_play(current): Playing (duration Some(6)s)` — **no panic** ✅ |
+| `APIClient.get_setup_token()` (`GET /setup`) | returns `test-token-xyz` — token discovery works, no manual entry needed |
+| **stream AAC** (`test_a440.m4a`, `channels: None`) | `WARN ... assuming stereo codec=CodecType(4100)` → `INFO load_and_play: Playing (duration Some(6)s)` — no panic ✅ |
 | `/player/status` after AAC | `state=playing, track_id=aac-fixed, duration_sec=6` |
-| **stream WAV** (`test_a440.wav`, regression) | `INFO ... channels: Some(FRONT_LEFT \| FRONT_RIGHT) ... Playing (duration Some(6)s)` → `status=playing` → `pause` → `status=paused` ✅ |
+| **stream WAV** (regression) | `INFO ... channels: Some(FRONT_LEFT \| FRONT_RIGHT) ... Playing` → `playing` → `pause` → `paused` ✅ |
+`grep -ci panic` on this run: `0`.
 
-### Server log excerpt (proof the fix fires and the crash is gone)
+### (b) Official CI release binary — `l337-audio-server-x86_64-linux-alsa` (v2026.10.23-1)
+After pushing `41e5a7c` to `main`, the "Build Release Binaries" workflow (run #90) succeeded and the
+artifact was downloaded. The binary (md5 `d29bbb056`) has the fix baked in (`strings` contains the
+`assuming stereo` warn). Installed to `bin/` and validated on `XDG_RUNTIME_DIR=/tmp/l337-test/rt4`:
+
 ```
-WARN l337_audio_server::player::engine: decode_to_pcm: channel layout unknown,
-     assuming stereo codec=CodecType(4100)          ← AAC, channels: None (was the panic site)
-INFO l337_audio_server::player::engine:
-     load_and_play(current): Playing (duration Some(6)s)   ← plays through, no divide-by-zero
+1) /setup discovery -> test-token-xyz
+2) AAC upload OK
+3) AAC status: playing cur aac-ci dur 6     ← AAC no longer panics; plays 6 s
+4) WAV upload OK
+5) WAV status: playing cur wav-ci            ← WAV regression: plays
+6) WAV pause: paused                         ← pause works
 ```
-`grep -ci panic server-fixed.log` → `0` (vs. the v0.1.0 run which panicked on the same file).
+CI server log (definitive):
+```
+INFO decode_to_pcm: probing result codec=CodecType(4100) ... channels: None ...   ← AAC (crash case)
+WARN decode_to_pcm: channel layout unknown, assuming stereo codec=CodecType(4100)  ← fix fires
+INFO load_and_play(current): Playing (duration Some(6)s)                            ← plays, no panic
+INFO decode_to_pcm: probing result codec=CodecType(264) channels: Some(FRONT_LEFT | FRONT_RIGHT)  ← WAV
+INFO load_and_play(current): Playing (duration Some(6)s)                            ← WAV plays
+panic count: 0
+```
+
+### Reproducer (now passes on the fixed build)
+```bash
+# server
+setsid env L337__SERVER__DUMMY=true L337__SERVER__TOKEN=test-token-xyz \
+  XDG_RUNTIME_DIR=/tmp/l337-test/rt4 \
+  ./bin/l337-audio-server --dummy --transport=socket &
+# client (player APIClient)
+c=APIClient("unix:///tmp/l337-test/rt4/l337.sock", token="test-token-xyz", timeout=30)
+await c.upload_stream("/player/play/stream", <aac bytes>, track_id="x", title="A440 AAC")
+(await c.get_status())["state"] == "playing"   # dur 6, no Disconnect/500
 
 ### Reproducer (now *passes*)
 ```bash
@@ -318,11 +346,11 @@ setsid env L337__SERVER__DUMMY=true L337__SERVER__TOKEN=test-token-xyz \
 
 ## 9b. Remaining to be verified
 
-- The player **TUI** (`bootstrap`/TUI) itself was not launched; this report uses the player's
-  `APIClient` programmatically over the Unix socket, which exercises the same auth/connect/play
-  code paths the TUI drives, without needing an interactive TTY.
-- `/auth/challenge` + `/auth/redeem` (the remote-token flow on current `main`) was not tested
-  live; it is covered by the server's own unit/integration tests.
+- The player **TUI** (`bootstrap`/TUI) itself was not launched; this report drives the server via the
+  player's `APIClient` over the Unix socket, which exercises the same auth/connect/play code paths
+  the TUI uses, without an interactive TTY.
+- `/auth/challenge` + `/auth/redeem` (the remote-token flow on current `main`) was not tested live;
+  it is covered by the server's own unit/integration tests.
 
 ## 10. Recommendation / next steps
 
