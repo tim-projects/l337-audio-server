@@ -2,22 +2,49 @@
 
 ## Build
 
-**Disk space is tight.** All cargo artifacts (registry, target dir, build cache) must live under `/tmp`. The in-repo `target/` must not be used for builds. Do not run `cargo build`, `cargo check`, or `cargo test` directly — they will write large temp files into `./target` and exhaust disk space.
+**Disk space is tight.** All cargo artifacts (registry, target dir, build cache) must live under `/tmp`. The in-repo `target/` must not be used for builds.
 
-Always use the project build script. Do not background builds:
+### Preferred path: fetch a prebuilt binary via GitHub Actions
+
+The CI workflow `Build Release Binaries` produces a Linux `x86_64` binary for
+every push to `main`. Prefer downloading that artifact instead of building
+locally — it avoids the Rust toolchain entirely:
+
+```bash
+gh workflow run "Build Release Binaries"           # start a build for HEAD
+gh run list --workflow="Build Release Binaries" --limit=3
+gh run download <run-id>                           # fetch artifacts
+```
+
+If a binary is not committed to the repo and no fresh artifact is available
+locally, use a `gh run download ...` to obtain the one built from the current
+commit. Local builds are a last resort (see below).
+
+### Local build (fallback only — only when explicitly requested)
+
+Only build for **Linux** locally. All other platforms (Windows, macOS,
+Android, iOS, etc.) are built and packaged exclusively by GitHub Actions
+runners. Do not attempt cross-compilation or native builds for non-Linux
+targets on this machine.
+
+Never run `cargo build`, `cargo check`, or `cargo test` directly — they will
+write large temp files into `./target` and exhaust disk space. Always use the
+project build script, which pins `CARGO_TARGET_DIR=/tmp/l337-build`
+and copies the finished binary to `bin/l337-audio-server`:
 
 ```bash
 CARGO_HOME=/tmp/cargo-home ./scripts/build.sh
 ```
 
-The script sets `CARGO_TARGET_DIR=/tmp/l337-build` and copies the finished binary to `bin/l337-audio-server` for deployment. `cargo check` is acceptable because it does not produce a linked binary and uses far less disk.
+`cargo check` (which does not produce a linked binary) is acceptable when you
+need to verify code compiles:
 
-If you need to verify code compiles without producing a binary, use:
 ```bash
 CARGO_HOME=/tmp/cargo-home cargo check
 ```
 
-Do not create a `.cargo/config.toml` in the repo. The build script already handles `CARGO_TARGET_DIR` via environment variable.
+Do not create a `.cargo/config.toml` in the repo. The build script already
+handles `CARGO_TARGET_DIR` via environment variable.
 
 ## Disk space hygiene
 
@@ -31,13 +58,19 @@ If `/tmp` is low, clean build artifacts:
 rm -rf /tmp/l337-build /tmp/cargo-home
 ```
 
-Never let cargo write into `./target/`. If a `target/` directory already exists in the repo, it should be moved to `/tmp` or removed.
+Never let cargo write into `./target/`. If a `target/` directory already exists
+in the repo, it should be moved to `/tmp` or removed.
 
 ## Local build targets
 
-Only build for **Linux** locally. All other platforms (Windows, macOS, Android, iOS, etc.) are built and packaged exclusively by GitHub Actions runners. Do not attempt cross-compilation or native builds for non-Linux targets on this machine.
+Only build for **Linux** locally. All other platforms (Windows, macOS,
+Android, iOS, etc.) are built and packaged exclusively by GitHub Actions
+runners. Do not attempt cross-compilation or native builds for non-Linux
+targets on this machine.
 
-For cross-platform syntax and type checking without producing a binary, `cargo check` is acceptable, but it must still use the `/tmp` cargo home as documented above.
+For cross-platform syntax and type checking without producing a binary,
+`cargo check` is acceptable, but it must still use the `/tmp` cargo home as
+documented above.
 
 ## Development Guidelines
 
