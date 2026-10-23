@@ -882,8 +882,17 @@ pub(crate) fn decode_to_pcm(
     }
 
     let sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.unwrap_or_default().count() as u16;
-    Ok((pcm, sample_rate, channels))
+    // Some containers (notably AAC-LC) probe with `channels == None`; treating an unknown
+    // layout as 0 would later divide by zero in duration calculations. Default to stereo,
+    // the overwhelmingly common sane fallback, and warn so the assumption is visible.
+    let channels = match codec_params.channels {
+        Some(layout) => layout.count() as u16,
+        None => {
+            tracing::warn!(codec = ?codec_params.codec, "decode_to_pcm: channel layout unknown, assuming stereo");
+            2
+        }
+    };
+    Ok((pcm, sample_rate, channels.max(1)))
 }
 
 pub(crate) fn resample_interleaved(
