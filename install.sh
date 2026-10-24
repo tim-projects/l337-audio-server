@@ -38,7 +38,7 @@ case "$ARCH" in
 esac
 
 # --- Determine release tag ---
-RELEASE_RESPONSE=$(mktemp)
+RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
 if [ "$INSTALL_PRERELEASE" = true ]; then
     if ! curl -sS -L --connect-timeout 15 --max-time 60 \
         -o "$RELEASE_RESPONSE" \
@@ -91,6 +91,8 @@ if [ "$OS_TYPE" = "linux" ]; then
             SCRIPT_NAME="install-linux-alsa"
         fi
     fi
+elif [ "$OS_TYPE" = "linux" ] && [ -n "${TERMUX_VERSION:-}" ]; then
+    SCRIPT_NAME="install-android-termux"
 elif [ "$OS_TYPE" = "macos" ]; then
     SCRIPT_NAME="install-macos"
 else
@@ -99,7 +101,7 @@ fi
 
 # --- Download and execute ---
 SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/scripts/${SCRIPT_NAME}.sh"
-SCRIPT_PATH=$(mktemp /tmp/l337-install-XXXXXX.sh)
+SCRIPT_PATH=$(mktemp "${TMPDIR:-/tmp}/l337-install-XXXXXX.sh")
 if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$SCRIPT_PATH" "$SCRIPT_URL"; then
     fail "Failed to download installer script from $SCRIPT_URL"
 fi
