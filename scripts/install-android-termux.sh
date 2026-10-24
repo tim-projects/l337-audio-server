@@ -41,6 +41,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Termux reports `uname -s` = Linux; identify as termux so logs don't look
+# like a Linux/systemd install. Same signal the player uses: TERMUX_VERSION.
+ARCH_TYPE="$(uname -m)"
+case "$ARCH_TYPE" in
+    aarch64|arm64) ARCH_TYPE="aarch64" ;;
+    *) ARCH_TYPE="$(uname -m)" ;;
+esac
+info "Platform: termux / $ARCH_TYPE ($(uname -s) $(uname -m))"
+info "User-space install — no root or sudo required (Termux has neither)"
+
 # --- Requirement checks (fail fast with actionable help) ---
 MISSING=()
 
@@ -53,9 +63,21 @@ case "$(uname -m)" in
     *) MISSING+=("aarch64 architecture (detected: $(uname -m))") ;;
 esac
 
-if ! command -v sv &>/dev/null; then
-    MISSING+=("termux-services  →  pkg install termux-services")
+# `sv` is the termux-services (runit) supervision binary. This installer is a
+# runit service installer, so it cannot do anything without it — check it
+# first and name the exact install command. Note: $PREFIX/var/service is NOT
+# a reliable signal (the openssh package ships service dirs there without
+# termux-services), so only the binary is checked.
+if ! command -v sv >/dev/null 2>&1; then
+    fail "termux-services is not installed: 'sv' not found in PATH.
+
+This installer registers the server as a runit service, which needs termux-services:
+  pkg install termux-services
+
+After installing, open a NEW Termux session — runit (runsvdir) only starts
+with a new session — then re-run this installer."
 fi
+ok "sv found: $(command -v sv) (termux-services)"
 
 # The android build (compiled with --features pulseaudio) prefers PulseAudio,
 # because direct AAudio from a Termux console process is unreliable:
@@ -181,7 +203,9 @@ exec "$BINARY" --transport=socket
 SVCEOF
 chmod +x "${RUN_SCRIPT}"
 
-sv up "${SERVICE_NAME}" || fail "sv up failed; check 'sv status ${SERVICE_NAME}'"
+sv up "${SERVICE_NAME}" || fail "sv up failed.
+If termux-services was installed in THIS session, runit is not running yet —
+open a NEW Termux session and re-run. Otherwise: 'sv status ${SERVICE_NAME}'"
 
 # Give the server a moment to create socket + token, then link it
 sleep 2

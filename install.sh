@@ -6,6 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 REPO="tim-projects/l337-audio-server"
 
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 
 # --- Argument parsing ---
 INSTALL_PRERELEASE=false
@@ -37,6 +38,17 @@ case "$ARCH" in
     *)             fail "Unsupported architecture: $ARCH" ;;
 esac
 
+# Termux reports `uname -s` = Linux, so it must be detected as a variant of
+# linux (same signal the player uses: TERMUX_VERSION). Termux is a user-space
+# install: there is no sudo and no root, so it must be routed before the
+# generic linux branch and never reach a systemd/root installer.
+OS_VARIANT="$OS_TYPE"
+if [ "$OS_TYPE" = "linux" ] && [ -n "${TERMUX_VERSION:-}" ]; then
+    OS_VARIANT="termux"
+fi
+
+info "Platform: $OS_VARIANT / $ARCH_TYPE"
+
 # --- Determine release tag ---
 RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
 if [ "$INSTALL_PRERELEASE" = true ]; then
@@ -66,7 +78,9 @@ if [ -z "$TAG" ]; then
 fi
 
 # --- Determine script to download ---
-if [ "$OS_TYPE" = "linux" ]; then
+if [ "$OS_VARIANT" = "termux" ]; then
+    SCRIPT_NAME="install-android-termux"
+elif [ "$OS_TYPE" = "linux" ]; then
     if [ "$ARCH_TYPE" = "armv7" ] || [ "$ARCH_TYPE" = "riscv64" ]; then
         SCRIPT_NAME="install-linux-alsa"
     else
@@ -91,8 +105,6 @@ if [ "$OS_TYPE" = "linux" ]; then
             SCRIPT_NAME="install-linux-alsa"
         fi
     fi
-elif [ "$OS_TYPE" = "linux" ] && [ -n "${TERMUX_VERSION:-}" ]; then
-    SCRIPT_NAME="install-android-termux"
 elif [ "$OS_TYPE" = "macos" ]; then
     SCRIPT_NAME="install-macos"
 else
