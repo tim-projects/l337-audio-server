@@ -1,6 +1,7 @@
 #!/bin/bash
 # install-android-termux.sh — Termux binary installer (runit/termux-services, no systemd)
-# Requirements: Termux + aarch64 + termux-services. Fails fast with help if missing.
+# Requirements: Termux + aarch64 + termux-services + running pulseaudio.
+# Fails fast with actionable help if any are missing.
 set -euo pipefail
 
 REPO="tim-projects/l337-audio-server"
@@ -29,6 +30,9 @@ while [ $# -gt 0 ]; do
             echo "  - Running in Termux (TERMUX_VERSION set)"
             echo "  - aarch64 architecture"
             echo "  - pkg install termux-services"
+            echo "  - pulseaudio installed and running:"
+            echo "      pkg install pulseaudio"
+            echo "      pulseaudio --start --exit-idle-time=-1"
             echo ""
             echo "Options:"
             echo "  --pre-release   Install latest prerelease instead of stable release"
@@ -51,6 +55,15 @@ esac
 
 if ! command -v sv &>/dev/null; then
     MISSING+=("termux-services  →  pkg install termux-services")
+fi
+
+# The android build (compiled with --features pulseaudio) prefers PulseAudio,
+# because direct AAudio from a Termux console process is unreliable:
+# AAudio_createStreamBuilder returns null and the server exits at startup.
+if ! command -v pulseaudio &>/dev/null; then
+    MISSING+=("pulseaudio  →  pkg install pulseaudio")
+elif ! pulseaudio --check &>/dev/null; then
+    MISSING+=("pulseaudio daemon  →  pulseaudio --start --exit-idle-time=-1")
 fi
 
 if [ "${#MISSING[@]}" -gt 0 ]; then
@@ -148,7 +161,7 @@ if [ -S "${SOCKET_SOURCE}" ]; then
 fi
 
 mkdir -p "${SERVICE_DIR}"
-cat > "${RUN_SCRIPT}" <<'SVCEOF'
+    cat > "${RUN_SCRIPT}" <<'SVCEOF'
 #!/data/data/com.termux/files/usr/bin/sh
 # Termux-services (runit) run script for l337-audio-server.
 # runit restarts this script if the process exits, giving basic supervision.
@@ -158,6 +171,11 @@ if [ ! -x "$BINARY" ]; then
     echo "l337-audio-server binary not found at $BINARY" >&2
     exit 1
 fi
+
+# The android build dlopens libpulse-simple.so from $PREFIX/lib, which the
+# NDK-built binary cannot find on its own (no DT_RUNPATH, and Termux leaves
+# LD_LIBRARY_PATH unset). Without this the PulseAudio backend is skipped.
+export LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "$BINARY" --transport=socket
 SVCEOF

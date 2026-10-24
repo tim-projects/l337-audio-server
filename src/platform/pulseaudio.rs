@@ -15,8 +15,12 @@ mod ffi {
     #[repr(C)]
     pub struct pa_sample_spec {
         pub format: i32,
-        pub channels: u8,
+        // NOTE: field order must match PulseAudio's pa_sample_spec exactly:
+        // { format, rate, channels }. Declaring channels before rate swaps the
+        // two values at the ABI boundary, which sends rate=channels and
+        // channels=rate and makes pa_simple_new fail with PA_ERR_INVALID.
         pub rate: u32,
+        pub channels: u8,
     }
 
     pub const PA_SAMPLE_FLOAT32LE: i32 = 5;
