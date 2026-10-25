@@ -206,17 +206,24 @@ impl AudioBackend for AndroidAudioBackend {
             // On Android/Termux, direct AAudio/OpenSL ES from a console process
             // is unreliable. Prefer PulseAudio if available (Termux standard).
             let pa_backend = crate::platform::pulseaudio::PulseAudioAudioBackend;
-            if let Ok(stream) = pa_backend.start_stream(
+            match pa_backend.start_stream(
                 name,
                 sample_rate,
                 channels,
                 audio_buffer.clone(),
                 volume.clone(),
             ) {
-                tracing::info!("Using PulseAudio backend for Android");
-                return Ok(stream);
+                Ok(stream) => {
+                    tracing::info!("Using PulseAudio backend for Android");
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "PulseAudio not available on this Android device, falling back to AAudio: {}",
+                        err
+                    );
+                }
             }
-            tracing::warn!("PulseAudio not available on this Android device, falling back to AAudio");
         }
 
         // Fallback: native AAudio via NDK.

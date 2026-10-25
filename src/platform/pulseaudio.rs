@@ -190,10 +190,13 @@ impl AudioBackend for PulseAudioAudioBackend {
         audio_buffer: Arc<Mutex<AudioBuffer>>,
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
+        // Soname order matters: Termux's pulseaudio package ships no
+        // `libpulse-simple.so.0` symlink (only `libpulse.so.0` is symlinked), so
+        // the plain `.so` must be tried first or the first attempt always fails.
         let lib = Arc::new(
             unsafe {
-                libloading::Library::new("libpulse-simple.so.0")
-                    .or_else(|_| libloading::Library::new("libpulse-simple.so"))
+                libloading::Library::new("libpulse-simple.so")
+                    .or_else(|_| libloading::Library::new("libpulse-simple.so.0"))
                     .map_err(|e| format!("Failed to load libpulse-simple: {}", e))?
             },
         );
