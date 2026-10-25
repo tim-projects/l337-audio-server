@@ -1,78 +1,67 @@
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tracing::warn;
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
-mod ffi {
-    #[repr(C)]
-    pub struct pa_simple {
-        _private: [u8; 0],
-    }
+// PulseAudio's client library must be linked at build time (see build.rs and
+// plan-android.md 4.6/4.8): on bionic a dlopen'd libpulse fails client-side in
+// pa_stream_new with PA_ERR_INVALID, while direct calls from a linked binary
+// work. These declarations resolve at load time against $PREFIX/lib/libpulse*.
 
-    #[repr(C)]
-    pub struct pa_sample_spec {
-        pub format: i32,
-        // NOTE: field order must match PulseAudio's pa_sample_spec exactly:
-        // { format, rate, channels }. Declaring channels before rate swaps the
-        // two values at the ABI boundary, which sends rate=channels and
-        // channels=rate and makes pa_simple_new fail with PA_ERR_INVALID.
-        pub rate: u32,
-        pub channels: u8,
-    }
+#[repr(C)]
+struct pa_sample_spec {
+    format: c_int,
+    // Field order must match PulseAudio's pa_sample_spec exactly:
+    // { format, rate, channels }. Declaring channels before rate swaps the
+    // two values at the ABI boundary, which sends rate=channels and
+    // channels=rate and makes pa_simple_new fail with PA_ERR_INVALID.
+    rate: u32,
+    channels: u8,
+}
 
-    pub const PA_SAMPLE_FLOAT32LE: i32 = 5;
-    pub const PA_DIRECTION_PLAYBACK: i32 = 0;
+const PA_SAMPLE_FLOAT32LE: c_int = 5;
+const PA_DIRECTION_PLAYBACK: c_int = 0;
 
-    #[allow(non_camel_case_types)]
-    pub type pa_simple_new_fn = unsafe extern "C" fn(
-        server: *const std::os::raw::c_char,
-        name: *const std::os::raw::c_char,
-        dir: i32,
-        dev: *const std::os::raw::c_char,
-        stream_name: *const std::os::raw::c_char,
+extern "C" {
+    fn pa_simple_new(
+        server: *const c_char,
+        name: *const c_char,
+        dir: c_int,
+        dev: *const c_char,
+        stream_name: *const c_char,
         ss: *const pa_sample_spec,
-        map: *const std::os::raw::c_void,
-        attr: *const std::os::raw::c_void,
-        error: *mut i32,
-    ) -> *mut pa_simple;
-
-    #[allow(non_camel_case_types)]
-    pub type pa_simple_write_fn = unsafe extern "C" fn(
-        s: *mut pa_simple,
-        data: *const std::os::raw::c_void,
+        map: *const c_void,
+        attr: *const c_void,
+        error: *mut c_int,
+    ) -> *mut c_void;
+    fn pa_simple_write(
+        s: *mut c_void,
+        data: *const c_void,
         bytes: usize,
-        error: *mut i32,
-    ) -> i32;
-
-    #[allow(non_camel_case_types)]
-    pub type pa_simple_drain_fn = unsafe extern "C" fn(
-        s: *mut pa_simple,
-        error: *mut i32,
-    ) -> i32;
-
-    #[allow(non_camel_case_types)]
-    pub type pa_simple_free_fn = unsafe extern "C" fn(s: *mut pa_simple);
-
-    #[allow(non_camel_case_types)]
-    pub type pa_simple_get_latency_fn = unsafe extern "C" fn(
-        s: *mut pa_simple,
-        error: *mut i32,
-    ) -> u64;
+        error: *mut c_int,
+    ) -> c_int;
+    fn pa_simple_drain(s: *mut c_void, error: *mut c_int) -> c_int;
+    fn pa_simple_free(s: *mut c_void);
+    fn pa_simple_get_latency(s: *mut c_void, error: *mut c_int) -> u64;
+    fn pa_strerror(error: c_int) -> *const c_char;
 }
 
-#[derive(Clone, Copy)]
-struct PulseAudioFuncs {
-    pa_simple_new: ffi::pa_simple_new_fn,
-    pa_simple_write: ffi::pa_simple_write_fn,
-    pa_simple_drain: ffi::pa_simple_drain_fn,
-    pa_simple_free: ffi::pa_simple_free_fn,
-    pa_simple_get_latency: ffi::pa_simple_get_latency_fn,
+/// Render a PA error code as a human-readable string.
+fn pa_error_string(error: c_int) -> String {
+    unsafe {
+        let ptr = pa_strerror(error);
+        if ptr.is_null() {
+            return format!("error {}", error);
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
 }
 
-struct SendSyncPulseAudio(*mut ffi::pa_simple);
+struct SendSyncPulseAudio(*mut c_void);
 unsafe impl Send for SendSyncPulseAudio {}
 unsafe impl Sync for SendSyncPulseAudio {}
 
@@ -89,13 +78,11 @@ pub struct PulseAudioAudioBackend;
 
 pub struct PulseAudioAudioOutputStream {
     state: Arc<PulseAudioState>,
-    funcs: PulseAudioFuncs,
-    _lib: Arc<libloading::Library>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl PulseAudioAudioOutputStream {
-    fn writer_loop(state: Arc<PulseAudioState>, funcs: PulseAudioFuncs) {
+    fn writer_loop(state: Arc<PulseAudioState>) {
         const CHUNK_FRAMES: usize = 256;
         let silence_buf = vec![0u8; CHUNK_FRAMES * 4];
 
@@ -144,9 +131,9 @@ impl PulseAudioAudioOutputStream {
                 drop(buf);
 
                 let result = unsafe {
-                    (funcs.pa_simple_write)(
+                    pa_simple_write(
                         simple_ptr,
-                        bytes.as_ptr() as *const std::os::raw::c_void,
+                        bytes.as_ptr() as *const c_void,
                         bytes.len(),
                         std::ptr::null_mut(),
                     )
@@ -160,9 +147,9 @@ impl PulseAudioAudioOutputStream {
             } else if !playing {
                 drop(buf);
                 let result = unsafe {
-                    (funcs.pa_simple_write)(
+                    pa_simple_write(
                         simple_ptr,
-                        silence_buf.as_ptr() as *const std::os::raw::c_void,
+                        silence_buf.as_ptr() as *const c_void,
                         silence_buf.len(),
                         std::ptr::null_mut(),
                     )
@@ -190,60 +177,23 @@ impl AudioBackend for PulseAudioAudioBackend {
         audio_buffer: Arc<Mutex<AudioBuffer>>,
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
-        // Soname order matters: Termux's pulseaudio package ships no
-        // `libpulse-simple.so.0` symlink (only `libpulse.so.0` is symlinked), so
-        // the plain `.so` must be tried first or the first attempt always fails.
-        let lib = Arc::new(
-            unsafe {
-                libloading::Library::new("libpulse-simple.so")
-                    .or_else(|_| libloading::Library::new("libpulse-simple.so.0"))
-                    .map_err(|e| format!("Failed to load libpulse-simple: {}", e))?
-            },
-        );
+        let name = c"l337-audio-server";
+        let stream_name = c"Audio Output";
 
-        let pa_simple_new: libloading::Symbol<ffi::pa_simple_new_fn> = unsafe {
-            lib.get(b"pa_simple_new\0")
-                .map_err(|e| format!("Failed to load pa_simple_new: {}", e))?
-        };
-        let pa_simple_write: libloading::Symbol<ffi::pa_simple_write_fn> = unsafe {
-            lib.get(b"pa_simple_write\0")
-                .map_err(|e| format!("Failed to load pa_simple_write: {}", e))?
-        };
-        let pa_simple_drain: libloading::Symbol<ffi::pa_simple_drain_fn> = unsafe {
-            lib.get(b"pa_simple_drain\0")
-                .map_err(|e| format!("Failed to load pa_simple_drain: {}", e))?
-        };
-        let pa_simple_free: libloading::Symbol<ffi::pa_simple_free_fn> = unsafe {
-            lib.get(b"pa_simple_free\0")
-                .map_err(|e| format!("Failed to load pa_simple_free: {}", e))?
-        };
-        let pa_simple_get_latency: libloading::Symbol<ffi::pa_simple_get_latency_fn> = unsafe {
-            lib.get(b"pa_simple_get_latency\0")
-                .map_err(|e| format!("Failed to load pa_simple_get_latency: {}", e))?
-        };
-
-        let funcs = PulseAudioFuncs {
-            pa_simple_new: *pa_simple_new,
-            pa_simple_write: *pa_simple_write,
-            pa_simple_drain: *pa_simple_drain,
-            pa_simple_free: *pa_simple_free,
-            pa_simple_get_latency: *pa_simple_get_latency,
-        };
-
-        let ss = ffi::pa_sample_spec {
-            format: ffi::PA_SAMPLE_FLOAT32LE,
+        let ss = pa_sample_spec {
+            format: PA_SAMPLE_FLOAT32LE,
             channels: channels as u8,
             rate: sample_rate,
         };
 
-        let mut error = 0;
+        let mut error: c_int = 0;
         let simple = unsafe {
-            (funcs.pa_simple_new)(
+            pa_simple_new(
                 std::ptr::null(),
-                b"l337-audio-server\0" as *const u8 as *const std::os::raw::c_char,
-                ffi::PA_DIRECTION_PLAYBACK,
+                name.as_ptr(),
+                PA_DIRECTION_PLAYBACK,
                 std::ptr::null(),
-                b"Audio Output\0" as *const u8 as *const std::os::raw::c_char,
+                stream_name.as_ptr(),
                 &ss,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -252,7 +202,7 @@ impl AudioBackend for PulseAudioAudioBackend {
         };
 
         if simple.is_null() {
-            return Err(format!("pa_simple_new failed with error {}", error));
+            return Err(format!("pa_simple_new failed: {}", pa_error_string(error)));
         }
 
         let state = Arc::new(PulseAudioState {
@@ -266,13 +216,11 @@ impl AudioBackend for PulseAudioAudioBackend {
 
         let state_clone = state.clone();
         let thread = thread::spawn(move || {
-            PulseAudioAudioOutputStream::writer_loop(state_clone, funcs);
+            PulseAudioAudioOutputStream::writer_loop(state_clone);
         });
 
         Ok(Box::new(PulseAudioAudioOutputStream {
             state,
-            funcs,
-            _lib: lib,
             thread: Mutex::new(Some(thread)),
         }))
     }
@@ -302,7 +250,7 @@ impl AudioOutputStream for PulseAudioAudioOutputStream {
 
         if !simple_ptr.is_null() {
             unsafe {
-                (self.funcs.pa_simple_free)(simple_ptr);
+                pa_simple_free(simple_ptr);
             }
         }
 

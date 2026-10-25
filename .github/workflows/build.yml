@@ -279,18 +279,16 @@ jobs:
         else
           cargo build --verbose --release --target aarch64-linux-android
         fi
-    # PulseAudio's client library must be mapped at process start (DT_NEEDED),
-    # not opened later with dlopen: on bionic/Termux the dlopen path fails in
-    # pa_stream_new (PA_ERR_INVALID) while the same calls in a linkage-linked
-    # binary succeed. See plan-android.md section 4. The run script must export
-    # LD_LIBRARY_PATH=$PREFIX/lib, because the NDK-built binary has no runpath.
-    - name: Link PulseAudio deps into the termux binary
+    # The termux variant links PulseAudio directly (build.rs adds the stubs in
+    # scripts/pulse-stubs as the link-time SONAME provider; the real libs
+    # resolve at runtime). This must NOT be dlopen'd: on bionic the dlopen path
+    # fails client-side in pa_stream_new (PA_ERR_INVALID). See plan-android.md.
+    # The run script must export LD_LIBRARY_PATH=$PREFIX/lib, because the
+    # NDK-built binary has no runpath.
+    - name: Verify PulseAudio linkage (termux)
       if: ${{ matrix.variant == 'termux' }}
       run: |
-        BIN=target/aarch64-linux-android/release/l337-audio-server
-        patchelf --version || (sudo apt-get update && sudo apt-get install -y patchelf)
-        patchelf --add-needed libpulse-simple.so --add-needed libpulse.so "$BIN"
-        readelf -d "$BIN" | grep NEEDED
+        readelf -d target/aarch64-linux-android/release/l337-audio-server | grep NEEDED
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:

@@ -1,0 +1,10 @@
+PULSE_0 {
+  global:
+    pa_simple_new;
+    pa_simple_write;
+    pa_simple_drain;
+    pa_simple_free;
+    pa_simple_get_latency;
+  local:
+    *;
+};

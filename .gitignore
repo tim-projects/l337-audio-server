@@ -22,6 +22,10 @@ Cargo.lock
 *.so
 *.dylib
 
+# PulseAudio link-time stubs (deliberately committed; build.rs links them for
+# the termux Android variant — see scripts/pulse-stubs/pulse-stub.c)
+!scripts/pulse-stubs/*.so
+
 # Cache and Logs
 cache/
 logs/
