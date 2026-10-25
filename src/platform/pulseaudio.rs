@@ -26,7 +26,7 @@ struct pa_sample_spec {
 const PA_SAMPLE_FLOAT32LE: c_int = 5;
 const PA_DIRECTION_PLAYBACK: c_int = 0;
 
-extern "C" {
+unsafe extern "C" {
     fn pa_simple_new(
         server: *const c_char,
         name: *const c_char,
