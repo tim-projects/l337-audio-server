@@ -5,15 +5,50 @@
 set -euo pipefail
 
 REPO="tim-projects/l337-audio-server"
-ASSET="l337-audio-server-aarch64-android-termux"
+# ASSET is selected below based on the host Termux libc flavor.
 INSTALL_DIR="${HOME}/.local/share/l337-player/bin"
 BINARY_PATH="${INSTALL_DIR}/l337-audio-server"
 SERVICE_NAME="l337-audio-server"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+TMPDIR="${TMPDIR:-/tmp}"
+SERVICE_DIR="${PREFIX}/var/service/${SERVICE_NAME}"
+RUN_SCRIPT="${SERVICE_DIR}/run"
+SOCKET_SOURCE="${TMPDIR}/l337-audio-server/runtime/l337.sock"
+SOCKET_TARGET="${HOME}/.cache/l337/l337-audio-server/l337.sock"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+
+# Stop every running instance of the server before the binary is replaced, the
+# way scripts/install-systemd.sh stops its unit before deploying. Two things
+# can be running: the termux-services (runit) service and a manually started
+# process. A survivor keeps the Unix socket actively listening, and the new
+# binary refuses to remove/rebind it and exits — so an update appears to do
+# nothing. Wait until the processes are actually gone before deploying.
+stop_existing_instances() {
+    if [ -d "${SERVICE_DIR}" ]; then
+        sv down "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    if pgrep -f "${BINARY_PATH}" >/dev/null 2>&1; then
+        info "Stopping running l337-audio-server instances..."
+        pkill -f "${BINARY_PATH}" >/dev/null 2>&1 || true
+    fi
+
+    for _ in $(seq 1 10); do
+        pgrep -f "${BINARY_PATH}" >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+
+    local pids
+    pids="$(pgrep -f "${BINARY_PATH}" | tr '\n' ' ' || true)"
+    fail "l337-audio-server is still running (pid: ${pids}).
+A running instance holds the Unix socket and instance lock, so the new
+binary cannot start. Stop it manually and re-run the installer:
+    kill ${pids}"
+}
 
 # Parse arguments
 INSTALL_PRERELEASE=false
@@ -50,6 +85,10 @@ case "$ARCH_TYPE" in
 esac
 info "Platform: termux / $ARCH_TYPE ($(uname -s) $(uname -m))"
 info "User-space install — no root or sudo required (Termux has neither)"
+
+# Termux uses the bionic (NDK) android build, which dlopens the PulseAudio
+# client at runtime (built with `--features pulseaudio` in CI).
+ASSET="l337-audio-server-aarch64-android-termux"
 
 # --- Requirement checks (fail fast with actionable help) ---
 MISSING=()
@@ -146,6 +185,7 @@ if ! head -c4 "${BINARY_PATH}.tmp" | grep -q $'\x7fELF'; then
 fi
 
 chmod +x "${BINARY_PATH}.tmp"
+stop_existing_instances
 mv "${BINARY_PATH}.tmp" "${BINARY_PATH}"
 ok "Installed ${BINARY_PATH}"
 
@@ -153,9 +193,6 @@ ok "Installed ${BINARY_PATH}"
 # The android build binds at <TMPDIR>/l337-audio-server/runtime/l337.sock.
 # Players with AndroidPlatformPlugin (which computes this path natively) don't
 # need it; the symlink keeps older clients working.
-TMPDIR="${TMPDIR:-/tmp}"
-SOCKET_SOURCE="${TMPDIR}/l337-audio-server/runtime/l337.sock"
-SOCKET_TARGET="${HOME}/.cache/l337/l337-audio-server/l337.sock"
 ensure_socket_symlink() {
     if [ ! -S "${SOCKET_SOURCE}" ]; then
         return 1
@@ -169,18 +206,8 @@ ensure_socket_symlink() {
 }
 
 # --- Register as termux-services service ---
-SERVICE_DIR="${PREFIX}/var/service/${SERVICE_NAME}"
-RUN_SCRIPT="${SERVICE_DIR}/run"
-
+# Old instances were already stopped before the binary was deployed above.
 info "Registering termux-services service..."
-
-# Stop any running instance so the new run script takes effect cleanly
-sv down "${SERVICE_NAME}" 2>/dev/null || true
-if [ -S "${SOCKET_SOURCE}" ]; then
-    warn "Socket still active after sv down; a manual instance may be running"
-    pkill -f "l337-audio-server --transport=socket" 2>/dev/null || true
-    sleep 1
-fi
 
 mkdir -p "${SERVICE_DIR}"
     cat > "${RUN_SCRIPT}" <<'SVCEOF'
@@ -203,13 +230,44 @@ exec "$BINARY" --transport=socket
 SVCEOF
 chmod +x "${RUN_SCRIPT}"
 
+# runsvdir scans SVDIR only every few seconds and creates supervise/ok once it
+# has launched runsv for this dir. `sv up` needs that file or it errors out with
+# "unable to open supervise/ok: file does not exist", so wait for supervision to
+# appear rather than racing it.
+supervised=false
+for _ in $(seq 1 20); do
+    if [ -e "${SERVICE_DIR}/supervise/ok" ]; then supervised=true; break; fi
+    sleep 1
+done
+if [ "$supervised" != true ]; then
+    fail "Could not register the service: runit (runsvdir) is not running.
+termux-services starts runit with a new session, so if you just installed
+termux-services, open a NEW Termux session and re-run this installer.
+You can verify with: 'pgrep -x runsvdir'"
+fi
+
 sv up "${SERVICE_NAME}" || fail "sv up failed.
 If termux-services was installed in THIS session, runit is not running yet —
 open a NEW Termux session and re-run. Otherwise: 'sv status ${SERVICE_NAME}'"
 
-# Give the server a moment to create socket + token, then link it
-sleep 2
-ensure_socket_symlink || warn "Socket not found yet; check 'sv status ${SERVICE_NAME}'"
+# Give the server a moment to create its socket + token, then link it. If the
+# service is not actually running, the server exited at startup (typically an
+# audio-backend init failure) — warn instead of silently declaring success.
+ok=false
+for _ in $(seq 1 10); do
+    case "$(sv status "${SERVICE_NAME}" 2>/dev/null)" in
+        run:*) ok=true; break ;;
+    esac
+    sleep 1
+done
+if [ "$ok" = true ]; then
+    ensure_socket_symlink || warn "Socket not found yet; check 'sv status ${SERVICE_NAME}'"
+else
+    warn "Service is not running: 'sv status ${SERVICE_NAME}'"
+    warn "The server is exiting on startup, usually an audio-backend failure."
+    warn "On devices without a usable audio device, set dummy = true in"
+    warn "${SERVICE_DIR}/server.ini and run: sv restart ${SERVICE_NAME}"
+fi
 
 ok "Service registered: ${SERVICE_NAME}"
 echo
