@@ -1,12 +1,19 @@
 # Android / Termux audio — plan and findings
 
 Status: **bionic is the correct (only) Termux build. No glibc build is needed.**
-**Root cause found and fixed.** The Termux build's `pa_simple_new` returns
-`PA_ERR_INVALID` inside our process, while the equivalent documented
-`pa_threaded_mainloop`/`pa_context`/`pa_stream` flow succeeds in the *same*
-process (proved with an LD_PRELOAD reimplementation: context READY, stream
-READY, "Using PulseAudio backend for Android"). The backend now drives that
-public API directly, linked (not dlopen'd).
+
+## 0. RESOLVED: PulseAudio audio output works on Termux
+
+Release **`2026.10.26-3`** is installed and **verified producing real audio**:
+a 440 Hz test tone played through PulseAudio was captured from the sink
+monitor (`pacat -d OpenSL_ES_sink.monitor`), and analysis of the 15.9 s
+recording shows peak 0.54 / RMS 0.089 with a dominant **440 Hz** component
+(magnitude 0.148) and ~0 at 220/880 Hz — exactly the tone that was played.
+The supervised service (`sv up l337-audio-server`) now runs with
+`dummy = false` and plays tracks through `OpenSL_ES_sink`.
+
+Two bugs had to be fixed after the linkage work; both were FFI-signature
+problems invisible at compile time (§4.13). Full chain of findings below.
 
 ## 1. Confirmed: bionic only, glibc not required
 
@@ -213,7 +220,63 @@ to work in this very process.
 - `build.yml`: the verification step now **fails the job** if `libpulse.so` is
   missing from the NEEDED list (guards the regression).
 
-### 4.12 PA 17.0 source facts (read on-device)
+### 4.13 The two FFI-signature bugs that followed
+
+Verified with an LD_PRELOAD shim (`~/pa_wshim.c`) that interposes
+`pa_stream_write`/`pa_stream_get_state` and logs PA's return codes:
+
+**Bug 1 — `pa_threaded_mainloop_signal` takes two arguments.**
+`pa_threaded_mainloop_signal(m, wait_for_accept)`. Declaring one argument
+passes register garbage as `wait_for_accept`; when non-zero the caller blocks
+forever in `pa_threaded_mainloop_accept`. This deadlocked the first
+reimplementation attempt. (Confirmed from `thread-mainloop.h:294`.)
+
+**Bug 2 — `pa_stream_write` takes six arguments.**
+`(s, data, nbytes, free_cb, offset, seek)` — the 6th is `pa_seek_mode_t`
+(`stream.h:519`). Declaring five left garbage in that register, and PA
+returned **-3 / `PA_ERR_INVALID`** from the validity check
+`seek <= PA_SEEK_RELATIVE_END`. The daemon log showed the stream itself was
+created fine (`float32le 2ch 48000Hz`), so the failure was invisible until the
+shim logged:
+```
+[w] pa_stream_write(s=0x... data=0x... nbytes=1024 free_cb=0x0 offset=0) -> begin
+[w] pa_stream_write -> -3
+```
+Fix: pass `PA_SEEK_RELATIVE` (0). Lesson applied to every other declaration —
+all signatures were audited against `$PREFIX/include/pulse/*.h`, and the ones
+that were already correct (e.g. `pa_stream_connect_playback`, 6 args) were
+re-confirmed by the shim observing them succeed.
+
+Also fixed along the way: the writer loop must not sleep while holding the
+mainloop lock (the PA mainloop thread needs it), and the `handle` MutexGuard
+may not be destructured before use (E0382, caught by CI).
+
+### 4.14 CI pitfalls hit
+
+- **Edition 2024 requires `unsafe extern "C"`** (hard error).
+- **Release version auto-increments.** When a publish job runs after a tag
+  already exists, the new release is `2026.10.26-2`, not `-1` — an artifact
+  download can 404 if you request the earlier tag. A failed build still
+  publishes (job has `always()` + `continue-on-error`), producing a partial
+  release; the *next* successful run publishes the complete one at `-N+1`.
+- `gh` is not installed on the phone; all GitHub operations go through
+  `ssh pipelinepro`. Job logs come from
+  `gh api -i repos/<r>/actions/jobs/<id>/logs` (plain text on this gh).
+
+### 4.15 Verification method (reproducible)
+
+```
+sv down l337-audio-server
+env LD_LIBRARY_PATH="$PREFIX/lib" TMPDIR="$TMPDIR" \
+    L337__SERVER__DUMMY=false \
+    ~/.local/share/l337-player/bin/l337-audio-server --transport=socket
+# in another shell: record the sink while playing a file:// track
+timeout 8 pacat --record --raw --format=float32le --rate=48000 --channels=2 \
+    -d OpenSL_ES_sink.monitor > mon.raw
+# then analyse mon.raw for a non-zero RMS and the expected dominant frequency
+```
+
+### 4.16 PA 17.0 source facts (read on-device)
 
 - `pa_simple_new` (`src/pulse/simple.c`) validates server/name/dev/ss/map
   client-side and can only return `PA_ERR_INVALID` (3) from that validation or
@@ -227,44 +290,23 @@ to work in this very process.
 
 Full source downloaded at `$TMPDIR/pa17.tar.gz` for local cross-reference.
 
-## 5. Fix plan
+## 5. Fix plan (complete)
 
-### 5.1 Immediate housekeeping
-- **Delete the broken release `2026.10.25-2`** — it was published without the
-  termux asset (the `publish-release` job runs with `always()` even when the
-  termux build fails). Users hitting `curl: (22) 404` are downloading it.
-- Optionally gate `publish-release` on the android jobs when the failure is
-  only in `build-android` (the source of that partial release).
+Done, in order:
 
-### 5.2 Determine why the real Rust process fails where C succeeds (open)
-Use the shim approach to interpose the **next** libpulse calls inside
-`pa_simple_new`'s state machine — `pa_context_connect`, `pa_context_errno`,
-`pa_stream_new`, `pa_threaded_mainloop_start` — and log each step's return in
-the real server. That pinpoints which internal step produces `PA_ERR_INVALID`
-in the Rust process (e.g. context error object holding INVALID, or the
-`c == NULL` branch). `RTLD_NEXT` resolution inside the shim works (already
-demonstrated for `pa_simple_new`).
-- Do not LD_PRELOAD `timeout`: LD_PRELOAD also applies to the wrapper and
-  `timeout` (glibc helper) then fails with `libdl.so` missing. Run the server
-  directly (it exits on its own when the backend fails).
+1. **Bisect the C failure** (dlopen vs. build-time linkage) — §4.6/§4.8.
+2. **Ship stubs + build.rs** so the binary is linked, not dlopen'd.
+3. **Replace `pa_simple_*` with the public `libpulse.so` API** — the Termux
+   `pa_simple_new` is patched and fails in our process (§4.10).
+4. **Fix the two argument-count bugs** found by LD_PRELOAD shims (§4.13):
+   `pa_threaded_mainloop_signal` (2 args) and `pa_stream_write` (6 args).
+5. **Audit every declaration against the headers** — the recurring lesson.
+6. **Verify real output** by recording the sink monitor (§4.15).
 
-### 5.3 Pragmatic fallback that needs no native linkage (recommended)
-Replace the PulseAudio FFI backend with a **child `pacat` process**:
-spawn `pacat --raw --format=float32le --rate=48000 --channels=2`, write the
-mixed PCM to its stdin.
-- `pacat` is a Termux binary that demonstrably streams to the working sink.
-- No native linkage, no ABI assumptions, survives PulseAudio changes.
-- Volume control already exists (`engine.rs::set_pipewire_sink_input_volume`
-  via `pactl`), so software gain can drop to unity.
-Costs: one extra process per stream, pipe latency, lifecycle handling
-(kill child on stop/drop). Keep the direct-FFI path behind a feature flag.
-
-### 5.4 Parallel track: why is AAudio unavailable in a console process?
-`AAudio_createStreamBuilder` returns null on Android 16 from a console process.
-If AAudio worked, the server would be usable without PulseAudio at all.
-Probe `libaaudio.so` directly from a bionic C binary (`~/aaudio_probe.c`) using
-the NDK aaudio headers to see whether the failure is library load, builder
-creation, or open.
+Not needed / rejected:
+- `pacat` child-process fallback (§5.3 of the old plan) — unnecessary now.
+- Housekeeping of the pre-fix `2026.10.24-1` / broken `2026.10.25-2`
+  releases left as-is.
 
 ## 6. Build/install/test loop (release required)
 
