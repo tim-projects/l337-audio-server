@@ -194,6 +194,40 @@ function Remove-ArpEntry {
     }
 }
 
+function Get-RunningInstances {
+    param([string]$BinaryPath)
+    # Win32_Process exposes ExecutablePath for every process, including the
+    # service's (which runs as SYSTEM); Get-Process cannot read .Path there.
+    Get-CimInstance Win32_Process -Filter "Name = 'l337-audio-server.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -eq $BinaryPath }
+}
+
+function Stop-ManualInstance {
+    param([string]$BinaryPath)
+    # Deleting the service only manages the service instance. A foreground run
+    # survives it, keeps the Unix socket and the instance lock alive, and makes
+    # the next install fail to bind — so refuse with the PIDs instead.
+    $running = @(Get-RunningInstances -BinaryPath $BinaryPath)
+    if ($running.Count -gt 0) {
+        $pids = ($running | ForEach-Object { $_.ProcessId }) -join " "
+        Write-Fail "A manually started l337-audio-server is still running (pid: $pids).`nStop it and re-run:  Stop-Process -Id $pids -Force"
+    }
+}
+
+function Remove-RuntimeDirs {
+    # The socket and the instance lock, not user data: the server puts them in
+    # <temp>\l337-audio-server\runtime (src/platform/common.rs). A run started
+    # by hand uses the caller's temp, the service the SYSTEM account's.
+    foreach ($parent in @($env:TEMP, "C:\Windows\TEMP", "C:\Windows\System32\config\systemprofile\AppData\Local\Temp")) {
+        if ([string]::IsNullOrWhiteSpace($parent)) { continue }
+        $dir = Join-Path $parent "l337-audio-server"
+        if (Test-Path $dir) {
+            Remove-Item -Path $dir -Recurse -Force
+            Write-Ok "Runtime removed: $dir"
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -201,8 +235,10 @@ if ($DryRun) {
     Write-Info "Dry-run mode — would perform the following actions:"
     if ($Uninstall) {
         Write-Info "  Stop and remove service: $ServiceName"
+        Write-Info "  Refuse if a manually started instance is still running"
         Write-Info "  Remove Add/Remove Programs entry"
         Write-Info "  Remove: $InstallDir"
+        Write-Info "  Remove the runtime directories (socket and instance lock)"
         if ($RemoveData) {
             Write-Info "  Remove data: $DataDir"
         } else {
@@ -220,12 +256,17 @@ if ($DryRun) {
 }
 
 if ($Uninstall) {
+    $binaryPath = Join-Path $InstallDir "l337-audio-server.exe"
     Uninstall-Service
+    # Every instance the service manager owned is gone now; refuse before any
+    # file is touched if a foreground one is still alive.
+    Stop-ManualInstance -BinaryPath $binaryPath
     Remove-ArpEntry
     if (Test-Path $InstallDir) {
         Write-Info "Removing installation directory: $InstallDir"
         Remove-Item -Path $InstallDir -Recurse -Force
     }
+    Remove-RuntimeDirs
     if ($RemoveData) {
         if (Test-Path $DataDir) {
             Write-Info "Removing data directory: $DataDir"

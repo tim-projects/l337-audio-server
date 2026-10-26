@@ -69,6 +69,12 @@ Or remove data too:
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall --remove-data
 ```
 
+Windows (from the checkout, or via Add/Remove Programs):
+```powershell
+.\install.ps1 -Uninstall
+.\install.ps1 -Uninstall -RemoveData
+```
+
 On every platform `--uninstall` stops the service, removes the systemd unit /
 launchd agent, the binary and the runtime directory (Unix socket and instance
 lock), and refuses with the offending PID if a manually started instance is
