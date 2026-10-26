@@ -211,13 +211,11 @@ impl PulseAudioAudioOutputStream {
             }
 
             let playing = state.playing.load(Ordering::Relaxed);
-            let (handle, lock_result) = {
-                let guard = match state.handle.lock() {
-                    Ok(g) => g,
-                    Err(e) => e.into_inner(),
-                };
-                (guard, guard.lock())
+            let handle = match state.handle.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
             };
+            let lock_result = handle.lock();
 
             if lock_result < 0 {
                 drop(handle);
