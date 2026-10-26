@@ -221,9 +221,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-# The android build dlopens libpulse-simple.so from $PREFIX/lib, which the
-# NDK-built binary cannot find on its own (no DT_RUNPATH, and Termux leaves
-# LD_LIBRARY_PATH unset). Without this the PulseAudio backend is skipped.
+# The termux build has DT_NEEDED libpulse.so (linked at build time against a
+# stub, resolved here at runtime). The NDK-built binary has no DT_RUNPATH and
+# Termux leaves LD_LIBRARY_PATH unset, so libpulse.so is not found on its own.
+# Without this export the loader fails outright (CANNOT LINK EXECUTABLE).
 export LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "$BINARY" --transport=socket
