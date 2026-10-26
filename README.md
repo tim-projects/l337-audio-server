@@ -69,6 +69,51 @@ Or remove data too:
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall --remove-data
 ```
 
+### Termux (Android)
+
+Termux is a **user-space** install — there is no `sudo` and no root, and it uses
+runit (`termux-services`) rather than systemd. Requirements:
+```bash
+pkg install termux-services pulseaudio
+pulseaudio --start --exit-idle-time=-1
+```
+
+Install (no `sudo`; open a **new Termux session** after installing
+`termux-services` so runit is running):
+```bash
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | bash -s -- --pre-release
+```
+
+Status, logs and config:
+```bash
+sv status l337-audio-server     # run: / down: / exit:
+sv-enable l337-audio-server     # auto-start on Termux launch
+cat ~/.cache/l337/l337.log      # server log
+# config lives in the service dir, which is also the service's CWD
+cat $PREFIX/var/service/l337-audio-server/server.ini
+```
+
+Uninstall:
+```bash
+# from a checkout (install.sh --uninstall only works once a release ships it)
+bash scripts/install-android-termux.sh --uninstall
+
+# ...or via install.sh, once a release contains the uninstall support
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | bash -s -- --uninstall
+```
+
+`--uninstall` stops the service and removes the service directory, the binary,
+the socket symlink and the runtime directory. Playlists, the auth token and
+logs are **kept**, as is your `server.ini` (preserved and restored on the next
+install, so `dummy = true`/`false` and a custom port survive). Add
+`--remove-data` to delete that data as well. The uninstall path intentionally
+skips the audio/service requirement checks, so it also works when PulseAudio or
+termux-services is broken.
+
+Flags are shared where the platforms overlap: `--pre-release`, `--uninstall`,
+`--remove-data` and `--help` work on all of them; `--force`, `--no-audio`,
+`--dry-run` and `--group-access` are ALSA/systemd only.
+
 ## Runtime Dependencies
 
 - **yt-dlp** — required for YouTube URL playback. Install separately:
