@@ -10,17 +10,18 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 
 # --- Argument parsing ---
 INSTALL_PRERELEASE=false
+UNINSTALL_REQUESTED=false
 ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
+        --uninstall|-u)             UNINSTALL_REQUESTED=true; shift ;;
         -h|--help)
             echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data]"
             echo ""
             echo "Delegates to the platform-specific installer on GitHub. All options"
             echo "are forwarded, so --uninstall behaves exactly like the platform's own"
-            echo "installer. Note: --uninstall is served by the installer script from the"
-            echo "release tag, so it requires a release that already contains it."
+            echo "installer."
             echo ""
             echo "Options:"
             echo "  --pre-release      Install the latest prerelease instead of the stable release"
@@ -58,32 +59,41 @@ fi
 
 info "Platform: $OS_VARIANT / $ARCH_TYPE"
 
-# --- Determine release tag ---
-RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
-if [ "$INSTALL_PRERELEASE" = true ]; then
-    if ! curl -sS -L --connect-timeout 15 --max-time 60 \
-        -o "$RELEASE_RESPONSE" \
-        "https://api.github.com/repos/${REPO}/releases?per_page=100"; then
-        rm -f "$RELEASE_RESPONSE"
-        fail "Failed to contact GitHub Releases API. Check network connectivity."
-    fi
-    TAG=$(awk '/^  \{/{r=$0;in_r=1;next} in_r{r=r"\n"$0;if($0~/^  \},?$/){if(r~/"prerelease"[[:space:]]*:[[:space:]]*true/){printf "%s",r;exit};r="";in_r=0}}' "$RELEASE_RESPONSE" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+# --- Determine what version of the installer script to fetch ---
+# An uninstall downloads no binary, so it must not depend on the release state
+# (this project publishes prereleases, so /releases/latest returns nothing).
+# Use the installer script from main instead.
+if [ "$UNINSTALL_REQUESTED" = true ]; then
+    SCRIPT_TAG="main"
+    info "Uninstall requested — using the installer script from ${SCRIPT_TAG}."
 else
-    if ! curl -sS -L --connect-timeout 15 --max-time 60 \
-        -o "$RELEASE_RESPONSE" \
-        "https://api.github.com/repos/${REPO}/releases/latest"; then
-        rm -f "$RELEASE_RESPONSE"
-        fail "Failed to contact GitHub Releases API. Check network connectivity."
-    fi
-    TAG=$(grep '"tag_name"' "$RELEASE_RESPONSE" | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || true
-fi
-rm -f "$RELEASE_RESPONSE"
-
-if [ -z "$TAG" ]; then
+    RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
     if [ "$INSTALL_PRERELEASE" = true ]; then
-        fail "Could not determine latest prerelease tag for ${REPO}."
+        if ! curl -sS -L --connect-timeout 15 --max-time 60 \
+            -o "$RELEASE_RESPONSE" \
+            "https://api.github.com/repos/${REPO}/releases?per_page=100"; then
+            rm -f "$RELEASE_RESPONSE"
+            fail "Failed to contact GitHub Releases API. Check network connectivity."
+        fi
+        TAG=$(awk '/^  \{/{r=$0;in_r=1;next} in_r{r=r"\n"$0;if($0~/^  \},?$/){if(r~/"prerelease"[[:space:]]*:[[:space:]]*true/){printf "%s",r;exit};r="";in_r=0}}' "$RELEASE_RESPONSE" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    else
+        if ! curl -sS -L --connect-timeout 15 --max-time 60 \
+            -o "$RELEASE_RESPONSE" \
+            "https://api.github.com/repos/${REPO}/releases/latest"; then
+            rm -f "$RELEASE_RESPONSE"
+            fail "Failed to contact GitHub Releases API. Check network connectivity."
+        fi
+        TAG=$(grep '"tag_name"' "$RELEASE_RESPONSE" | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || true
     fi
-    fail "Could not determine latest stable release tag for ${REPO}. Re-run with --pre-release to install a prerelease."
+    rm -f "$RELEASE_RESPONSE"
+
+    if [ -z "$TAG" ]; then
+        if [ "$INSTALL_PRERELEASE" = true ]; then
+            fail "Could not determine latest prerelease tag for ${REPO}."
+        fi
+        fail "Could not determine latest stable release tag for ${REPO}. Re-run with --pre-release to install a prerelease."
+    fi
+    SCRIPT_TAG="$TAG"
 fi
 
 # --- Determine script to download ---
@@ -121,10 +131,16 @@ else
 fi
 
 # --- Download and execute ---
-SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/scripts/${SCRIPT_NAME}.sh"
-SCRIPT_PATH=$(mktemp "${TMPDIR:-/tmp}/l337-install-XXXXXX.sh")
+# The temp file has no filename extension: mktemp's X-run must be at the end of
+# the template, and an `.sh` suffix after it is rejected by some
+# implementations (e.g. Termux's /bin/mktemp) — bash does not care about it.
+SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${SCRIPT_TAG}/scripts/${SCRIPT_NAME}.sh"
+SCRIPT_PATH=$(mktemp "${TMPDIR:-/tmp}/l337-install.XXXXXX")
 if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$SCRIPT_PATH" "$SCRIPT_URL"; then
     fail "Failed to download installer script from $SCRIPT_URL"
 fi
 chmod +x "$SCRIPT_PATH"
-exec "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+# Execute through bash rather than relying on the downloaded script's shebang:
+# the platform installers use `#!/bin/bash`, and /bin/bash does not exist on
+# Termux (where /bin is an empty /system/bin symlink).
+exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"

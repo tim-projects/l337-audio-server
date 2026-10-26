@@ -360,6 +360,27 @@ when a user wants out.
 
 `install.sh`'s help was also corrected (it advertised a nonexistent `--force`).
 
+### Two install.sh bugs this uninstall work exposed
+
+Both broke **`install.sh --uninstall`** on Termux (and would have broken
+`install.sh --pre-release` too, if not for environment luck):
+
+1. **It refused to run without a release tag.** The wrapper always resolved
+   `/releases/latest` (or the prerelease list) to find a tag for the *asset*
+   URL — but this project publishes prereleases only, so `/releases/latest`
+   returns nothing and it failed with "Could not determine latest stable
+   release tag". An uninstall downloads no binary, so the tag is irrelevant to
+   it: uninstall now fetches the installer script from `main` and skips the
+   release lookup entirely.
+2. **It could not execute the downloaded script.** `exec "$SCRIPT_PATH"`
+   relied on the installer's `#!/bin/bash` shebang, and `/bin/bash` does not
+   exist on Termux (`/bin` is an empty `/system/bin` symlink) — the kernel
+   fails with "bad interpreter: /bin/bash: No such file or directory". The
+   wrapper now runs `exec bash "$SCRIPT_PATH" …`.
+   Related: the temp-file template `l337-install-XXXXXX.sh` put `.sh` *after*
+   the mktemp X-run, which the `/bin/mktemp` this PATH resolves to rejects
+   ("need XXX"). The template is now suffix-free.
+
 ## 6. Build/install/test loop (release required)
 
 - The workflow has **no `push` trigger** — only `pull_request` and
