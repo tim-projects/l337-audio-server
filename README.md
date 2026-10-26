@@ -69,6 +69,13 @@ Or remove data too:
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --uninstall --remove-data
 ```
 
+On every platform `--uninstall` stops the service, removes the systemd unit /
+launchd agent, the binary and the runtime directory (Unix socket and instance
+lock), and refuses with the offending PID if a manually started instance is
+still running — stop it and re-run. Configuration, state, cache and logs are
+**kept**; add `--remove-data` to delete them. Add `--dry-run` to print the plan
+without changing anything.
+
 ### Termux (Android)
 
 Termux is a **user-space** install — there is no `sudo` and no root, and it uses

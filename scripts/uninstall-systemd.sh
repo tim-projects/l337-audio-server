@@ -11,7 +11,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${1:-system}"
+# The mode comes from the parse loop below (which also accepts a leading
+# --remove-data): only default here, never derive it from a positional arg.
+MODE="system"
 
 USER_NAME="l337"
 GROUP_NAME="l337"

@@ -23,6 +23,9 @@
 #   sudo ./scripts/install-systemd.sh --update   # in-place binary upgrade (no
 #                                               #   config/state/cache touched)
 #   ./scripts/install-systemd.sh --auto          # auto-detect and choose service type
+#   sudo ./scripts/install-systemd.sh --uninstall # remove the service and files
+#   sudo ./scripts/install-systemd.sh --uninstall --remove-data
+#   sudo ./scripts/install-systemd.sh --uninstall --dry-run
 #
 # To build the binary first (requires cargo):
 #   ./scripts/build.sh
@@ -45,13 +48,34 @@ VERIFICATION_WAS_MISSING_PWCLI=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_USER=""
 MODE="auto"
+DRY_RUN=false
+UNINSTALL=false
+REMOVE_DATA=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --user) INSTALL_USER="$2"; shift 2 ;;
         --auto) MODE="auto"; shift ;;
         --update) MODE="update"; shift ;;
-        -h|--help) echo "Usage: $0 [--user USER] [--auto|--update]"; exit 0 ;;
+        --uninstall|-u) UNINSTALL=true; shift ;;
+        --remove-data) REMOVE_DATA=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) cat <<EOF
+Usage: $0 [OPTIONS]
+
+systemd installer for L337 Audio Server.
+Installs a prebuilt binary and configures it as a system or user service.
+
+Options:
+  --user <username>      User service for this user (default: \$USER with sudo)
+  --auto                 Auto-detect the service type
+  --update               In-place binary upgrade (config/state/cache untouched)
+  --uninstall, -u        Remove the service and installed files
+  --remove-data          Also remove configuration and data directories
+  --dry-run              Show what would happen without making changes
+  -h, --help             Show this help message
+EOF
+            exit 0 ;;
         *) MODE="$1"; shift ;;
     esac
 done
@@ -961,6 +985,33 @@ Example:
     info "Installing via sudo detected. Installing files to /opt/l337-audio-server and setting up user service for $target_user..."
     SUDO_USER="$target_user" install_hybrid_service
 }
+
+# The uninstall itself lives in scripts/uninstall-systemd.sh — one
+# implementation, with the same flag trio every other installer accepts.
+if [ "$UNINSTALL" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+        info "Dry-run mode — would perform the following actions:"
+        info "  Stop and disable l337-audio-server.service"
+        info "  Remove the unit and $INSTALL_DIR"
+        if [ "$REMOVE_DATA" = true ]; then
+            info "  Remove configuration and data directories"
+        else
+            info "  Retain configuration and data directories"
+        fi
+        exit 0
+    fi
+    uninstall_args=()
+    [ "$REMOVE_DATA" = true ] && uninstall_args+=(--remove-data)
+    [ -n "$INSTALL_USER" ] && uninstall_args+=(--user "$INSTALL_USER")
+    exec "$SCRIPT_DIR/scripts/uninstall-systemd.sh" ${uninstall_args[@]+"${uninstall_args[@]}"}
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    info "Dry-run mode — would perform the following actions:"
+    info "  Install $SCRIPT_DIR/bin/l337-audio-server to $INSTALL_DIR"
+    info "  Configure $SYSTEM_SERVICE and the user unit"
+    exit 0
+fi
 
 case "$MODE" in
 

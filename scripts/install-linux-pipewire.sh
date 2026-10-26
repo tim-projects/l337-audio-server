@@ -518,6 +518,7 @@ version_eq() {
 uninstall_user_service() {
     info "Uninstalling systemd user services..."
 
+    local binary_path="${INSTALL_DIR}/l337-audio-server"
     local any_installed=false
     while IFS= read -r user; do
         local real_home
@@ -544,12 +545,18 @@ uninstall_user_service() {
         rm -f "$user_service_file"
         run_as_user "$user" -- systemctl --user daemon-reload 2>/dev/null || true
 
+        # The runtime dir holds only the socket and instance.lock, so it goes
+        # away whether or not --remove-data was given.
+        if [ -d "$user_runtime_dir" ]; then
+            rm -rf "$user_runtime_dir"
+            ok "Runtime removed for $user: $user_runtime_dir"
+        fi
+
         if [ "$REMOVE_DATA" = true ]; then
             info "Removing user data for $user..."
             rm -rf "$user_config_dir" \
                   "$user_cache_dir" \
-                  "$user_state_dir" \
-                  "$user_runtime_dir"
+                  "$user_state_dir"
             ok "Data removed for $user"
         else
             warn "User data retained for $user:"
@@ -561,10 +568,21 @@ uninstall_user_service() {
         warn "No user services found"
     fi
 
-    if [ "$REMOVE_DATA" = true ]; then
-        rm -rf "$INSTALL_DIR"
-        ok "Shared binary removed"
+    # Every user's service is stopped now. $INSTALL_DIR is shared, so it may
+    # only go once no instance still holds the socket or the instance lock —
+    # a foreground run is invisible to systemctl and would survive it.
+    if pgrep -f "$binary_path" >/dev/null 2>&1; then
+        local pids
+        pids="$(pgrep -f "$binary_path" | tr '\n' ' ' || true)"
+        fail "A manually started l337-audio-server is still running (pid: ${pids}).
+Stop it and re-run:  kill ${pids}"
     fi
+
+    rm -rf "$INSTALL_DIR"
+    ok "Shared binary removed"
+
+    # A download that fell back to /tmp leaves the whole binary there.
+    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
 
     ok "User service uninstallation complete"
 }
@@ -576,9 +594,11 @@ if [ "$DRY_RUN" = true ]; then
     info "Dry-run mode — would perform the following actions:"
     if [ "$UNINSTALL" = true ]; then
         info "  Scan all users for installed l337-audio-server.service files"
-        info "  For each user: stop, disable, remove service + config"
+        info "  For each user: stop, disable, remove service and runtime dir"
+        info "  Refuse if a manually started instance is still running"
+        info "  Remove the shared binary at $INSTALL_DIR"
         if [ "$REMOVE_DATA" = true ]; then
-            info "  Remove shared binary if no users remain"
+            info "  Remove configuration, cache and state directories per user"
         fi
     else
         info "  Query GitHub for latest release"

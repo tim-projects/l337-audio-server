@@ -440,13 +440,41 @@ uninstall_macos() {
     local plist_dir
     plist_dir=$(eval echo "~${REAL_USER}/Library/LaunchAgents")
     local plist_path="${plist_dir}/${PLIST_LABEL}.plist"
+    local binary_path="${INSTALL_DIR}/l337-audio-server"
 
     if launchctl list | grep -q "$PLIST_LABEL"; then
         launchctl unload "$plist_path" 2>/dev/null || true
     fi
 
+    # launchd only manages the agent. A foreground instance is invisible to it,
+    # keeps the socket and the instance lock alive, and makes the next install
+    # fail to bind — so refuse instead of half-removing.
+    if pgrep -f "$binary_path" >/dev/null 2>&1; then
+        local pids
+        pids="$(pgrep -f "$binary_path" | tr '\n' ' ' || true)"
+        fail "A manually started l337-audio-server is still running (pid: ${pids}).
+Stop it and re-run:  kill ${pids}"
+    fi
+
     rm -f "$plist_path"
     rm -rf "$INSTALL_DIR"
+
+    # Runtime, not user data: the socket and the instance lock. The plist sets
+    # XDG_CACHE_HOME=~/.cache, so the service's runtime lives there; a server
+    # started by hand falls back to the macOS cache dir the same way the server
+    # does (src/platform/common.rs). Only the ephemeral auth challenge token
+    # shares this directory — playlists, the token file and logs do not.
+    local runtime_dir
+    for runtime_dir in "${real_home}/.cache/l337-audio-server" \
+                       "${real_home}/Library/Caches/l337-audio-server"; do
+        if [ -d "$runtime_dir" ]; then
+            rm -rf "$runtime_dir"
+            ok "Runtime removed: $runtime_dir"
+        fi
+    done
+
+    # A download that fell back to /tmp leaves the whole binary there.
+    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
 
     if [ "$REMOVE_DATA" = true ]; then
         info "Removing user data directories..."
@@ -470,6 +498,8 @@ if [ "$DRY_RUN" = true ]; then
     info "Dry-run mode — would perform the following actions:"
     if [ "$UNINSTALL" = true ]; then
         info "  Remove the service and installed files"
+        info "  Remove the runtime directories (socket and instance lock)"
+        info "  Refuse if a manually started instance is still running"
         if [ "$REMOVE_DATA" = true ]; then
             info "  Remove user data directories"
         else

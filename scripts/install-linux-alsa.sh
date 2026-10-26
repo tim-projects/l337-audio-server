@@ -577,6 +577,8 @@ version_eq() {
 uninstall_linux() {
     info "Uninstalling from Linux..."
 
+    local binary_path="${INSTALL_DIR}/l337-audio-server"
+
     if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
         systemctl stop l337-audio-server.service || true
     fi
@@ -584,10 +586,32 @@ uninstall_linux() {
         systemctl disable l337-audio-server.service || true
     fi
 
+    # systemd only manages the service instance. A foreground instance is not
+    # stopped by the unit, keeps the socket and the instance lock alive, and
+    # makes the next install fail to bind — so refuse instead of half-removing.
+    if pgrep -f "$binary_path" >/dev/null 2>&1; then
+        local pids
+        pids="$(pgrep -f "$binary_path" | tr '\n' ' ' || true)"
+        fail "A manually started l337-audio-server is still running (pid: ${pids}).
+Stop it and re-run:  kill ${pids}"
+    fi
+
     rm -f "$SYSTEMD_SERVICE"
     systemctl daemon-reload 2>/dev/null || true
 
     rm -rf "$INSTALL_DIR"
+
+    # Runtime artifacts (socket + instance.lock), not user data: the unit's
+    # RuntimeDirectory, and a run that had XDG_RUNTIME_DIR of its own.
+    local runtime
+    for runtime in "/run/l337-audio-server" /run/user/*/l337-audio-server; do
+        [ -d "$runtime" ] || continue
+        rm -rf "$runtime"
+        ok "Runtime removed: $runtime"
+    done
+
+    # A download that fell back to /tmp leaves the whole binary there.
+    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
 
     if [ "$REMOVE_DATA" = true ]; then
         info "Removing data directories..."
@@ -621,6 +645,8 @@ if [ "$DRY_RUN" = true ]; then
     info "Dry-run mode — would perform the following actions:"
     if [ "$UNINSTALL" = true ]; then
         info "  Remove the service and installed files"
+        info "  Remove the runtime directories (/run/l337-audio-server, /run/user/*/l337-audio-server)"
+        info "  Refuse if a manually started instance is still running"
         if [ "$REMOVE_DATA" = true ]; then
             info "  Remove configuration and data directories"
         else
