@@ -372,7 +372,14 @@ Both broke **`install.sh --uninstall`** on Termux (and would have broken
    release tag". An uninstall downloads no binary, so the tag is irrelevant to
    it: uninstall now fetches the installer script from `main` and skips the
    release lookup entirely.
-2. **It could not execute the downloaded script.** `exec "$SCRIPT_PATH"`
+### Pin the uninstall to a release when one is available
+
+Running the uninstall from `main` means the destructive path executes code from
+a mutable branch, so it is a *fallback*, not the default: if a release tag can
+be resolved it is used (pass `--pre-release --uninstall` to pin to the latest
+prerelease), and only when that fails does the wrapper warn loudly and use
+`main`. An install never falls back — a missing release is still a hard error,
+because the tag selects the binary that gets installed. `exec "$SCRIPT_PATH"`
    relied on the installer's `#!/bin/bash` shebang, and `/bin/bash` does not
    exist on Termux (`/bin` is an empty `/system/bin` symlink) — the kernel
    fails with "bad interpreter: /bin/bash: No such file or directory". The
