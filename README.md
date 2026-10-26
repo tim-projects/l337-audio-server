@@ -72,17 +72,20 @@ curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh
 ### Termux (Android)
 
 Termux is a **user-space** install — there is no `sudo` and no root, and it uses
-runit (`termux-services`) rather than systemd. Requirements:
-```bash
-pkg install termux-services pulseaudio
-pulseaudio --start --exit-idle-time=-1
-```
+runit (`termux-services`) rather than systemd.
 
-Install (no `sudo`; open a **new Termux session** after installing
-`termux-services` so runit is running):
+Install (no `sudo`; open a **new Termux session** the first time so runit is
+running):
 ```bash
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | bash -s -- --pre-release
 ```
+
+The installer installs what it needs by itself — `termux-services` and
+`pulseaudio`, and it starts the PulseAudio daemon if it is not running — so no
+manual step is required. Pass `--no-install-deps` to opt out and be told what to
+run instead. The only step it cannot do for you is opening a **new Termux
+session** after a fresh `termux-services` install (runit only starts with a new
+session).
 
 Status, logs and config:
 ```bash
@@ -95,10 +98,10 @@ cat $PREFIX/var/service/l337-audio-server/server.ini
 
 Uninstall:
 ```bash
-# from a checkout (install.sh --uninstall only works once a release ships it)
+# from a checkout
 bash scripts/install-android-termux.sh --uninstall
 
-# ...or via install.sh, once a release contains the uninstall support
+# or via install.sh
 curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | bash -s -- --uninstall
 ```
 
@@ -106,13 +109,18 @@ curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh
 the socket symlink and the runtime directory. Playlists, the auth token and
 logs are **kept**, as is your `server.ini` (preserved and restored on the next
 install, so `dummy = true`/`false` and a custom port survive). Add
-`--remove-data` to delete that data as well. The uninstall path intentionally
-skips the audio/service requirement checks, so it also works when PulseAudio or
-termux-services is broken.
+`--remove-data` to delete that data as well.
+
+Afterwards you are asked, one package at a time, whether to also remove
+`termux-services` and `pulseaudio` (both are general-purpose packages that
+other software uses, so the default is to keep them). Piped through
+`curl | bash` there is nobody to ask, so they are kept and the removal command
+is printed instead.
 
 Flags are shared where the platforms overlap: `--pre-release`, `--uninstall`,
 `--remove-data` and `--help` work on all of them; `--force`, `--no-audio`,
-`--dry-run` and `--group-access` are ALSA/systemd only.
+`--dry-run` and `--group-access` are ALSA/systemd only. `--no-install-deps` is
+Termux-only — only that installer installs its own dependencies.
 
 ## Runtime Dependencies
 

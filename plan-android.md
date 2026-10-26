@@ -388,6 +388,35 @@ because the tag selects the binary that gets installed. `exec "$SCRIPT_PATH"`
    the mktemp X-run, which the `/bin/mktemp` this PATH resolves to rejects
    ("need XXX"). The template is now suffix-free.
 
+### Auto-installing dependencies and asking about their removal
+
+Requirements are split into three buckets so the installer stops dumping
+bullets and starts doing the work it can do:
+
+- **Installable packages** (`termux-services`, `pulseaudio`) are installed with
+  `pkg install -y` automatically. Opt out with `--no-install-deps`.
+- **Auto-startable services** — the PulseAudio daemon — are started with
+  `pulseaudio --start --exit-idle-time=-1`. If it was started this way, the
+  installer warns that Termux will not restart it after a reboot.
+- **Things needing a decision** (not Termux, wrong architecture) are printed as
+  a numbered list, each with a copy-pasteable fix. The check is re-run after
+  each fix so the reported state is never stale.
+
+On `--uninstall`, the server's own files are removed as before, and then the
+two dependency packages are offered one at a time — `Remove termux-services
+(runit service supervision)? [y/N]`, then the same for `pulseaudio` — defaulting
+to keep, because both are general-purpose packages other software relies on.
+Data was already retained, so removing a package cannot destroy user data.
+Without a TTY (e.g. `curl | bash`) there is nobody to ask, so both are kept and
+the exact `pkg uninstall <pkg>` command is printed. Removing `pulseaudio` kills
+the daemon first.
+
+A broken hint was fixed along the way: the old failure message told users to
+verify runit with `pgrep -x runsvdir`, which never matches (Termux sets `comm`
+to the full path, so `-x` fails). Now `supervise/ok` — the ground truth for the
+service actually being supervised — is the only check, and the hint is
+`sv status sshd`.
+
 ## 6. Build/install/test loop (release required)
 
 - The workflow has **no `push` trigger** — only `pull_request` and

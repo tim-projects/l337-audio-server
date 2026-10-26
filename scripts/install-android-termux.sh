@@ -1,12 +1,14 @@
 #!/bin/bash
 # install-android-termux.sh — Termux binary installer (runit/termux-services, no systemd)
 # Requirements: Termux + aarch64 + termux-services + running pulseaudio.
-# Fails fast with actionable help if any are missing.
+# Missing packages are installed automatically unless --no-install-deps is
+# given; anything that needs a decision is reported as a numbered instruction.
 #
 # Usage:
-#   bash scripts/install-android-termux.sh                     # install/update
-#   bash scripts/install-android-termux.sh --pre-release       # install prerelease
-#   bash scripts/install-android-termux.sh --uninstall         # remove service + binary
+#   bash scripts/install-android-termux.sh                            # install/update
+#   bash scripts/install-android-termux.sh --pre-release              # install prerelease
+#   bash scripts/install-android-termux.sh --no-install-deps          # never install packages
+#   bash scripts/install-android-termux.sh --uninstall                # remove service + binary
 #   bash scripts/install-android-termux.sh --uninstall --remove-data  # also delete data
 set -euo pipefail
 
@@ -197,25 +199,76 @@ Stop it manually and re-run:  kill ${pids}"
     warn "Not removed (never created by this installer): a stray ./server.ini"
     warn "in \$HOME or any other working directory."
     echo
-    ok "Termux uninstall complete"
+    ok "l337-audio-server removed"
+    echo
+
+    # --- Optional: remove the packages this server needed ---
+    # Asked one at a time, defaulting to keep, because both are general-purpose
+    # Termux packages that other software also relies on. The data was retained
+    # above, so removing a package cannot destroy anything of the user's.
+    info "The following packages were needed by this server:"
+    remove_dependency_if_confirmed "termux-services" "runit service supervision"
+    remove_dependency_if_confirmed "pulseaudio" "the PulseAudio daemon used for audio output"
+    echo
+    ok "Uninstall finished."
+}
+
+# Ask whether to remove a package the server needed. Default is keep. Without a
+# TTY (e.g. `curl | bash`) there is nobody to ask, so the package is kept and
+# the manual command is printed instead of guessing.
+remove_dependency_if_confirmed() {
+    local pkg="$1" purpose="$2" reply=""
+
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        warn "Kept '${pkg}' (${purpose})."
+        warn "  Not removing it without confirmation — to remove it:  pkg uninstall ${pkg}"
+        return 0
+    fi
+
+    printf 'Remove %s (%s)? [y/N] ' "$pkg" "$purpose"
+    read -r reply || reply=""
+    case "$reply" in
+        [yY]|[yY][eE][sS])
+            # Stop the daemon before its files are removed.
+            case "$pkg" in
+                pulseaudio) pulseaudio --kill >/dev/null 2>&1 || true ;;
+            esac
+            info "Removing ${pkg}..."
+            if pkg uninstall -y "$pkg" >/dev/null 2>&1; then
+                ok "Removed ${pkg}"
+            else
+                warn "Could not remove ${pkg} — remove it manually:  pkg uninstall ${pkg}"
+            fi
+            ;;
+        *)
+            ok "Kept ${pkg} (${purpose})."
+            ;;
+    esac
 }
 
 # Parse arguments
 INSTALL_PRERELEASE=false
 UNINSTALL=false
 REMOVE_DATA=false
+AUTO_INSTALL_DEPS=true
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --uninstall|-u)             UNINSTALL=true; shift ;;
         --remove-data)              REMOVE_DATA=true; shift ;;
+        --no-install-deps)          AUTO_INSTALL_DEPS=false; shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data]"
+            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data] [--no-install-deps]"
             echo ""
             echo "Installs l337-audio-server for Termux (android build) and"
             echo "registers it as a termux-services (runit) service."
             echo ""
-            echo "Requirements:"
+            echo "Requirements (missing packages are installed automatically,"
+            echo "unless --no-install-deps is given):"
             echo "  - Running in Termux (TERMUX_VERSION set)"
             echo "  - aarch64 architecture"
             echo "  - pkg install termux-services"
@@ -224,13 +277,15 @@ while [ $# -gt 0 ]; do
             echo "      pulseaudio --start --exit-idle-time=-1"
             echo ""
             echo "Options:"
-            echo "  --pre-release    Install latest prerelease instead of stable release"
-            echo "  --uninstall, -u  Remove the service and installed binary (keeps data)"
-            echo "  --remove-data    With --uninstall: also delete playlists, token and logs"
+            echo "  --pre-release       Install latest prerelease instead of stable release"
+            echo "  --uninstall, -u     Remove the service and installed binary (keeps data)"
+            echo "  --remove-data       With --uninstall: also delete playlists, token and logs"
+            echo "  --no-install-deps   Do not install missing packages automatically"
             echo ""
-            echo "Data is kept by default so an uninstall is recoverable; use"
-            echo "--remove-data for a clean removal. The uninstall path works even if"
-            echo "pulseaudio or termux-services are missing or broken."
+            echo "On uninstall you are asked, one package at a time, whether to also"
+            echo "remove the packages this server needed. Interactively that is a"
+            echo "prompt; piped (curl | bash) they are kept and the removal command"
+            echo "is printed. Data is always kept unless --remove-data is given."
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; echo "Try $0 --help" >&2; exit 1 ;;
     esac
@@ -258,53 +313,114 @@ fi
 # libpulse.so (built with `--features pulseaudio` in CI).
 ASSET="l337-audio-server-aarch64-android-termux"
 
-# --- Requirement checks (fail fast with actionable help) ---
-MISSING=()
+# --- Requirement checks ---
+# Requirements are split into two buckets so the ones that are just a missing
+# package can be installed automatically, and the rest get a numbered
+# instruction instead of a wall of bullets. Both arrays are rebuilt by
+# check_requirements, so the check can be re-run after an auto-install.
+MISSING_PKGS=()
+NEEDS_USER=()
+DAEMON_DOWN=false
+STARTED_DAEMON=false
 
-if [ -z "${TERMUX_VERSION:-}" ]; then
-    MISSING+=("Running in Termux (TERMUX_VERSION is not set)")
+check_requirements() {
+    MISSING_PKGS=()
+    NEEDS_USER=()
+    DAEMON_DOWN=false
+
+    if [ -z "${TERMUX_VERSION:-}" ]; then
+        NEEDS_USER+=("Not running inside Termux.
+       This installer only supports Termux — run it from a Termux shell.")
+    fi
+
+    case "$(uname -m)" in
+        aarch64|arm64) ;;
+        *) NEEDS_USER+=("This device is '$(uname -m)', but only aarch64 builds are published.") ;;
+    esac
+
+    # `sv` is the termux-services (runit) supervision binary. This installer
+    # registers a runit service, so it cannot do anything without it.
+    # $PREFIX/var/service is NOT a usable signal (the openssh package ships
+    # service dirs there without termux-services), so only the binary counts.
+    command -v sv >/dev/null 2>&1 || MISSING_PKGS+=("termux-services")
+
+    # The android build prefers PulseAudio because direct AAudio from a Termux
+    # console process is unreliable: AAudio_createStreamBuilder returns null
+    # and the server exits at startup.
+    if ! command -v pulseaudio >/dev/null 2>&1; then
+        MISSING_PKGS+=("pulseaudio")
+    elif ! pulseaudio --check >/dev/null 2>&1; then
+        # Starting the daemon needs no decision from the user, so it is a fix,
+        # not an instruction — unless auto-fixing is switched off.
+        DAEMON_DOWN=true
+    fi
+}
+
+# Print what is still missing, one numbered instruction each, then exit.
+report_requirements() {
+    local n=0
+
+    if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+        echo >&2
+        warn "Packages still missing: ${MISSING_PKGS[*]}"
+        warn "Install them with:  pkg install ${MISSING_PKGS[*]}"
+    fi
+
+    if [ "${#NEEDS_USER[@]}" -gt 0 ]; then
+        echo >&2
+        echo -e "\033[1;31m[FAIL]\033[0m Requirements not met:" >&2
+        for item in "${NEEDS_USER[@]}"; do
+            n=$((n + 1))
+            printf '  %d. %s\n' "$n" "$item" >&2
+        done
+        echo >&2
+        echo "Fix the above, then re-run this installer." >&2
+        exit 1
+    fi
+}
+
+check_requirements
+
+# Missing packages need no decision from the user: install them (opt out with
+# --no-install-deps). pkg pulls ~15 MB, so always say what is being installed.
+if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+    if [ "$AUTO_INSTALL_DEPS" = true ]; then
+        info "Installing missing packages: ${MISSING_PKGS[*]}"
+        if pkg install -y "${MISSING_PKGS[@]}"; then
+            ok "Installed packages: ${MISSING_PKGS[*]}"
+        else
+            fail "Could not install ${MISSING_PKGS[*]} — install them manually: pkg install ${MISSING_PKGS[*]}"
+        fi
+        # A newly installed package can change the picture (pulseaudio is now
+        # present but its daemon still is not running).
+        check_requirements
+    else
+        warn "Not installing missing packages (--no-install-deps given)."
+    fi
 fi
 
-case "$(uname -m)" in
-    aarch64|arm64) ;;
-    *) MISSING+=("aarch64 architecture (detected: $(uname -m))") ;;
-esac
-
-# `sv` is the termux-services (runit) supervision binary. This installer is a
-# runit service installer, so it cannot do anything without it — check it
-# first and name the exact install command. Note: $PREFIX/var/service is NOT
-# a reliable signal (the openssh package ships service dirs there without
-# termux-services), so only the binary is checked.
-if ! command -v sv >/dev/null 2>&1; then
-    fail "termux-services is not installed: 'sv' not found in PATH.
-
-This installer registers the server as a runit service, which needs termux-services:
-  pkg install termux-services
-
-After installing, open a NEW Termux session — runit (runsvdir) only starts
-with a new session — then re-run this installer."
+# Same reasoning for the daemon: starting it is not a decision.
+if [ "$DAEMON_DOWN" = true ]; then
+    if [ "$AUTO_INSTALL_DEPS" = true ]; then
+        info "Starting the PulseAudio daemon..."
+        if pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1; then
+            ok "PulseAudio daemon started"
+            STARTED_DAEMON=true
+            check_requirements
+        else
+            NEEDS_USER+=("Could not start the PulseAudio daemon.
+       Start it manually with:  pulseaudio --start --exit-idle-time=-1")
+        fi
+    else
+        NEEDS_USER+=("The PulseAudio daemon is not running.
+       Start it with:  pulseaudio --start --exit-idle-time=-1")
+    fi
 fi
+
+report_requirements
+
 ok "sv found: $(command -v sv) (termux-services)"
-
-# The android build (compiled with --features pulseaudio) prefers PulseAudio,
-# because direct AAudio from a Termux console process is unreliable:
-# AAudio_createStreamBuilder returns null and the server exits at startup.
-if ! command -v pulseaudio &>/dev/null; then
-    MISSING+=("pulseaudio  →  pkg install pulseaudio")
-elif ! pulseaudio --check &>/dev/null; then
-    MISSING+=("pulseaudio daemon  →  pulseaudio --start --exit-idle-time=-1")
-fi
-
-if [ "${#MISSING[@]}" -gt 0 ]; then
-    echo -e "\033[1;31m[FAIL]\033[0m Requirements not met:" >&2
-    for item in "${MISSING[@]}"; do
-        echo "  - $item" >&2
-    done
-    echo >&2
-    echo "Install missing requirements, then re-run:" >&2
-    echo "  $0 --pre-release" >&2
-    exit 1
-fi
+ok "pulseaudio: $(command -v pulseaudio)"
 
 # --- Determine release tag ---
 RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
@@ -422,7 +538,7 @@ if [ "$supervised" != true ]; then
     fail "Could not register the service: runit (runsvdir) is not running.
 termux-services starts runit with a new session, so if you just installed
 termux-services, open a NEW Termux session and re-run this installer.
-You can verify with: 'pgrep -x runsvdir'"
+You can verify with: 'sv status sshd' (runit answers for existing services)."
 fi
 
 sv up "${SERVICE_NAME}" || fail "sv up failed.
@@ -457,6 +573,13 @@ echo "    sv status ${SERVICE_NAME}   # check"
 echo "    sv-enable ${SERVICE_NAME}   # auto-start on Termux launch"
 echo
 echo "  Token: ${HOME}/.cache/l337/l337-audio-server/server_token.txt"
+
+if [ "$STARTED_DAEMON" = true ]; then
+    echo
+    warn "The PulseAudio daemon was started with --exit-idle-time=-1, so it"
+    warn "stays up, but Termux does not auto-start it after a reboot. Re-run:"
+    warn "    pulseaudio --start --exit-idle-time=-1"
+fi
 
 echo
 echo "Done. Start l337 to connect."
