@@ -41,6 +41,9 @@ const PA_STREAM_INTERPOLATE_TIMING: u32 = 0x0002;
 const PA_STREAM_AUTO_TIMING_UPDATE: u32 = 0x0008;
 const PA_STREAM_ADJUST_LATENCY: u32 = 0x0100;
 
+// pa_seek_mode_t
+const PA_SEEK_RELATIVE: c_int = 0;
+
 unsafe extern "C" {
     fn pa_threaded_mainloop_new() -> *mut c_void;
     fn pa_threaded_mainloop_free(m: *mut c_void);
@@ -97,6 +100,9 @@ unsafe extern "C" {
         nbytes: usize,
         free_cb: *const c_void,
         offset: i64,
+        // pa_seek_mode_t: PA_SEEK_RELATIVE = 0. Mandatory sixth argument —
+        // declaring five passes register garbage and fails with PA_ERR_INVALID.
+        seek: c_int,
     ) -> c_int;
     fn pa_stream_disconnect(s: *mut c_void) -> c_int;
     fn pa_stream_get_state(s: *mut c_void) -> c_int;
@@ -244,7 +250,7 @@ impl PulseAudioAudioOutputStream {
                     drop(buf);
                     // pa_stream_write with a NULL free callback copies the data.
                     if unsafe {
-                        pa_stream_write(stream_ptr, data.as_ptr() as *const c_void, data.len(), std::ptr::null(), 0)
+                        pa_stream_write(stream_ptr, data.as_ptr() as *const c_void, data.len(), std::ptr::null(), 0, PA_SEEK_RELATIVE)
                     } < 0
                     {
                         return Err("pa_stream_write failed".to_string());
@@ -254,7 +260,7 @@ impl PulseAudioAudioOutputStream {
                     drop(buf);
                     // Keep the device awake with silence while paused.
                     if unsafe {
-                        pa_stream_write(stream_ptr, silence.as_ptr() as *const c_void, silence.len(), std::ptr::null(), 0)
+                        pa_stream_write(stream_ptr, silence.as_ptr() as *const c_void, silence.len(), std::ptr::null(), 0, PA_SEEK_RELATIVE)
                     } < 0
                     {
                         return Err("pa_stream_write (silence) failed".to_string());

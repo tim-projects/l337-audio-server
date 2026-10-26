@@ -73,8 +73,9 @@ int pa_stream_connect_playback(pa_stream *s, const char *dev, const void *attr,
     (void)s; (void)dev; (void)attr; (void)flags; (void)volume; (void)sync_stream;
     return -1;
 }
-int pa_stream_write(pa_stream *s, const void *data, unsigned long nbytes, void *free_cb, long long offset) {
-    (void)s; (void)data; (void)nbytes; (void)free_cb; (void)offset;
+typedef int pa_seek_mode_t;
+int pa_stream_write(pa_stream *s, const void *data, unsigned long nbytes, void *free_cb, long long offset, pa_seek_mode_t seek) {
+    (void)s; (void)data; (void)nbytes; (void)free_cb; (void)offset; (void)seek;
     return -1;
 }
 typedef void (*pa_stream_success_cb_t)(pa_stream *s, int success, void *userdata);
