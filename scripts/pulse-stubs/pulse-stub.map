@@ -1,10 +1,31 @@
 PULSE_0 {
   global:
-    pa_simple_new;
-    pa_simple_write;
-    pa_simple_drain;
-    pa_simple_free;
-    pa_simple_get_latency;
+    pa_threaded_mainloop_new;
+    pa_threaded_mainloop_free;
+    pa_threaded_mainloop_get_api;
+    pa_threaded_mainloop_start;
+    pa_threaded_mainloop_stop;
+    pa_threaded_mainloop_lock;
+    pa_threaded_mainloop_unlock;
+    pa_threaded_mainloop_signal;
+    pa_threaded_mainloop_wait;
+    pa_context_new;
+    pa_context_ref;
+    pa_context_unref;
+    pa_context_set_state_callback;
+    pa_context_connect;
+    pa_context_disconnect;
+    pa_context_get_state;
+    pa_context_errno;
+    pa_stream_new;
+    pa_stream_set_state_callback;
+    pa_stream_connect_playback;
+    pa_stream_write;
+    pa_stream_drain;
+    pa_stream_disconnect;
+    pa_stream_get_state;
+    pa_stream_unref;
+    pa_strerror;
   local:
     *;
 };

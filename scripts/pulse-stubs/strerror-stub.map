@@ -1,6 +1,0 @@
-PULSE_0 {
-  global:
-    pa_strerror;
-  local:
-    *;
-};

@@ -17,9 +17,14 @@ fn main() {
 /// bisect that established this is recorded in `plan-android.md` (sections 4.6
 /// and 4.8).
 ///
-/// The linked stubs in `scripts/pulse-stubs` exist only at link time; their
-/// SONAMEs and symbol versions match the real Termux libraries, so at runtime
-/// the loader resolves the `DT_NEEDED` entries against `$PREFIX/lib/libpulse*`.
+/// The linked stub in `scripts/pulse-stubs` exists only at link time; its
+/// SONAME and symbol versions match the real Termux library, so at runtime the
+/// loader resolves the `DT_NEEDED` entry against `$PREFIX/lib/libpulse.so`.
+///
+/// We link only `libpulse.so` — never `libpulse-simple.so` — because the
+/// Termux build's `pa_simple_new` fails in this process while the equivalent
+/// documented `pa_threaded_mainloop`/`pa_context`/`pa_stream` flow works
+/// (plan-android.md section 4.9).
 fn link_pulseaudio_for_termux() {
     let target_os = env::var_os("CARGO_CFG_TARGET_OS");
     if target_os.as_deref() != Some(OsStr::new("android")) {
@@ -33,7 +38,6 @@ fn link_pulseaudio_for_termux() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let stubs = format!("{}/scripts/pulse-stubs", manifest_dir);
     println!("cargo:rustc-link-search=native={}", stubs);
-    println!("cargo:rustc-link-lib=dylib=pulse-simple");
     println!("cargo:rustc-link-lib=dylib=pulse");
     println!("cargo:rerun-if-changed={}", stubs);
 }

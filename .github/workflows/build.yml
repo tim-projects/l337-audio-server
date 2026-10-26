@@ -279,16 +279,21 @@ jobs:
         else
           cargo build --verbose --release --target aarch64-linux-android
         fi
-    # The termux variant links PulseAudio directly (build.rs adds the stubs in
-    # scripts/pulse-stubs as the link-time SONAME provider; the real libs
-    # resolve at runtime). This must NOT be dlopen'd: on bionic the dlopen path
-    # fails client-side in pa_stream_new (PA_ERR_INVALID). See plan-android.md.
+    # The termux variant links PulseAudio directly: build.rs links the stub in
+    # scripts/pulse-stubs (SONAME libpulse.so) so the real library is mapped at
+    # process start. This must NOT be dlopen'd: on bionic the dlopen path fails
+    # client-side in pa_stream_new (PA_ERR_INVALID). See plan-android.md.
     # The run script must export LD_LIBRARY_PATH=$PREFIX/lib, because the
     # NDK-built binary has no runpath.
     - name: Verify PulseAudio linkage (termux)
       if: ${{ matrix.variant == 'termux' }}
       run: |
-        readelf -d target/aarch64-linux-android/release/l337-audio-server | grep NEEDED
+        BIN=target/aarch64-linux-android/release/l337-audio-server
+        readelf -d "$BIN" | grep NEEDED
+        if ! readelf -d "$BIN" | grep -q 'libpulse.so'; then
+          echo "::error::termux binary is not linked against libpulse.so"
+          exit 1
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
