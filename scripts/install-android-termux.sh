@@ -2,6 +2,12 @@
 # install-android-termux.sh — Termux binary installer (runit/termux-services, no systemd)
 # Requirements: Termux + aarch64 + termux-services + running pulseaudio.
 # Fails fast with actionable help if any are missing.
+#
+# Usage:
+#   bash scripts/install-android-termux.sh                     # install/update
+#   bash scripts/install-android-termux.sh --pre-release       # install prerelease
+#   bash scripts/install-android-termux.sh --uninstall         # remove service + binary
+#   bash scripts/install-android-termux.sh --uninstall --remove-data  # also delete data
 set -euo pipefail
 
 REPO="tim-projects/l337-audio-server"
@@ -15,6 +21,12 @@ SERVICE_DIR="${PREFIX}/var/service/${SERVICE_NAME}"
 RUN_SCRIPT="${SERVICE_DIR}/run"
 SOCKET_SOURCE="${TMPDIR}/l337-audio-server/runtime/l337.sock"
 SOCKET_TARGET="${HOME}/.cache/l337/l337-audio-server/l337.sock"
+# User data (never removed unless --remove-data):
+#   DATA_DIR  playlists/app.db/playlists.db/config.ini (+ preserved server.ini)
+#   CACHE_DIR auth token, socket symlink, server logs
+DATA_DIR="${HOME}/.local/share/l337-player"
+CACHE_DIR="${HOME}/.cache/l337"
+RUNTIME_DIR="${TMPDIR}/l337-audio-server"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
@@ -50,13 +62,155 @@ binary cannot start. Stop it manually and re-run the installer:
     kill ${pids}"
 }
 
+# Remove a runtime directory once, tolerating TMPDIR/$PREFIX/tmp aliasing
+# (Termux exports TMPDIR=$PREFIX/tmp, so both usually resolve to the same path).
+remove_runtime_dir() {
+    local dir="$1"
+    if [ -z "$dir" ] || [ "$dir" = "/" ]; then
+        return 0
+    fi
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+        rm -rf "$dir"
+        ok "Runtime removed: $dir"
+    fi
+}
+
+# Uninstall the Termux install. Default keeps user data (playlists, token,
+# logs and the service's server.ini, which is live config: the runit service's
+# CWD *is* the service dir, so ./server.ini is that file). --remove-data
+# deletes it.
+#
+# No requirement checks gate this path on purpose: uninstalling must work even
+# when pulseaudio is broken or termux-services was removed.
+uninstall_termux() {
+    info "Uninstalling l337-audio-server from Termux..."
+
+    if [ ! -d "${SERVICE_DIR}" ] && [ ! -f "${BINARY_PATH}" ] && [ ! -d "${DATA_DIR}" ]; then
+        warn "Nothing to uninstall (no service, binary or data found)."
+    fi
+
+    # --- Stop the service and any manually started instance ---
+    # runsvdir re-spawns a service the moment its directory exists, so the stop
+    # must complete (and the process be gone) before the directory is removed.
+    if [ -d "${SERVICE_DIR}" ]; then
+        if command -v sv >/dev/null 2>&1; then
+            sv down "${SERVICE_NAME}" >/dev/null 2>&1 || true
+        else
+            warn "'sv' not found — cannot stop via runit; will signal processes directly"
+        fi
+    fi
+
+    if pgrep -f "${BINARY_PATH}" >/dev/null 2>&1; then
+        info "Stopping running l337-audio-server instances..."
+        pkill -f "${BINARY_PATH}" >/dev/null 2>&1 || true
+    fi
+
+    local _stopped=false
+    for _ in $(seq 1 10); do
+        pgrep -f "${BINARY_PATH}" >/dev/null 2>&1 || { _stopped=true; break; }
+        sleep 1
+    done
+    if [ "$_stopped" != true ]; then
+        local pids
+        pids="$(pgrep -f "${BINARY_PATH}" | tr '\n' ' ' || true)"
+        fail "l337-audio-server is still running (pid: ${pids}); cannot remove its files.
+Stop it manually and re-run:  kill ${pids}"
+    fi
+    ok "Stopped all instances"
+
+    # --- Preserve live config before the service dir goes away ---
+    # server.ini holds the user's choice (e.g. dummy = true, a custom port).
+    # Always overwrite the preserved copy: the live config is authoritative,
+    # and keeping a stale one would silently revert the user's last change on
+    # the next uninstall/install cycle.
+    if [ -f "${SERVICE_DIR}/server.ini" ]; then
+        if mkdir -p "${DATA_DIR}"; then
+            if cp -p "${SERVICE_DIR}/server.ini" "${DATA_DIR}/server.ini" 2>/dev/null; then
+                info "Preserved config: ${DATA_DIR}/server.ini"
+            else
+                warn "Could not preserve ${SERVICE_DIR}/server.ini into ${DATA_DIR}"
+            fi
+        fi
+    fi
+
+    # --- Service registration ---
+    # `sv-enable` leaves nothing behind (it only deletes the service dir's
+    # 'down' file), so removing the directory fully unregisters the service.
+    if [ -d "${SERVICE_DIR}" ]; then
+        rm -rf "${SERVICE_DIR}"
+        ok "Service removed: ${SERVICE_DIR}"
+    else
+        warn "Service directory not found: ${SERVICE_DIR}"
+    fi
+
+    # --- Binary ---
+    local removed_bin=false
+    if [ -f "${BINARY_PATH}" ]; then
+        rm -f "${BINARY_PATH}"
+        removed_bin=true
+        ok "Binary removed: ${BINARY_PATH}"
+    else
+        warn "Binary not found: ${BINARY_PATH}"
+    fi
+    # A download that was interrupted leaves a .tmp behind (~15 MB); it is ours
+    # to delete, unlike any other foreign file in bin/.
+    if [ -e "${BINARY_PATH}.tmp" ]; then
+        rm -f "${BINARY_PATH}.tmp"
+        removed_bin=true
+        ok "Stale download removed: ${BINARY_PATH}.tmp"
+    fi
+    if [ "$removed_bin" = true ]; then
+        # Only succeeds if bin/ contains nothing else, so foreign files (and the
+        # user's own leftovers) are never deleted.
+        rmdir "${INSTALL_DIR}" 2>/dev/null || true
+    fi
+
+    # --- Socket symlink + runtime dir ---
+    if [ -L "${SOCKET_TARGET}" ]; then
+        rm -f "${SOCKET_TARGET}"
+        ok "Socket symlink removed: ${SOCKET_TARGET}"
+    fi
+    remove_runtime_dir "${RUNTIME_DIR}"
+    if [ "${PREFIX}/tmp/l337-audio-server" != "${RUNTIME_DIR}" ]; then
+        remove_runtime_dir "${PREFIX}/tmp/l337-audio-server"
+    fi
+    # A run started by install.sh with a different TMPDIR can also have left
+    # /tmp/l337-audio-server behind on some devices.
+    remove_runtime_dir "/tmp/l337-audio-server"
+
+    # --- Data ---
+    if [ "$REMOVE_DATA" = true ]; then
+        for d in "${DATA_DIR}" "${CACHE_DIR}" "${PREFIX}/etc/l337-audio-server"; do
+            if [ -e "$d" ]; then
+                rm -rf "$d"
+                ok "Data removed: $d"
+            fi
+        done
+        ok "Data directories removed"
+    else
+        warn "User data retained:"
+        warn "  ${DATA_DIR}    (playlists, app.db, playlists.db, config.ini, server.ini)"
+        warn "  ${CACHE_DIR}   (auth token, server logs)"
+        warn "Re-run with --remove-data to delete them."
+    fi
+
+    warn "Not removed (never created by this installer): a stray ./server.ini"
+    warn "in \$HOME or any other working directory."
+    echo
+    ok "Termux uninstall complete"
+}
+
 # Parse arguments
 INSTALL_PRERELEASE=false
+UNINSTALL=false
+REMOVE_DATA=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
+        --uninstall|-u)             UNINSTALL=true; shift ;;
+        --remove-data)              REMOVE_DATA=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release]"
+            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data]"
             echo ""
             echo "Installs l337-audio-server for Termux (android build) and"
             echo "registers it as a termux-services (runit) service."
@@ -70,7 +224,13 @@ while [ $# -gt 0 ]; do
             echo "      pulseaudio --start --exit-idle-time=-1"
             echo ""
             echo "Options:"
-            echo "  --pre-release   Install latest prerelease instead of stable release"
+            echo "  --pre-release    Install latest prerelease instead of stable release"
+            echo "  --uninstall, -u  Remove the service and installed binary (keeps data)"
+            echo "  --remove-data    With --uninstall: also delete playlists, token and logs"
+            echo ""
+            echo "Data is kept by default so an uninstall is recoverable; use"
+            echo "--remove-data for a clean removal. The uninstall path works even if"
+            echo "pulseaudio or termux-services are missing or broken."
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; echo "Try $0 --help" >&2; exit 1 ;;
     esac
@@ -86,8 +246,16 @@ esac
 info "Platform: termux / $ARCH_TYPE ($(uname -s) $(uname -m))"
 info "User-space install — no root or sudo required (Termux has neither)"
 
-# Termux uses the bionic (NDK) android build, which dlopens the PulseAudio
-# client at runtime (built with `--features pulseaudio` in CI).
+# Uninstall runs before the requirement checks on purpose: it must succeed when
+# pulseaudio is broken or termux-services was removed, i.e. exactly when a user
+# wants out. sv is used if present and degraded to a warning if not.
+if [ "$UNINSTALL" = true ]; then
+    uninstall_termux
+    exit 0
+fi
+
+# Termux uses the bionic (NDK) android build, which is linked against
+# libpulse.so (built with `--features pulseaudio` in CI).
 ASSET="l337-audio-server-aarch64-android-termux"
 
 # --- Requirement checks (fail fast with actionable help) ---
@@ -230,6 +398,16 @@ export LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRA
 exec "$BINARY" --transport=socket
 SVCEOF
 chmod +x "${RUN_SCRIPT}"
+
+# Restore the config preserved by `--uninstall`. Without this the server
+# recreates the built-in default on first start and silently drops any
+# customization the user made (dummy = true, a non-default port,
+# buffer_max_bytes), making uninstall/reinstall lossy.
+PRESERVED_INI="${DATA_DIR}/server.ini"
+if [ -f "${PRESERVED_INI}" ] && [ ! -f "${SERVICE_DIR}/server.ini" ]; then
+    cp -p "${PRESERVED_INI}" "${SERVICE_DIR}/server.ini"
+    ok "Restored preserved config: ${SERVICE_DIR}/server.ini"
+fi
 
 # runsvdir scans SVDIR only every few seconds and creates supervise/ok once it
 # has launched runsv for this dir. `sv up` needs that file or it errors out with

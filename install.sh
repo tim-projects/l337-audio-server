@@ -15,8 +15,17 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--uninstall] [--force] ..."
-            echo "Delegates to platform-specific installer on GitHub."
+            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data]"
+            echo ""
+            echo "Delegates to the platform-specific installer on GitHub. All options"
+            echo "are forwarded, so --uninstall behaves exactly like the platform's own"
+            echo "installer. Note: --uninstall is served by the installer script from the"
+            echo "release tag, so it requires a release that already contains it."
+            echo ""
+            echo "Options:"
+            echo "  --pre-release      Install the latest prerelease instead of the stable release"
+            echo "  --uninstall, -u    Remove the service and installed binary (data kept)"
+            echo "  --remove-data      With --uninstall: also delete playlists, token and logs"
             exit 0 ;;
         *) shift ;;
     esac

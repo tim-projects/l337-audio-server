@@ -308,6 +308,58 @@ Not needed / rejected:
 - Housekeeping of the pre-fix `2026.10.24-1` / broken `2026.10.25-2`
   releases left as-is.
 
+## 5.5 Uninstall (implemented and tested on device)
+
+`install.sh --uninstall` did **not** work on Termux: the flag was advertised in
+`install.sh`'s help and forwarded, but `install-android-termux.sh` rejected it
+with "Unknown option", so nothing could uninstall the Termux install. It also
+would not have worked through `install.sh` anyway until a release contained the
+fix (the wrapper always fetches the installer *from the release tag*).
+
+From a checkout, this works now:
+```
+bash scripts/install-android-termux.sh --uninstall                # keeps data
+bash scripts/install-android-termux.sh --uninstall --remove-data  # full removal
+```
+
+What `--uninstall` removes:
+- stops the runit service (`sv down`) and any manually started instance, waiting
+  up to 10 s and failing loudly if a process survives (a survivor would hold the
+  socket/instance lock)
+- the whole `$PREFIX/var/service/l337-audio-server` dir (run script, supervise
+  state, `down` file — `sv-enable` leaves nothing else, so no autostart leftover)
+- the binary, plus a stale `${BINARY_PATH}.tmp` from an interrupted download
+  (~15 MB that would otherwise be skipped)
+- the `~/.cache/l337/l337-audio-server/l337.sock` symlink and both candidate
+  runtime dirs (`$TMPDIR/l337-audio-server` and `$PREFIX/tmp/...`, which alias
+  under Termux, plus `/tmp/l337-audio-server` for a foreign-TMPDIR run)
+
+What it deliberately keeps (data): `~/.local/share/l337-player` (playlists,
+app.db, playlists.db, config.ini) and `~/.cache/l337` (auth token, logs).
+`--remove-data` deletes those plus `$PREFIX/etc/l337-audio-server`.
+
+Three gaps found while testing, all fixed:
+1. **Config loss on the round-trip.** The runit service's CWD *is* the service
+   dir, so `./server.ini` there is the live config (verified via
+   `/proc/<pid>/cwd`). Removing the service dir destroyed it, and the server
+   silently recreated the built-in default on next install. Now `--uninstall`
+   always overwrites `${DATA_DIR}/server.ini` with the live config, and the
+   installer restores it when the service dir has none.
+2. **Stale preserve vs. current config.** An earlier draft kept an existing
+   preserved copy "to be safe", which silently reverted the user's *latest*
+   change on a second cycle. The live config is authoritative and now always
+   wins.
+3. **Stale `.tmp` download** left behind by an interrupted install.
+
+Verified on device: clean uninstall, data retained, config preserved → restored
+(`dummy = true`), idempotent re-uninstall (exit 0), and `--remove-data` in an
+isolated fake `HOME`/`PREFIX` removing every tracked path. Note that the
+uninstall needs no requirements: it runs before the requirement checks so it
+works when pulseaudio is broken or termux-services was removed — i.e. exactly
+when a user wants out.
+
+`install.sh`'s help was also corrected (it advertised a nonexistent `--force`).
+
 ## 6. Build/install/test loop (release required)
 
 - The workflow has **no `push` trigger** — only `pull_request` and
