@@ -26,6 +26,10 @@ Cargo.lock
 # the termux Android variant — see scripts/pulse-stubs/pulse-stub.c)
 !scripts/pulse-stubs/*.so
 
+# libopus link-time stub (committed; build.rs links it for the termux Opus
+# build — see scripts/opus-stubs/opus-stub.c)
+!scripts/opus-stubs/*.so
+
 # Cache and Logs
 cache/
 logs/
