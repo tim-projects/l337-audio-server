@@ -275,6 +275,7 @@ while [ $# -gt 0 ]; do
             echo "  - pulseaudio installed and running:"
             echo "      pkg install pulseaudio"
             echo "      pulseaudio --start --exit-idle-time=-1"
+            echo "  - libopus present when built with --features opus: pkg install libopus"
             echo ""
             echo "Options:"
             echo "  --pre-release       Install latest prerelease instead of stable release"
@@ -353,6 +354,15 @@ check_requirements() {
         # Starting the daemon needs no decision from the user, so it is a fix,
         # not an instruction — unless auto-fixing is switched off.
         DAEMON_DOWN=true
+    fi
+
+    # libopus is required at runtime when the server is built with --features
+    # opus (server-side Opus decoding, G1): the binary links against it at build
+    # time, i.e. it has DT_NEEDED libopus.so, and it is resolved from
+    # LD_LIBRARY_PATH=$PREFIX/lib.
+    LIBOPUS_PATH="${PREFIX}/lib/libopus.so"
+    if [ ! -f "$LIBOPUS_PATH" ]; then
+        MISSING_PKGS+=("libopus")
     fi
 }
 
@@ -506,8 +516,9 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 # The termux build has DT_NEEDED libpulse.so (linked at build time against a
-# stub, resolved here at runtime). The NDK-built binary has no DT_RUNPATH and
-# Termux leaves LD_LIBRARY_PATH unset, so libpulse.so is not found on its own.
+# stub, resolved here at runtime); when built with --features opus it also has
+# DT_NEEDED libopus.so. The NDK-built binary has no DT_RUNPATH and Termux leaves
+# LD_LIBRARY_PATH unset, so these shared libs are not found on their own.
 # Without this export the loader fails outright (CANNOT LINK EXECUTABLE).
 export LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 

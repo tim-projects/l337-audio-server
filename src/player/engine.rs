@@ -842,6 +842,28 @@ pub(crate) fn decode_to_pcm(
     let track = format.default_track().ok_or("no default track")?;
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
+
+    // Symphonia has no Opus decoder; route Opus tracks to libopus (G1).
+    #[cfg(feature = "opus")]
+    if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        let extra: &[u8] = codec_params.extra_data.as_deref().unwrap_or(&[]);
+        let head = crate::player::opus::parse_opus_head(extra)
+            .ok_or("Opus track missing OpusHead sideband")?;
+        let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
+        let mut pcm: Vec<f32> = Vec::new();
+        loop {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            pcm.extend(opus_dec.push(packet.buf()));
+        }
+        return Ok((pcm, 48000, head.channels));
+    }
+
     tracing::info!(?codec_params, codec_id = ?codec_params.codec, "decode_to_pcm: probing result");
     let mut decoder = match symphonia::default::get_codecs().make(&codec_params, &decoder_opts) {
         Ok(decoder) => decoder,
@@ -1409,6 +1431,57 @@ fn streaming_decode_sync(
     };
     track_id = track.id;
     codec_params = track.codec_params.clone();
+
+    // Symphonia cannot decode Opus; stream WebM/Ogg Opus through libopus (G1).
+    // This handles Opus tracks to end-of-stream and returns before the
+    // Symphonia decoder below. Opus decodes at 48 kHz (device rate), so no
+    // resample is required here.
+    #[cfg(feature = "opus")]
+    if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        let extra: &[u8] = codec_params.extra_data.as_deref().unwrap_or(&[]);
+        let head = crate::player::opus::parse_opus_head(extra)
+            .ok_or("Opus track missing OpusHead sideband")?;
+        {
+            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            ab.channels = head.channels;
+            ab.file_sample_rate = 48000;
+        }
+        let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
+        let mut last_file_size = file_size;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            match format.next_packet() {
+                Ok(packet) => {
+                    if packet.track_id() != track_id {
+                        continue;
+                    }
+                    let out = opus_dec.push(packet.buf());
+                    if !out.is_empty() {
+                        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        ab.pcm.extend_from_slice(&out);
+                    }
+                    stall_cycles = 0;
+                }
+                Err(symphonia::core::errors::Error::IoError(_)) => {
+                    let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if current_size > last_file_size {
+                        last_file_size = current_size;
+                        stall_cycles = 0;
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    } else if stall_cycles > 20 {
+                        break;
+                    } else {
+                        stall_cycles += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        return Ok(());
+    }
 
     let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
     let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);

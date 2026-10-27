@@ -6,6 +6,32 @@ fn main() {
     println!("cargo:rustc-env=L337_VERSION={}", version);
 
     link_pulseaudio_for_termux();
+    link_opus();
+}
+
+/// Link the real libopus for server-side Opus decoding (see src/player/opus.rs).
+///
+/// Gated on the `opus` crate feature so cross targets that cannot supply libopus
+/// never link it, and on `linux`/`android` where a system libopus exists
+/// (desktop dev packages; Termux `libopus` at runtime). Resolved through the
+/// normal linker path — the same strategy as libpulse, not `dlopen`.
+fn link_opus() {
+    if env::var_os("CARGO_FEATURE_OPUS").is_none() {
+        return;
+    }
+    let target_os = env::var_os("CARGO_CFG_TARGET_OS");
+    let supported = matches!(
+        target_os.as_deref(),
+        Some(OsStr::new("linux")) | Some(OsStr::new("android"))
+    );
+    if !supported {
+        return;
+    }
+    // On Android/Termux the NDK has no system opus; reuse the same run-path
+    // approach as libpulse (LD_LIBRARY_PATH=$PREFIX/lib supplies libopus.so).
+    // Cross-compile link-time resolution needs the NDK sysroot, added in A1.
+    println!("cargo:rustc-link-lib=dylib=opus");
+    println!("cargo:rerun-if-changed=build.rs");
 }
 
 /// Link the Android/Termux PulseAudio backend against libpulse at build time.

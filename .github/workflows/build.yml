@@ -117,11 +117,11 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: ""
-            pkg_deps: libpipewire-0.3-dev libspa-0.2-dev
+            features: "--features opus"
+            pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev
           - variant: alsa
-            features: "--no-default-features --features alsa"
-            pkg_deps: ""
+            features: "--no-default-features --features alsa,opus"
+            pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
@@ -204,11 +204,11 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: ""
-            pkg_deps: libpipewire-0.3-dev libspa-0.2-dev
+            features: "--features opus"
+            pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev
           - variant: alsa
-            features: "--no-default-features --features alsa"
-            pkg_deps: ""
+            features: "--no-default-features --features alsa,opus"
+            pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
