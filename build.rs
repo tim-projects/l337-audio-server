@@ -24,18 +24,15 @@ fn link_opus() {
         return;
     }
     let target_os = env::var_os("CARGO_CFG_TARGET_OS");
-    match target_os.as_deref() {
-        Some(OsStr::new("linux")) => {
-            println!("cargo:rustc-link-lib=dylib=opus");
-        }
-        Some(OsStr::new("android")) => {
-            let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-            let stubs = format!("{}/scripts/opus-stubs", manifest_dir);
-            println!("cargo:rustc-link-search=native={}", stubs);
-            println!("cargo:rustc-link-lib=dylib=opus");
-            println!("cargo:rerun-if-changed={}", stubs);
-        }
-        _ => {}
+    let os = target_os.as_deref();
+    if os == Some(OsStr::new("linux")) {
+        println!("cargo:rustc-link-lib=dylib=opus");
+    } else if os == Some(OsStr::new("android")) {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let stubs = format!("{}/scripts/opus-stubs", manifest_dir);
+        println!("cargo:rustc-link-search=native={}", stubs);
+        println!("cargo:rustc-link-lib=dylib=opus");
+        println!("cargo:rerun-if-changed={}", stubs);
     }
 }
 
