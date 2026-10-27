@@ -324,7 +324,7 @@ jobs:
     - name: Build release binary
       run: |
         if [ "${{ matrix.variant }}" = "termux" ]; then
-          cargo build --verbose --release --target aarch64-linux-android --features pulseaudio
+          cargo build --verbose --release --target aarch64-linux-android --features pulseaudio,opus
         else
           cargo build --verbose --release --target aarch64-linux-android
         fi

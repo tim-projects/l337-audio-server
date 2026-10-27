@@ -12,26 +12,31 @@ fn main() {
 /// Link the real libopus for server-side Opus decoding (see src/player/opus.rs).
 ///
 /// Gated on the `opus` crate feature so cross targets that cannot supply libopus
-/// never link it, and on `linux`/`android` where a system libopus exists
-/// (desktop dev packages; Termux `libopus` at runtime). Resolved through the
-/// normal linker path — the same strategy as libpulse, not `dlopen`.
+/// never link it, and on `linux`/`android`:
+///   - linux: link the system libopus (libopus-dev on CI; `pkg install libopus`
+///     on Termux-native).
+///   - android: the NDK has no system opus, so link the stub in
+///     `scripts/opus-stubs` (SONAME libopus.so), which the loader resolves
+///     against the real `$PREFIX/lib/libopus.so` at runtime — the same strategy
+///     as the libpulse stub, and never `dlopen`.
 fn link_opus() {
     if env::var_os("CARGO_FEATURE_OPUS").is_none() {
         return;
     }
     let target_os = env::var_os("CARGO_CFG_TARGET_OS");
-    let supported = matches!(
-        target_os.as_deref(),
-        Some(OsStr::new("linux")) | Some(OsStr::new("android"))
-    );
-    if !supported {
-        return;
+    match target_os.as_deref() {
+        Some(OsStr::new("linux")) => {
+            println!("cargo:rustc-link-lib=dylib=opus");
+        }
+        Some(OsStr::new("android")) => {
+            let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+            let stubs = format!("{}/scripts/opus-stubs", manifest_dir);
+            println!("cargo:rustc-link-search=native={}", stubs);
+            println!("cargo:rustc-link-lib=dylib=opus");
+            println!("cargo:rerun-if-changed={}", stubs);
+        }
+        _ => {}
     }
-    // On Android/Termux the NDK has no system opus; reuse the same run-path
-    // approach as libpulse (LD_LIBRARY_PATH=$PREFIX/lib supplies libopus.so).
-    // Cross-compile link-time resolution needs the NDK sysroot, added in A1.
-    println!("cargo:rustc-link-lib=dylib=opus");
-    println!("cargo:rerun-if-changed=build.rs");
 }
 
 /// Link the Android/Termux PulseAudio backend against libpulse at build time.
