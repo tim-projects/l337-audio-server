@@ -1,8 +1,9 @@
 #!/bin/bash
 # install-linux-alsa.sh — Linux ALSA binary installer (system service)
 #
-# Downloads l337-audio-server-{arch}-linux-alsa from GitHub releases and
-# installs it as a systemd system service.
+# Downloads l337-audio-server-{arch}-linux-alsa-glibc{X.Y} from GitHub releases
+# and installs it as a systemd system service. X.Y is the glibc the binary was
+# built on; the newest release whose tier this system's glibc can run wins.
 #
 # Usage:
 #   sudo ./scripts/install-linux-alsa.sh
@@ -166,34 +167,19 @@ info "Platform: $OS_TYPE / $ARCH_TYPE"
 # ---------------------------------------------------------------------------
 # GitHub release helpers
 # ---------------------------------------------------------------------------
-extract_prerelease() {
-    awk '
-        /^  \{/ {
-            release=$0 "\n"
-            in_release=1
-            next
-        }
-        in_release {
-            release=release $0 "\n"
-            if ($0 ~ /^  \},?$/) {
-                if (release ~ /"prerelease"[[:space:]]*:[[:space:]]*true/) {
-                    printf "%s", release
-                    exit
-                }
-                release=""
-                in_release=0
-            }
-        }
-    '
-}
-
-get_latest_release_json() {
+# Released Linux assets are named
+#   l337-audio-server-<arch>-linux-<variant>-glibc<X.Y>
+# where X.Y is the glibc the binary was built on (the oldest glibc it can run
+# on). Releases are walked newest-first and the first one shipping a tier this
+# system's glibc can run wins, so a newer release that needs a newer glibc never
+# shadows an older release that still works here. Systems older than every
+# published tier must build from source.
+fetch_release_data() {
     local endpoint
     local url
     local response_file
     local http_code
     local message
-    local release
 
     if [ "$INSTALL_PRERELEASE" = true ]; then
         endpoint="releases?per_page=100"
@@ -220,21 +206,124 @@ get_latest_release_json() {
         fail "GitHub returned HTTP $http_code while querying stable releases. ${message:-} Re-run with --pre-release to install a prerelease."
     fi
 
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        release=$(extract_prerelease < "$response_file")
-    else
-        release=$(cat "$response_file")
-    fi
+    cat "$response_file"
     rm -f "$response_file"
+}
 
-    if [ -z "$release" ]; then
+# Flatten release JSON into one line per published asset:
+#   <tag> <prerelease:0|1> <asset filename> <published_at> <download url>
+# Rows come out newest release first, exactly as the GitHub API orders them.
+release_assets() {
+    awk '
+        /"tag_name"[[:space:]]*:/ {
+            t=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",t); sub(/".*/,"",t); tag=t; next
+        }
+        /"prerelease"[[:space:]]*:/ { pre=($0 ~ /: *true/) ? 1 : 0; next }
+        /"published_at"[[:space:]]*:/ {
+            p=$0; sub(/.*"published_at"[[:space:]]*:[[:space:]]*"/,"",p); sub(/".*/,"",p); pub=p; next
+        }
+        /"browser_download_url"[[:space:]]*:/ {
+            u=$0; sub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/,"",u); sub(/".*/,"",u)
+            n=split(u, part, "/")
+            printf "%s\t%d\t%s\t%s\t%s\n", tag, pre, part[n], pub, u
+            next
+        }
+    '
+}
+
+# Pick the newest release that ships a glibc tier this system can run, and the
+# highest such tier inside it (the lowest tier when the system glibc is unknown
+# so an unreadable libc still gets the most compatible binary).
+# Sets SELECTED_TAG, SELECTED_ASSET, SELECTED_URL, SELECTED_TIER,
+# SELECTED_PUBLISHED; returns 1 when no compatible asset exists.
+# shortcut: only the newest 100 releases are searched (the API page size and
+# this script does not follow pagination); an old-glibc system older than that
+# window has to build from source.
+select_compatible_release() {
+    local base="$1"
+    local r_tag r_pre r_name r_pub r_url r_tier data
+
+    SELECTED_TAG=""
+    SELECTED_ASSET=""
+    SELECTED_URL=""
+    SELECTED_TIER=""
+    SELECTED_PUBLISHED=""
+
+    data=$(fetch_release_data)
+
+    while IFS=$'\t' read -r r_tag r_pre r_name r_pub r_url; do
         if [ "$INSTALL_PRERELEASE" = true ]; then
-            fail "No prerelease found for ${REPO}."
+            if [ "$r_pre" != "1" ]; then
+                continue
+            fi
         fi
-        fail "No stable release found for ${REPO}."
+
+        case "$r_name" in
+            "$base"-glibc*) ;;
+            *) continue ;;
+        esac
+
+        r_tier="${r_name##*-glibc}"
+
+        if [ -n "$SYSTEM_GLIBC" ]; then
+            if version_lt "$SYSTEM_GLIBC" "$r_tier"; then
+                continue
+            fi
+        fi
+
+        if [ -z "$SELECTED_TAG" ]; then
+            SELECTED_TAG="$r_tag"
+            SELECTED_ASSET="$r_name"
+            SELECTED_URL="$r_url"
+            SELECTED_TIER="$r_tier"
+            SELECTED_PUBLISHED="$r_pub"
+            continue
+        fi
+
+        # Only compare tiers inside the release that already matched.
+        if [ "$r_tag" != "$SELECTED_TAG" ]; then
+            continue
+        fi
+
+        if [ -n "$SYSTEM_GLIBC" ]; then
+            if version_lt "$SELECTED_TIER" "$r_tier"; then
+                SELECTED_ASSET="$r_name"
+                SELECTED_URL="$r_url"
+                SELECTED_TIER="$r_tier"
+            fi
+        else
+            if version_lt "$r_tier" "$SELECTED_TIER"; then
+                SELECTED_ASSET="$r_name"
+                SELECTED_URL="$r_url"
+                SELECTED_TIER="$r_tier"
+            fi
+        fi
+    done <<<"$(printf '%s\n' "$data" | release_assets)"
+
+    [ -n "$SELECTED_TAG" ]
+}
+
+# Highest glibc symbol version the running libc exports, i.e. the oldest glibc
+# a binary may have been built on to still run here. Empty when undetectable.
+system_glibc_version() {
+    local v=""
+
+    v=$(ldd --version 2>/dev/null | head -1 \
+        | sed -n 's/.*[[:space:]]\([0-9][0-9]*\.[0-9][0-9.]*\)[[:space:]]*$/\1/p')
+    if [ -z "$v" ]; then
+        v=$(getconf GNU_LIBC_VERSION 2>/dev/null \
+            | sed -n 's/.*glibc[[:space:]]*\([0-9][0-9]*\.[0-9][0-9.]*\).*/\1/p')
     fi
 
-    printf '%s\n' "$release"
+    printf '%s' "$v"
+}
+
+# version_lt: true when $1 sorts before $2. Equal versions are not "less than".
+version_lt() {
+    if [ "$1" = "$2" ]; then
+        return 1
+    fi
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
 }
 
 parse_json_field() {
@@ -243,6 +332,8 @@ parse_json_field() {
     echo "$json" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true
 }
 
+# Tier-less asset base name. The glibc tier is appended by the publisher as
+# -glibc<X.Y>, and select_compatible_release matches it against the system.
 get_asset_name() {
     local os="$1"
     local arch="$2"
@@ -611,7 +702,10 @@ Stop it and re-run:  kill ${pids}"
     done
 
     # A download that fell back to /tmp leaves the whole binary there.
-    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
+    # A download that fell back to /tmp leaves the whole binary there. The
+    # temp name carries the glibc tier, and pre-tier releases had no suffix.
+    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp" \
+          "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")-glibc"*.tmp
 
     if [ "$REMOVE_DATA" = true ]; then
         info "Removing data directories..."
@@ -683,18 +777,27 @@ require_root
 check_dependencies
 
 info "Checking for latest release..."
-RELEASE_JSON=$(get_latest_release_json)
-LATEST_TAG=$(parse_json_field "$RELEASE_JSON" "tag_name")
-PUBLISHED_AT=$(parse_json_field "$RELEASE_JSON" "published_at")
 
-if [ -z "$LATEST_TAG" ]; then
-    fail "Could not determine latest release tag"
+SYSTEM_GLIBC=$(system_glibc_version)
+if [ -n "$SYSTEM_GLIBC" ]; then
+    info "System glibc: $SYSTEM_GLIBC (assets are tagged -glibc<X.Y> by the glibc they were built on)"
+else
+    warn "Could not determine the system glibc version; using the most compatible asset tier."
 fi
 
-info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
+if ! select_compatible_release "$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")"; then
+    fail "No release of ${REPO} provides an ALSA binary for ${OS_TYPE}/${ARCH_TYPE} on glibc ${SYSTEM_GLIBC:-unknown}.
 
-ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")
-info "Selected asset: $ASSET_NAME"
+The oldest published tier needs a newer glibc. This system must build from source."
+fi
+
+LATEST_TAG="$SELECTED_TAG"
+PUBLISHED_AT="$SELECTED_PUBLISHED"
+ASSET_NAME="$SELECTED_ASSET"
+DOWNLOAD_URL="$SELECTED_URL"
+
+info "Latest compatible release: $LATEST_TAG (published: $PUBLISHED_AT)"
+info "Selected asset: $ASSET_NAME (glibc $SELECTED_TIER)"
 
 INSTALLED_VERSION=""
 if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
@@ -731,7 +834,7 @@ if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
     fi
 fi
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET_NAME}"
+# DOWNLOAD_URL and ASSET_NAME were resolved above by select_compatible_release.
 NEW_BIN=""
 if mkdir -p "$INSTALL_DIR/.tmp" 2>/dev/null && [ -w "$INSTALL_DIR/.tmp" ]; then
     NEW_BIN="$INSTALL_DIR/.tmp/l337-audio-server.new"

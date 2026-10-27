@@ -25,6 +25,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # glibc floor of the released Linux binaries — the glibc of the pinned build
+  # image below, and the oldest glibc the released binaries can run on. Every
+  # Linux release asset is named with this value:
+  #     l337-audio-server-<arch>-linux-<variant>-glibc2.36
+  # so the installer can match it against the system's glibc and install the
+  # newest release the system can run. Bump this ONLY together with the image
+  # in the Linux jobs below: the "Check glibc compatibility" step fails the
+  # build if the binary actually requires a newer glibc than declared here.
+  L337_GLIBC: "2.36"
 
 concurrency:
   group: build-release
@@ -65,9 +74,24 @@ jobs:
           echo "version=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Computed release tag: ${TAG}"
 
+  # IMPORTANT: every glibc-linked Linux job builds inside this pinned image.
+  # Do not build these binaries natively on the runner again. Release
+  # 2026.10.26-4 was linked on ubuntu-latest (Ubuntu 26.04), toolchain defaults
+  # had moved silently: GCC 16 now defaults to C23 mode, which makes glibc's
+  # headers redirect `sscanf` to `__isoc23_sscanf` (glibc >= 2.38 only) and
+  # rebind `atan2f` to GLIBC_2.43. The aws-lc-sys C code only calls plain
+  # `sscanf`/`atan2f`, so the binary silently started requiring GLIBC_2.43 and
+  # refused to start on any system with an older glibc (installer rolled back).
+  # Debian 12 (bookworm) is frozen: glibc 2.36, GCC 12 (gnu17 default), PipeWire
+  # 0.3.65. The released binaries then run on glibc >= 2.36 (Debian 12,
+  # Ubuntu 24.04+, Fedora 40+, RHEL 10). The "Check glibc compatibility" step
+  # below enforces that floor in CI so this can never regress silently again,
+  # and every Linux asset this job publishes is named with the floor
+  # (-glibc2.36) so the installer can match it against the system's glibc.
   build-linux:
     name: Build - x86_64-linux (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    container: rust:1.99.1-bookworm
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'x86_64-linux-pipewire' || github.event.inputs.target == 'x86_64-linux-alsa' }}
     strategy:
@@ -84,20 +108,21 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
-    - name: Install dependencies (Linux)
+    - name: Install dependencies and Rust target
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pkg-config ${{ matrix.pkg_deps }}
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: x86_64-unknown-linux-gnu
+        apt-get update
+        apt-get install -y --no-install-recommends pkg-config ${{ matrix.pkg_deps }}
+        rustup target add x86_64-unknown-linux-gnu
     - name: Build release binary
       run: cargo build --verbose --release --target x86_64-unknown-linux-gnu ${{ matrix.features }}
+    - name: Check glibc compatibility
+      run: |
+        command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
+        bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/x86_64-unknown-linux-gnu/release/l337-audio-server" "$L337_GLIBC"
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-x86_64-linux-${{ matrix.variant }}
+        name: l337-audio-server-x86_64-linux-${{ matrix.variant }}-glibc${{ env.L337_GLIBC }}
         path: |
           target/x86_64-unknown-linux-gnu/release/l337-audio-server
         retention-days: 90
@@ -153,6 +178,7 @@ jobs:
   build-linux-arm64:
     name: Build - aarch64-linux (${{ matrix.variant }})
     runs-on: ubuntu-24.04-arm
+    container: rust:1.99.1-bookworm
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'aarch64-linux-pipewire' || github.event.inputs.target == 'aarch64-linux-alsa' }}
     strategy:
@@ -169,20 +195,21 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
-    - name: Install dependencies (Linux ARM64)
+    - name: Install dependencies and Rust target
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pkg-config ${{ matrix.pkg_deps }}
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: aarch64-unknown-linux-gnu
+        apt-get update
+        apt-get install -y --no-install-recommends pkg-config ${{ matrix.pkg_deps }}
+        rustup target add aarch64-unknown-linux-gnu
     - name: Build release binary
       run: cargo build --verbose --release --target aarch64-unknown-linux-gnu ${{ matrix.features }}
+    - name: Check glibc compatibility
+      run: |
+        command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
+        bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/aarch64-unknown-linux-gnu/release/l337-audio-server" "$L337_GLIBC"
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-aarch64-linux-${{ matrix.variant }}
+        name: l337-audio-server-aarch64-linux-${{ matrix.variant }}-glibc${{ env.L337_GLIBC }}
         path: |
           target/aarch64-unknown-linux-gnu/release/l337-audio-server
         retention-days: 90
@@ -190,6 +217,7 @@ jobs:
   build-linux-arm32:
     name: Build - armv7-linux (alsa)
     runs-on: ubuntu-24.04-arm
+    container: rust:1.99.1-bookworm
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'armv7-linux-alsa' }}
     env:
@@ -198,20 +226,21 @@ jobs:
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_AR: arm-linux-gnueabihf-ar
     steps:
     - uses: actions/checkout@v4
-    - name: Install dependencies (Linux ARM32)
+    - name: Install dependencies and Rust target
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pkg-config gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: armv7-unknown-linux-gnueabihf
+        apt-get update
+        apt-get install -y --no-install-recommends pkg-config gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+        rustup target add armv7-unknown-linux-gnueabihf
     - name: Build release binary
       run: cargo build --verbose --release --target armv7-unknown-linux-gnueabihf --no-default-features --features alsa
+    - name: Check glibc compatibility
+      run: |
+        command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
+        bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/armv7-unknown-linux-gnueabihf/release/l337-audio-server" "$L337_GLIBC"
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-armv7-linux-alsa
+        name: l337-audio-server-armv7-linux-alsa-glibc${{ env.L337_GLIBC }}
         path: |
           target/armv7-unknown-linux-gnueabihf/release/l337-audio-server
         retention-days: 90
@@ -219,6 +248,7 @@ jobs:
   build-linux-riscv64:
     name: Build - riscv64-linux (alsa)
     runs-on: ubuntu-24.04-arm
+    container: rust:1.99.1-bookworm
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'riscv64-linux-alsa' }}
     env:
@@ -227,20 +257,21 @@ jobs:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_AR: riscv64-linux-gnu-ar
     steps:
     - uses: actions/checkout@v4
-    - name: Install dependencies (Linux RISC-V)
+    - name: Install dependencies and Rust target
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pkg-config gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: riscv64gc-unknown-linux-gnu
+        apt-get update
+        apt-get install -y --no-install-recommends pkg-config gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
+        rustup target add riscv64gc-unknown-linux-gnu
     - name: Build release binary
       run: cargo build --verbose --release --target riscv64gc-unknown-linux-gnu --no-default-features --features alsa
+    - name: Check glibc compatibility
+      run: |
+        command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
+        bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/riscv64gc-unknown-linux-gnu/release/l337-audio-server" "$L337_GLIBC"
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: l337-audio-server-riscv64-linux-alsa
+        name: l337-audio-server-riscv64-linux-alsa-glibc${{ env.L337_GLIBC }}
         path: |
           target/riscv64gc-unknown-linux-gnu/release/l337-audio-server
         retention-days: 90
