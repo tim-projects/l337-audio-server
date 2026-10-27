@@ -1,0 +1,24 @@
+name: Monthly Release
+
+on:
+  schedule:
+    # 05:17 UTC on the first day of every month. GitHub only guarantees a rough
+    # window for scheduled workflows and may skip a run entirely under load, so
+    # workflow_dispatch below lets a missed month be kicked off by hand.
+    - cron: "17 5 1 * *"
+  workflow_dispatch:
+    inputs:
+      official:
+        description: 'Publish as an official release (unchecked = prerelease)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  release:
+    name: Monthly official release
+    uses: ./.github/workflows/build.yml
+    with:
+      # A scheduled run has no inputs, so it falls back to official.
+      official: ${{ inputs.official || true }}
+    secrets: inherit
