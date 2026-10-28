@@ -463,6 +463,9 @@ impl PlayerEngine {
                 return;
             }
         };
+        // Compressed file size, captured before `bytes` is moved into the decode
+        // task — the delivered source bitrate estimate (G2 actual_kbps).
+        let bytes_len = bytes.len();
 
         let decode = tokio::task::spawn_blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)))
@@ -502,7 +505,7 @@ impl PlayerEngine {
         // source — compressed file bytes over duration is the true source bitrate.
         self.codec_label = codec;
         self.actual_kbps = if duration_sec > 0 {
-            Some((bytes.len() as u64 * 8 / 1000 / duration_sec.max(1)) as u32)
+            Some((bytes_len as u64 * 8 / 1000 / duration_sec.max(1)) as u32)
         } else {
             None
         };
