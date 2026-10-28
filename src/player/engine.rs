@@ -1,4 +1,4 @@
-use crate::api::models::{PlayerStateLabel, PlayerStatus, Track};
+use crate::api::models::{resolve_ceiling, PlayerStateLabel, PlayerStatus, Track};
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 use crate::player::storage::StorageManager;
 use rubato::Resampler;
@@ -90,10 +90,21 @@ pub struct PlayerEngine {
     file_sample_rate: u32,
     channels: u16,
     streaming: Option<StreamingPlayback>,
+    /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
+    default_target_kbps: u32,
+    /// Runtime-mutable default ceiling (kbps); per-track `target_kbps`/`quality`
+    /// override it per request. `0` = best. Set via `POST /player/target`.
+    runtime_target_kbps: u32,
+    /// Effective ceiling (kbps) applied to the current/last track (for status).
+    effective_target_kbps: u32,
+    /// Delivered bitrate of the current/last track when known (for PlayerStatus).
+    actual_kbps: Option<u32>,
+    /// Short codec label of the current/last track when known (for PlayerStatus).
+    codec_label: Option<String>,
 }
 
 impl PlayerEngine {
-    pub fn new(storage: StorageManager, buffer_max_bytes: u64) -> Result<Self, String> {
+    pub fn new(storage: StorageManager, buffer_max_bytes: u64, default_target_kbps: u32) -> Result<Self, String> {
         let mut audio_buffer = AudioBuffer::new(48000, 0);
         audio_buffer.max_bytes = buffer_max_bytes as usize;
         let audio_buffer = Arc::new(Mutex::new(audio_buffer));
@@ -162,6 +173,11 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            default_target_kbps,
+            runtime_target_kbps: default_target_kbps,
+            effective_target_kbps: default_target_kbps,
+            actual_kbps: None,
+            codec_label: None,
         })
     }
 
@@ -182,6 +198,11 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            default_target_kbps: 0,
+            runtime_target_kbps: 0,
+            effective_target_kbps: 0,
+            actual_kbps: None,
+            codec_label: None,
         }
     }
 
@@ -237,7 +258,7 @@ impl PlayerEngine {
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let decode =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)));
-        let (mut pcm, file_sample_rate, channels) = match decode {
+        let (mut pcm, file_sample_rate, channels, _codec) = match decode {
             Ok(Ok(result)) => result,
             _ => return Err("decode failed".to_string()),
         };
@@ -314,6 +335,17 @@ impl PlayerEngine {
         self.stop();
         self.current_track = Some(track.clone());
 
+        // G2: resolve the bandwidth ceiling for this request and remember it (and
+        // reset the observable bitrate/codec) so PlayerStatus reflects this play.
+        let ceiling = resolve_ceiling(
+            track.target_kbps,
+            track.quality,
+            self.runtime_target_kbps,
+        );
+        self.effective_target_kbps = ceiling;
+        self.actual_kbps = None;
+        self.codec_label = None;
+
         let cached_path = self.storage.get_path_for_track(&track.track_id);
         if cached_path.exists() {
             info!("play_track: cache hit for {}", track.track_id);
@@ -326,13 +358,13 @@ impl PlayerEngine {
 
         if is_youtube_url(&track.stream_url) {
             info!("play_track: YouTube streaming for {}", track.stream_url);
-            if let Err(e) = self.start_streaming_playback(&track.stream_url).await {
+            if let Err(e) = self.start_streaming_playback(&track.stream_url, ceiling).await {
                 if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
                     return Err(EngineError::YouTube(yt_err.clone()));
                 }
                 error!("YouTube streaming failed, falling back to download: {}", e);
                 let path = self.storage.get_active_slot_path("current");
-                if let Err(e) = download_stream(&track.stream_url, &path).await {
+                if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
                     let err_box = e;
                     if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
                         return Err(EngineError::YouTube(yt_err.clone()));
@@ -352,7 +384,7 @@ impl PlayerEngine {
             path.display()
         );
 
-        if let Err(e) = download_stream(&track.stream_url, &path).await {
+        if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
             let err_box = e;
             if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
                 return Err(EngineError::YouTube(yt_err.clone()));
@@ -392,6 +424,8 @@ impl PlayerEngine {
             title,
             artist,
             duration: None,
+            target_kbps: None,
+            quality: None,
         });
 
         let path = self.storage.get_active_slot_path(slot);
@@ -432,7 +466,7 @@ impl PlayerEngine {
         })
         .await;
 
-        let (pcm, file_sample_rate, channels) = match decode {
+        let (pcm, file_sample_rate, channels, codec) = match decode {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(e))) => {
                 error!(
@@ -443,7 +477,7 @@ impl PlayerEngine {
                 );
                 return;
             }
-            Ok(Err(_)) => {
+            Ok(Ok(Err(e))) => {
                 error!(
                     "load_and_play({}): decoder panicked on {} (unsupported/corrupt container)",
                     slot,
@@ -451,7 +485,7 @@ impl PlayerEngine {
                 );
                 return;
             }
-            Err(e) => {
+            Ok(Err(_)) => {
                 error!("load_and_play({}): decode task join error: {}", slot, e);
                 return;
             }
@@ -459,7 +493,16 @@ impl PlayerEngine {
 
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
-        self.duration_sec = Some(((pcm.len() / channels as usize) as f64 / file_sample_rate as f64).round() as u64);
+        let duration_sec = ((pcm.len() / channels as usize) as f64 / file_sample_rate as f64).round() as u64;
+        self.duration_sec = Some(duration_sec);
+        // G2 observability: codec + delivered bitrate of this (file/download)
+        // source — compressed file bytes over duration is the true source bitrate.
+        self.codec_label = codec;
+        self.actual_kbps = if duration_sec > 0 {
+            Some((bytes.len() as u64 * 8 / 1000 / duration_sec.max(1)) as u32)
+        } else {
+            None
+        };
 
         let device_rate = {
             let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -531,15 +574,18 @@ impl PlayerEngine {
         self.state = PlayerStateLabel::Stopped;
     }
 
-    async fn start_streaming_playback(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn start_streaming_playback(&mut self, url: &str, ceiling: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
-        let direct_url = if is_direct_stream_url(url) {
-            url.to_string()
+        let (direct_url, abr, codec) = if is_direct_stream_url(url) {
+            (url.to_string(), None, None)
         } else {
-            resolve_youtube_stream_url(url).await?
+            resolve_youtube_stream_url(url, ceiling).await?
         };
+        // Record the delivered bitrate / codec of the chosen rendition (G2).
+        self.actual_kbps = abr;
+        self.codec_label = codec;
 
         let dl_path = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -607,6 +653,28 @@ impl PlayerEngine {
             tracing::warn!("PipeWire volume control unavailable, using software gain: {e}");
             *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
         }
+    }
+
+    /// G2: change the default bandwidth ceiling at runtime without a restart.
+    /// `target_kbps = 0` (or null) or an unknown label resets to the server
+    /// default (best).
+    pub fn set_target(&mut self, payload: crate::api::models::TargetPayload) {
+        self.runtime_target_kbps = resolve_ceiling(
+            payload.target_kbps,
+            payload.quality,
+            self.default_target_kbps,
+        );
+    }
+
+    /// The server-configured default ceiling (kbps); `0` = best.
+    pub fn default_target_kbps(&self) -> u32 {
+        self.default_target_kbps
+    }
+
+    /// The current runtime default ceiling (kbps); may differ from the config
+    /// default after `set_target`. `0` = best.
+    pub fn current_default_target_kbps(&self) -> u32 {
+        self.runtime_target_kbps
     }
 
     fn set_pipewire_sink_input_volume(&self, volume: f32) -> Result<(), String> {
@@ -679,7 +747,7 @@ impl PlayerEngine {
         let decode =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)));
 
-        let (mut pcm, file_sample_rate, channels) = match decode {
+        let (mut pcm, file_sample_rate, channels, _codec) = match decode {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 error!("seek: decode failed on {}: {:?}", path.display(), e);
@@ -785,6 +853,9 @@ impl PlayerEngine {
                 position_sec: Some(0),
                 duration_sec: self.duration_sec,
                 audio_available: self.stream.is_some(),
+                target_kbps: self.effective_target_kbps,
+                actual_kbps: self.actual_kbps,
+                codec: self.codec_label.clone(),
             };
         }
 
@@ -817,13 +888,42 @@ impl PlayerEngine {
             position_sec,
             duration_sec: self.duration_sec,
             audio_available: self.stream.is_some(),
+            target_kbps: self.effective_target_kbps,
+            actual_kbps: self.actual_kbps,
+            codec: self.codec_label.clone(),
         }
     }
 }
 
+/// Map a Symphonia codec type to the short label shown in `PlayerStatus.codec`.
+fn codec_label(ct: symphonia::core::codecs::CodecType) -> Option<String> {
+    use symphonia::core::codecs::{
+        CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_OPUS,
+        CODEC_TYPE_PCM_S16LE, CODEC_TYPE_VORBIS,
+    };
+    let s = if ct == CODEC_TYPE_OPUS {
+        "opus"
+    } else if ct == CODEC_TYPE_AAC {
+        "aac"
+    } else if ct == CODEC_TYPE_VORBIS {
+        "vorbis"
+    } else if ct == CODEC_TYPE_MP3 {
+        "mp3"
+    } else if ct == CODEC_TYPE_FLAC {
+        "flac"
+    } else if ct == CODEC_TYPE_ALAC {
+        "alac"
+    } else if ct == CODEC_TYPE_PCM_S16LE {
+        "pcm_s16le"
+    } else {
+        return None;
+    };
+    Some(s.to_string())
+}
+
 pub(crate) fn decode_to_pcm(
     bytes: Vec<u8>,
-) -> Result<(Vec<f32>, u32, u16), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<f32>, u32, u16, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::io::MediaSourceStream;
 
@@ -842,6 +942,7 @@ pub(crate) fn decode_to_pcm(
     let track = format.default_track().ok_or("no default track")?;
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
+    let codec = codec_label(codec_params.codec);
 
     // Symphonia has no Opus decoder; route Opus tracks to libopus (G1).
     #[cfg(feature = "opus")]
@@ -861,7 +962,7 @@ pub(crate) fn decode_to_pcm(
             }
             pcm.extend(opus_dec.push(packet.buf()));
         }
-        return Ok((pcm, 48000, head.channels));
+        return Ok((pcm, 48000, head.channels, Some("opus".to_string())));
     }
 
     tracing::info!(?codec_params, codec_id = ?codec_params.codec, "decode_to_pcm: probing result");
@@ -914,7 +1015,7 @@ pub(crate) fn decode_to_pcm(
             2
         }
     };
-    Ok((pcm, sample_rate, channels.max(1)))
+    Ok((pcm, sample_rate, channels.max(1), codec))
 }
 
 pub(crate) fn resample_interleaved(
@@ -1079,6 +1180,7 @@ pub(crate) static DOWNLOAD_STREAM_INVOKED: std::sync::atomic::AtomicBool =
 pub async fn download_stream(
     url: &str,
     dest: &PathBuf,
+    ceiling: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
 
@@ -1106,7 +1208,7 @@ pub async fn download_stream(
         if !yt_dlp_available() {
             return Err("yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into());
         }
-        return download_via_ytdlp(url, dest)
+        return download_via_ytdlp(url, dest, ceiling)
             .await
             .map_err(|e| format!("yt-dlp download failed for {url}: {e}").into());
     }
@@ -1202,6 +1304,7 @@ fn yt_dlp_available() -> bool {
 async fn download_via_ytdlp(
     url: &str,
     dest: &PathBuf,
+    ceiling: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to download YouTube URLs.".into());
@@ -1213,7 +1316,7 @@ async fn download_via_ytdlp(
         .arg("--no-config")
         .arg("--no-warnings")
         .arg("-f")
-        .arg("bestaudio")
+        .arg(&yt_dlp_format_selector(ceiling))
         .arg("--no-playlist")
         .arg("-o")
         .arg(dest)
@@ -1242,7 +1345,47 @@ async fn download_via_ytdlp(
     Ok(())
 }
 
-async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// yt-dlp audio format selector for a bandwidth ceiling (G2). `0` = best. The
+/// trailing `bestaudio` fallback keeps selection from ever failing; yt-dlp's
+/// `abr` is approximate, so the result can exceed the ceiling when nothing fits
+/// under it — reported honestly via `actual_kbps`.
+fn yt_dlp_format_selector(ceiling: u32) -> String {
+    if ceiling == 0 {
+        "bestaudio".to_string()
+    } else {
+        format!("bestaudio[abr<={ceiling}]/bestaudio")
+    }
+}
+
+/// Map a yt-dlp `acodec` string to the short label used in `PlayerStatus.codec`.
+fn normalize_codec(acodec: &str) -> Option<String> {
+    let a = acodec.trim();
+    if a.is_empty() || a.eq_ignore_ascii_case("none") || a.eq_ignore_ascii_case("na") {
+        return None;
+    }
+    let label = if a.starts_with("opus") {
+        "opus"
+    } else if a.starts_with("mp4a") || a == "aac" {
+        "aac"
+    } else if a.starts_with("vorbis") {
+        "vorbis"
+    } else if a.starts_with("mp3") {
+        "mp3"
+    } else if a.starts_with("flac") {
+        "flac"
+    } else {
+        a
+    };
+    Some(label.to_string())
+}
+
+/// Resolve a YouTube page URL to a direct audio stream URL honoring `ceiling`,
+/// also returning the selected rendition's average bitrate and codec so
+/// `PlayerStatus` can show reality.
+async fn resolve_youtube_stream_url(
+    url: &str,
+    ceiling: u32,
+) -> Result<(String, Option<u32>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
     }
@@ -1250,10 +1393,11 @@ async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::er
     let output = TokioCommand::new("yt-dlp")
         .arg("--no-config")
         .arg("--no-warnings")
-        .arg("-g")
         .arg("-f")
-        .arg("bestaudio")
+        .arg(&yt_dlp_format_selector(ceiling))
         .arg("--no-playlist")
+        .arg("--print")
+        .arg("%(abr)s %(acodec)s %(url)s")
         .arg(url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1270,18 +1414,27 @@ async fn resolve_youtube_stream_url(url: &str) -> Result<String, Box<dyn std::er
     }
 
     if !output.status.success() {
-        return Err("yt-dlp -g failed".into());
+        return Err("yt-dlp format selection failed".into());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stream_url = stdout
+    let line = stdout
         .lines()
         .find(|line| !line.trim().is_empty())
-        .ok_or("yt-dlp -g returned empty output")?
+        .ok_or("yt-dlp returned empty output")?;
+    let mut parts = line.trim().splitn(3, ' ');
+    let abr = parts
+        .next()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .map(|v| v.round() as u32);
+    let codec = parts.next().and_then(normalize_codec);
+    let stream_url = parts
+        .next()
+        .ok_or("yt-dlp returned no url")?
         .trim()
         .to_string();
 
-    Ok(stream_url)
+    Ok((stream_url, abr, codec))
 }
 
 async fn stream_http_to_file(
@@ -1693,6 +1846,24 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
+    fn test_yt_dlp_format_selector() {
+        assert_eq!(yt_dlp_format_selector(0), "bestaudio");
+        assert_eq!(yt_dlp_format_selector(128), "bestaudio[abr<=128]/bestaudio");
+        assert_eq!(yt_dlp_format_selector(48), "bestaudio[abr<=48]/bestaudio");
+        assert_eq!(yt_dlp_format_selector(1024), "bestaudio[abr<=1024]/bestaudio");
+    }
+
+    #[test]
+    fn test_normalize_codec() {
+        assert_eq!(normalize_codec("opus").as_deref(), Some("opus"));
+        assert_eq!(normalize_codec("mp4a.40.2").as_deref(), Some("aac"));
+        assert_eq!(normalize_codec("vorbis").as_deref(), Some("vorbis"));
+        assert_eq!(normalize_codec("mp3").as_deref(), Some("mp3"));
+        assert_eq!(normalize_codec("none").as_deref(), None);
+        assert_eq!(normalize_codec("").as_deref(), None);
+    }
+
+    #[test]
     fn test_detect_youtube_block_rate_limit() {
         assert_eq!(
             detect_youtube_block("HTTP Error 429 Too Many Requests"),
@@ -1794,6 +1965,8 @@ exit 1
             title: None,
             artist: None,
             duration: None,
+            target_kbps: None,
+            quality: None,
         };
 
         let result = engine.play_track(track).await;

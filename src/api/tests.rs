@@ -62,6 +62,8 @@ mod tests {
             title: Some("Title".into()),
             artist: Some("Artist".into()),
             duration: Some(100),
+            target_kbps: None,
+            quality: None,
         };
         let response = play(State(state.clone()), Json(track)).await;
         assert_eq!(
@@ -101,6 +103,8 @@ mod tests {
             title: Some("Seek".into()),
             artist: Some("Test".into()),
             duration: Some(1),
+            target_kbps: None,
+            quality: None,
         };
         let _ = play(State(state.clone()), Json(track)).await;
 

@@ -1,4 +1,4 @@
-use crate::api::models::{AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload, Track, VolumePayload};
+use crate::api::models::{AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload, TargetPayload, Track, VolumePayload};
 use crate::player::engine::{self, PlayerEngine};
 use axum::{
     body::Body,
@@ -243,11 +243,16 @@ pub async fn cache_next(
     }
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
-        let (dest, track_id) = {
+        let (dest, track_id, ceiling) = {
             let engine = state_clone.0.lock().await;
             (
                 engine.storage.get_active_slot_path("next"),
                 track.track_id.clone(),
+                crate::api::models::resolve_ceiling(
+                    track.target_kbps,
+                    track.quality,
+                    engine.default_target_kbps(),
+                ),
             )
         };
 
@@ -255,7 +260,7 @@ pub async fn cache_next(
             "Starting background cache for track {} to next.stream",
             track_id
         );
-        if let Err(e) = engine::download_stream(&track.stream_url, &dest).await {
+        if let Err(e) = engine::download_stream(&track.stream_url, &dest, ceiling).await {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
             let engine = state_clone.0.lock().await;
@@ -280,11 +285,16 @@ pub async fn cache_previous(
     }
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
-        let (dest, track_id) = {
+        let (dest, track_id, ceiling) = {
             let engine = state_clone.0.lock().await;
             (
                 engine.storage.get_active_slot_path("prev"),
                 track.track_id.clone(),
+                crate::api::models::resolve_ceiling(
+                    track.target_kbps,
+                    track.quality,
+                    engine.default_target_kbps(),
+                ),
             )
         };
 
@@ -292,7 +302,7 @@ pub async fn cache_previous(
             "Starting background cache for track {} to prev.stream",
             track_id
         );
-        if let Err(e) = engine::download_stream(&track.stream_url, &dest).await {
+        if let Err(e) = engine::download_stream(&track.stream_url, &dest, ceiling).await {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
             let engine = state_clone.0.lock().await;
@@ -333,6 +343,16 @@ pub async fn seek(
     let mut engine = state.0.lock().await;
     engine.seek(payload.position);
     StatusCode::OK.into_response()
+}
+
+pub async fn set_target(
+    State(state): State<AppState>,
+    Json(payload): Json<TargetPayload>,
+) -> impl IntoResponse {
+    let mut engine = state.0.lock().await;
+    engine.set_target(payload);
+    let default = engine.current_default_target_kbps();
+    Json(serde_json::json!({"ok": true, "target_kbps": default})).into_response()
 }
 
 pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {

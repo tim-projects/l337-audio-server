@@ -53,6 +53,8 @@ struct ServerSettings {
     dummy: bool,
     #[serde(default)]
     buffer_max_bytes: Option<u64>,
+    #[serde(default)]
+    default_target_kbps: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -118,7 +120,12 @@ fn parse_transport_cli() -> Option<String> {
 
 /// Default `server.ini` written when none exists, so the server always has a
 /// usable configuration and never panics on a missing file.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\nbuffer_max_bytes = 8388608\n";
+///
+/// `buffer_max_bytes` is the *rebuffer window* (a few seconds of decoded PCM),
+/// not a whole track: consumed samples are reclaimed as playback advances (G4),
+/// so a generous window never OOMs a long track. `default_target_kbps = 0` means
+/// `best` (no ceiling; bit-exact pass-through for lossless sources) — see G2.
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n# Rebuffer window (~24 MiB), not a whole-track buffer (see G4).\nbuffer_max_bytes = 25165824\n# Bandwidth ceiling in kbps; 0 = best / no ceiling (see G2).\ndefault_target_kbps = 0\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
     let mut builder = config::Config::builder();
@@ -232,14 +239,15 @@ async fn main() {
     };
 
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
-    let buffer_max_bytes = settings.server.buffer_max_bytes.unwrap_or(8 * 1024 * 1024);
+    let buffer_max_bytes = settings.server.buffer_max_bytes.unwrap_or(24 * 1024 * 1024);
+    let default_target_kbps = settings.server.default_target_kbps.unwrap_or(0);
     let engine = if dummy_mode {
         tracing::warn!(
             "Running in DUMMY output mode. No audio will be produced. Testing only."
         );
         PlayerEngine::new_dummy(storage)
     } else {
-        match PlayerEngine::new(storage, buffer_max_bytes) {
+        match PlayerEngine::new(storage, buffer_max_bytes, default_target_kbps) {
             Ok(engine) => engine,
             Err(e) => {
                 tracing::error!(
@@ -349,6 +357,7 @@ async fn main() {
         .route("/player/speed", post(handlers::set_speed))
         .route("/player/volume", post(handlers::set_volume))
         .route("/player/seek", post(handlers::seek))
+        .route("/player/target", post(handlers::set_target))
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
         .route("/auth/challenge", post(handlers::auth_challenge))
