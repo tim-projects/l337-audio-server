@@ -251,7 +251,7 @@ pub async fn cache_next(
                 crate::api::models::resolve_ceiling(
                     track.target_kbps,
                     track.quality,
-                    engine.default_target_kbps(),
+                    engine.current_default_target_kbps(),
                 ),
             )
         };
@@ -293,7 +293,7 @@ pub async fn cache_previous(
                 crate::api::models::resolve_ceiling(
                     track.target_kbps,
                     track.quality,
-                    engine.default_target_kbps(),
+                    engine.current_default_target_kbps(),
                 ),
             )
         };

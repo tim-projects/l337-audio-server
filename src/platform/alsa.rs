@@ -186,11 +186,8 @@ impl AlsaAudioOutputStream {
 
             let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
 
-            if buf.pcm.len() > buf.max_bytes / 4 {
-                tracing::warn!("ALSA writer: AudioBuffer exceeded max_bytes, clearing");
-                buf.pcm.clear();
-                buf.read_pos = 0;
-                buf.backend_error.store(true, Ordering::SeqCst);
+            if buf.exceeds_window() {
+                tracing::debug!("ALSA writer: AudioBuffer over rebuffer window; draining (paced)");
             }
 
             if buf.backend_error.load(Ordering::SeqCst) {
@@ -211,6 +208,9 @@ impl AlsaAudioOutputStream {
 
                 let bytes = unsafe { samples.align_to::<u8>().1 };
                 buf.read_pos += to_copy;
+                if buf.read_pos >= (1 << 20) {
+                    buf.reclaim_consumed();
+                }
                 drop(buf);
 
                 let result = unsafe {

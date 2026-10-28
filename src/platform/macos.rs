@@ -75,13 +75,8 @@ impl AudioBackend for CoreAudioAudioBackend {
                 }
 
                 let mut buf = ab.lock().unwrap();
-                if buf.pcm.len() > buf.max_bytes / 4 {
-                    buf.pcm.clear();
-                    buf.read_pos = 0;
-                    buf.backend_error.store(true, Ordering::SeqCst);
-                    drop(buf);
-                    tracing::warn!("CoreAudio buffer cap exceeded, signalling backend error");
-                    return Err(());
+                if buf.exceeds_window() {
+                    tracing::debug!("CoreAudio audio buffer over rebuffer window; draining (paced)");
                 }
 
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
@@ -122,6 +117,9 @@ impl AudioBackend for CoreAudioAudioBackend {
                     }
                 }
                 buf.read_pos += frames * num_channels;
+                if buf.read_pos >= (1 << 20) {
+                    buf.reclaim_consumed();
+                }
 
                 Ok(())
             })

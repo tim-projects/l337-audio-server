@@ -144,6 +144,17 @@ Termux-only — only that installer installs its own dependencies.
 
 The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return an error and the `/health` endpoint will show `yt_dlp: false`.
 
+- **libopus** — required at load time by the Linux PipeWire/ALSA and Android/Termux
+  binaries, which decode Opus server-side (`--features opus`). If it is missing the
+  binary fails to start with a loader error before `main()`. The installers install
+  it; install manually if needed:
+  - Debian/Ubuntu: `sudo apt install libopus0`
+  - Fedora: `sudo dnf install opus`
+  - Arch: `sudo pacman -S opus`
+  - Termux/Android: `pkg install libopus`
+
+  (armv7/riscv64 release binaries build without Opus and do not need it.)
+
 ## Troubleshooting
 
 ### Installer falls back to the wrong backend or won’t run

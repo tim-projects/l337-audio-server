@@ -113,6 +113,7 @@ jobs:
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'x86_64-linux-pipewire' || github.event.inputs.target == 'x86_64-linux-alsa' }}
     strategy:
+      fail-fast: false
       matrix:
         variant: [pipewire, alsa]
         include:
@@ -121,7 +122,7 @@ jobs:
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
             features: "--no-default-features --features alsa,opus"
-            pkg_deps: libopus-dev libclang-dev clang
+            pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
@@ -137,6 +138,14 @@ jobs:
       run: |
         command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
         bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/x86_64-unknown-linux-gnu/release/l337-audio-server" "$L337_GLIBC"
+    - name: Verify Opus linkage
+      if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
+      run: |
+        BIN=target/x86_64-unknown-linux-gnu/release/l337-audio-server
+        if ! readelf -d "$BIN" | grep -q 'libopus.so'; then
+          echo "::error::${{ matrix.variant }} built with --features opus but not linked against libopus.so"
+          exit 1
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -200,6 +209,7 @@ jobs:
     needs: determine-version
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'aarch64-linux-pipewire' || github.event.inputs.target == 'aarch64-linux-alsa' }}
     strategy:
+      fail-fast: false
       matrix:
         variant: [pipewire, alsa]
         include:
@@ -208,7 +218,7 @@ jobs:
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
             features: "--no-default-features --features alsa,opus"
-            pkg_deps: libopus-dev libclang-dev clang
+            pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
@@ -224,6 +234,14 @@ jobs:
       run: |
         command -v readelf >/dev/null || { apt-get update && apt-get install -y --no-install-recommends binutils; }
         bash "$GITHUB_WORKSPACE/scripts/check-glibc.sh" "target/aarch64-unknown-linux-gnu/release/l337-audio-server" "$L337_GLIBC"
+    - name: Verify Opus linkage
+      if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
+      run: |
+        BIN=target/aarch64-unknown-linux-gnu/release/l337-audio-server
+        if ! readelf -d "$BIN" | grep -q 'libopus.so'; then
+          echo "::error::${{ matrix.variant }} built with --features opus but not linked against libopus.so"
+          exit 1
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -250,6 +268,10 @@ jobs:
         apt-get install -y --no-install-recommends pkg-config gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
         rustup target add armv7-unknown-linux-gnueabihf
     - name: Build release binary
+      # NOTE: armv7/riscv64 assets have NO cross libopus, so they build without
+      # the `opus` feature — these binaries cannot decode Opus server-side (e.g.
+      # YouTube bestaudio). The source-agnostic ceiling still clamps + reports
+      # actual_kbps; the client-side AAC stopgap remains the YouTube path here.
       run: cargo build --verbose --release --target armv7-unknown-linux-gnueabihf --no-default-features --features alsa
     - name: Check glibc compatibility
       run: |
@@ -334,15 +356,34 @@ jobs:
     # client-side in pa_stream_new (PA_ERR_INVALID). See plan-android.md.
     # The run script must export LD_LIBRARY_PATH=$PREFIX/lib, because the
     # NDK-built binary has no runpath.
-    - name: Verify PulseAudio linkage (termux)
+    - name: Verify PulseAudio + Opus linkage (termux)
       if: ${{ matrix.variant == 'termux' }}
       run: |
         BIN=target/aarch64-linux-android/release/l337-audio-server
         readelf -d "$BIN" | grep NEEDED
-        if ! readelf -d "$BIN" | grep -q 'libpulse.so'; then
-          echo "::error::termux binary is not linked against libpulse.so"
+        for lib in libpulse.so libopus.so; do
+          if ! readelf -d "$BIN" | grep -q "$lib"; then
+            echo "::error::termux binary is not linked against $lib"
+            exit 1
+          fi
+        done
+        # The opus link-time stub must be aarch64 with a matching SONAME; a
+        # stale/wrong-arch blob would otherwise only surface as a link error.
+        STUB=scripts/opus-stubs/libopus.so
+        if ! readelf -h "$STUB" | grep -q 'AArch64'; then
+          echo "::error::opus stub is not AArch64"
           exit 1
         fi
+        if ! readelf -d "$STUB" | grep -q 'SONAME.*libopus.so'; then
+          echo "::error::opus stub SONAME is not libopus.so"
+          exit 1
+        fi
+        for sym in opus_decoder_create opus_decode_float opus_decoder_destroy opus_strerror; do
+          if ! readelf --dyn-syms "$STUB" | grep -q "$sym"; then
+            echo "::error::opus stub is missing symbol $sym"
+            exit 1
+          fi
+        done
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:

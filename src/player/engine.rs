@@ -499,6 +499,11 @@ impl PlayerEngine {
 
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
+        // shortcut: the file path still decodes the whole track into `pcm` in one
+        // shot (peak RSS ~ compressed size×2-2.5 for hour-long tracks); the
+        // device writer reclaims it as playback advances (G4). Upgrade path:
+        // decode local files incrementally into the same throttled producer that
+        // streaming_decode_sync uses, removing the whole-track peak entirely.
         let duration_sec = ((pcm.len() / channels as usize) as f64 / file_sample_rate as f64).round() as u64;
         self.duration_sec = Some(duration_sec);
         // G2 observability: codec + delivered bitrate of this (file/download)
@@ -1585,6 +1590,25 @@ fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &Ato
     }
 }
 
+/// Handle a stream read `IoError` by waiting for the growing file (the async
+/// download task keeps appending). Returns `false` when the stream has stalled
+/// past tolerance and the caller should stop; `true` to retry. Shares one stall
+/// policy between the Opus and Symphonia streaming loops (G4). Sleeps while
+/// holding no buffer lock.
+fn wait_for_progress(path: &Path, last_file_size: &mut u64, stall_cycles: &mut u32) -> bool {
+    let current_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if current_size > *last_file_size {
+        *last_file_size = current_size;
+        *stall_cycles = 0;
+    } else if *stall_cycles > 20 {
+        return false;
+    } else {
+        *stall_cycles += 1;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    true
+}
+
 fn streaming_decode_sync(
     path: PathBuf,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
@@ -1697,16 +1721,8 @@ fn streaming_decode_sync(
                     stall_cycles = 0;
                 }
                 Err(symphonia::core::errors::Error::IoError(_)) => {
-                    let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    if current_size > last_file_size {
-                        last_file_size = current_size;
-                        stall_cycles = 0;
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    } else if stall_cycles > 20 {
+                    if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                         break;
-                    } else {
-                        stall_cycles += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                 }
                 Err(_) => break,
@@ -1887,16 +1903,8 @@ fn streaming_decode_sync(
                 }
             }
             Err(symphonia::core::errors::Error::IoError(_)) => {
-                let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if current_size > last_file_size {
-                    last_file_size = current_size;
-                    stall_cycles = 0;
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                } else if stall_cycles > 20 {
+                if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                     break;
-                } else {
-                    stall_cycles += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
             Err(e) => {

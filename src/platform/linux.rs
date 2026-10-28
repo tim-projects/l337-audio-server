@@ -95,11 +95,8 @@ impl AudioBackend for PipeWireAudioBackend {
                     return;
                 }
 
-                if buf.pcm.len() > buf.max_bytes / 4 {
-                    tracing::warn!("AudioBuffer exceeded max_bytes, clearing to prevent runaway growth");
-                    buf.pcm.clear();
-                    buf.read_pos = 0;
-                    buf.backend_error.store(true, Ordering::SeqCst);
+                if buf.exceeds_window() {
+                    tracing::debug!("AudioBuffer over rebuffer window; draining (paced)");
                 }
 
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
@@ -133,6 +130,11 @@ impl AudioBackend for PipeWireAudioBackend {
                             *d = s * v;
                         }
                         buf.read_pos += to_copy;
+
+                        // Reclaim consumed samples at a checkpoint (G4).
+                        if buf.read_pos >= (1 << 20) {
+                            buf.reclaim_consumed();
+                        }
 
                         for sample in &mut f32_slice[to_copy..] {
                             *sample = 0.0;

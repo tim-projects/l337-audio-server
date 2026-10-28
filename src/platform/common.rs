@@ -95,6 +95,14 @@ impl AudioBuffer {
         if rp > 0 {
             self.pcm.drain(0..rp);
             self.read_pos = 0;
+            // Bound *capacity* too, not just length: after draining a large
+            // consumed prefix (e.g. a whole-track decode on the file path) shrink
+            // so memory tracks the window, not the original track length. Gated so
+            // the normal streaming path (capacity ~= window) never reallocs.
+            let window = self.max_bytes / 4 + (1 << 20);
+            if self.pcm.capacity() > window {
+                self.pcm.shrink_to_fit();
+            }
         }
     }
 }

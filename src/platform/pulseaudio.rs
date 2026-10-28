@@ -203,7 +203,7 @@ pub struct PulseAudioAudioOutputStream {
 
 impl PulseAudioAudioOutputStream {
     fn writer_loop(state: Arc<PulseAudioState>) {
-        const CHUNK_FRAMES: usize = 256;
+        const CHUNK_FRAMES: usize = 4096;
         let silence = vec![0u8; CHUNK_FRAMES * 4];
         // Device clock for pacing (constant for the stream's life: 48000). The
         // channel count is read per-iteration below because it is 0 until the
@@ -218,16 +218,14 @@ impl PulseAudioAudioOutputStream {
                 break;
             }
 
-            // Bail out if the *unconsumed* rebuffer window is over budget (G4:
-            // consumed samples are reclaimed, so this triggers only on genuine
-            // runaway, not on a long-but-paced track).
+            // G4: the rebuffer window is bounded by the streaming *producer*
+            // throttle (throttle_stream_producer) and by this writer's paced
+            // drain + reclaim, so a buffer over the window (e.g. a finite decoded
+            // track at t=0) just drains — it is a diagnostic, never a fatal error.
             {
                 let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
                 if buf.exceeds_window() {
-                    buf.backend_error.store(true, Ordering::SeqCst);
-                    drop(buf);
-                    tracing::warn!("PulseAudio buffer cap exceeded, signalling backend error");
-                    break;
+                    tracing::debug!("PulseAudio audio buffer over rebuffer window; draining (paced)");
                 }
             }
 

@@ -164,13 +164,8 @@ extern "C" fn data_callback(
     }
 
     let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-    if buf.pcm.len() > buf.max_bytes / 4 {
-        buf.pcm.clear();
-        buf.read_pos = 0;
-        buf.backend_error.store(true, Ordering::SeqCst);
-        drop(buf);
-        tracing::warn!("AAudio buffer cap exceeded, signalling backend error");
-        return ffi::AAUDIO_CALLBACK_RESULT_ERROR;
+    if buf.exceeds_window() {
+        tracing::debug!("AAudio audio buffer over rebuffer window; draining (paced)");
     }
     let available = buf.pcm.len().saturating_sub(buf.read_pos);
     let to_copy = available.min(total_samples);
@@ -181,6 +176,9 @@ extern "C" fn data_callback(
             *dst_sample = src_sample * volume;
         }
         buf.read_pos += to_copy;
+        if buf.read_pos >= (1 << 20) {
+            buf.reclaim_consumed();
+        }
     }
 
     if to_copy < total_samples {

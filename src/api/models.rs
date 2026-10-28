@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 /// labels are the stable front-end contract; the ceilings are retunnable. The
 /// server-authoritative primitive is the kbps number — front-ends may send
 /// either. Ladder (kbps): lowest 16, low 48, medium 128, high 256, veryhigh 512,
-/// extreme 1024, best/lossless 0 (no ceiling).
+/// extreme 1024, best/lossless 0 (no ceiling). `lossless` shares best's ceiling:
+/// the server pass-throughs and never re-encodes, and `PlayerStatus.codec`
+/// reports the encoding actually delivered (so a lossy source is visible).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
@@ -33,12 +35,33 @@ impl Quality {
             Quality::Lossless => 0,
         }
     }
+}
 
-    /// Whether this label requires bit-exact pass-through (never a lossy
-    /// re-encode). For lossy-only sources it degrades to `best` and says so.
-    pub fn needs_bitexact(self) -> bool {
-        matches!(self, Quality::Lossless)
-    }
+/// Tolerant deserializer for `Option<Quality>`: an absent field is `None`
+/// ([`serde(default)]`), and an unrecognized string is also `None` so an
+/// evolving front-end label never 422s the request — it falls back to the
+/// server default / best, exactly as the documented contract states.
+fn deserialize_quality_opt<'de, D>(deserializer: D) -> Result<Option<Quality>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    let label = match raw {
+        None => return Ok(None),
+        Some(s) => s.trim().to_lowercase(),
+    };
+    let q = match label.as_str() {
+        "lowest" => Quality::Lowest,
+        "low" => Quality::Low,
+        "medium" => Quality::Medium,
+        "high" => Quality::High,
+        "veryhigh" => Quality::Veryhigh,
+        "extreme" => Quality::Extreme,
+        "best" => Quality::Best,
+        "lossless" => Quality::Lossless,
+        _ => return Ok(None),
+    };
+    Ok(Some(q))
 }
 
 /// Resolve the effective bandwidth ceiling (kbps) for a request. `0`/absent =
@@ -69,8 +92,9 @@ pub struct Track {
     #[serde(default)]
     pub target_kbps: Option<u32>,
     /// Sugar label for a preset ceiling (see [`Quality`]). Lower precedence
-    /// than an explicit `target_kbps`.
-    #[serde(default)]
+    /// than an explicit `target_kbps`. Unknown labels are treated as absent
+    /// (fall back to the server default / best) rather than rejected.
+    #[serde(default, deserialize_with = "deserialize_quality_opt")]
     pub quality: Option<Quality>,
 }
 
@@ -92,7 +116,7 @@ pub struct VolumePayload {
 pub struct TargetPayload {
     #[serde(default)]
     pub target_kbps: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_quality_opt")]
     pub quality: Option<Quality>,
 }
 
@@ -179,10 +203,18 @@ mod tests {
     }
 
     #[test]
-    fn quality_only_lossless_requires_bitexact() {
-        assert!(Quality::Lossless.needs_bitexact());
-        assert!(!Quality::Best.needs_bitexact());
-        assert!(!Quality::Extreme.needs_bitexact());
+    fn quality_unknown_label_is_skipped_not_rejected() {
+        // Unknown label -> None (falls back to server default/best), not a 422.
+        let p: TargetPayload = serde_json::from_str(r#"{"quality":"ultra"}"#).unwrap();
+        assert_eq!(p.quality, None);
+        // Valid labels parse case/whitespace-insensitively.
+        let p: TargetPayload = serde_json::from_str(r#"{"quality":" LOW "}"#).unwrap();
+        assert_eq!(p.quality, Some(Quality::Low));
+        let p: TargetPayload = serde_json::from_str(r#"{"quality":"veryHigh"}"#).unwrap();
+        assert_eq!(p.quality, Some(Quality::Veryhigh));
+        // Absent field -> None (default).
+        let p: TargetPayload = serde_json::from_str(r#"{"target_kbps":128}"#).unwrap();
+        assert_eq!(p.quality, None);
     }
 
     #[test]

@@ -122,14 +122,8 @@ impl AudioBackend for WasapiAudioBackend {
                 }
 
                 let mut buf = ab.lock().unwrap();
-                if buf.pcm.len() > buf.max_bytes / 4 {
-                    buf.pcm.clear();
-                    buf.read_pos = 0;
-                    buf.backend_error.store(true, Ordering::SeqCst);
-                    drop(buf);
-                    tracing::warn!("WASAPI buffer cap exceeded, signalling backend error");
-                    let _ = render_client.release_buffer(buffer_frames as u32, 0);
-                    break;
+                if buf.exceeds_window() {
+                    tracing::debug!("WASAPI audio buffer over rebuffer window; draining (paced)");
                 }
 
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
@@ -140,6 +134,9 @@ impl AudioBackend for WasapiAudioBackend {
                     *d = s * v;
                 }
                 buf.read_pos += to_copy;
+                if buf.read_pos >= (1 << 20) {
+                    buf.reclaim_consumed();
+                }
 
                 for sample in &mut data[to_copy..] {
                     *sample = 0.0;

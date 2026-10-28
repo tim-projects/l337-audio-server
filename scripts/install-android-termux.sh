@@ -406,6 +406,14 @@ if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
         check_requirements
     else
         warn "Not installing missing packages (--no-install-deps given)."
+        # libopus is a hard runtime dependency of the Opus-capable binary
+        # (DT_NEEDED libopus.so): without it the server cannot load at all.
+        # Fail clearly rather than leaving a broken install that later blames
+        # the audio backend.
+        if [ ! -f "${PREFIX}/lib/libopus.so" ]; then
+            NEEDS_USER+=("libopus is missing and --no-install-deps was given. The Opus-capable binary links libopus.so at load time. Install it:  pkg install libopus")
+            report_requirements
+        fi
     fi
 fi
 
@@ -570,9 +578,17 @@ if [ "$ok" = true ]; then
     ensure_socket_symlink || warn "Socket not found yet; check 'sv status ${SERVICE_NAME}'"
 else
     warn "Service is not running: 'sv status ${SERVICE_NAME}'"
-    warn "The server is exiting on startup, usually an audio-backend failure."
-    warn "On devices without a usable audio device, set dummy = true in"
-    warn "${SERVICE_DIR}/server.ini and run: sv restart ${SERVICE_NAME}"
+    if [ ! -f "${PREFIX}/lib/libopus.so" ]; then
+        # DT_NEEDED libopus.so is resolved before main(); dummy = true cannot
+        # help a loader failure, so say the real cause.
+        warn "The Opus-capable binary needs libopus.so, which is missing — the"
+        warn "loader fails before the server starts (not an audio-backend issue)."
+        warn "Install it and restart:  pkg install libopus && sv restart ${SERVICE_NAME}"
+    else
+        warn "The server is exiting on startup, usually an audio-backend failure."
+        warn "On devices without a usable audio device, set dummy = true in"
+        warn "${SERVICE_DIR}/server.ini and run: sv restart ${SERVICE_NAME}"
+    fi
 fi
 
 ok "Service registered: ${SERVICE_NAME}"

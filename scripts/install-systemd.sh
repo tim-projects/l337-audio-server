@@ -247,6 +247,39 @@ check_pipewire_dependency() {
     else
         ok "PipeWire user tools found"
     fi
+
+    # Linux pipewire/alsa release binaries link libopus (--features opus); a
+    # missing runtime lib makes the server fail to exec before main() (even in
+    # dummy mode). Ensure it is present.
+    ensure_libopus_dependency
+}
+
+ensure_libopus_dependency() {
+    if ldconfig -p 2>/dev/null | grep -q 'libopus\.so'; then
+        ok "libopus runtime library present"
+        return 0
+    fi
+    local install_cmd="" pkg_name=""
+    if command -v apt-get &>/dev/null; then
+        install_cmd="apt-get install -y"; pkg_name="libopus0"
+    elif command -v dnf &>/dev/null; then
+        install_cmd="dnf install -y"; pkg_name="opus"
+    elif command -v pacman &>/dev/null; then
+        install_cmd="pacman -S --noconfirm"; pkg_name="opus"
+    elif command -v zypper &>/dev/null; then
+        install_cmd="zypper install -y"; pkg_name="libopus0"
+    elif command -v apk &>/dev/null; then
+        install_cmd="apk add"; pkg_name="opus"
+    else
+        warn "No supported package manager to install libopus. Install libopus0 (Debian/Ubuntu) or opus (Fedora/Arch/Alpine) manually."
+        return 0
+    fi
+    info "Installing $pkg_name (runtime dependency of the Opus-capable binary)..."
+    if $install_cmd "$pkg_name" >/dev/null 2>&1; then
+        ok "Installed $pkg_name"
+    else
+        warn "Could not install $pkg_name. Install libopus0/opus manually or the server will fail to start."
+    fi
 }
 
 install_verification_tools() {
