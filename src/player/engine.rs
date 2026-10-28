@@ -480,7 +480,7 @@ impl PlayerEngine {
                 );
                 return;
             }
-            Ok(Ok(Err(e))) => {
+            Ok(Err(_)) => {
                 error!(
                     "load_and_play({}): decoder panicked on {} (unsupported/corrupt container)",
                     slot,
@@ -488,7 +488,7 @@ impl PlayerEngine {
                 );
                 return;
             }
-            Ok(Err(_)) => {
+            Err(e) => {
                 error!("load_and_play({}): decode task join error: {}", slot, e);
                 return;
             }
