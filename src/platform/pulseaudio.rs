@@ -205,7 +205,9 @@ impl PulseAudioAudioOutputStream {
     fn writer_loop(state: Arc<PulseAudioState>) {
         const CHUNK_FRAMES: usize = 256;
         let silence = vec![0u8; CHUNK_FRAMES * 4];
-        // Device clock for pacing (fixed for the stream's life; engine sets 48000).
+        // Device clock for pacing (constant for the stream's life: 48000). The
+        // channel count is read per-iteration below because it is 0 until the
+        // engine sets it (playback start).
         let rate = {
             let b = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
             b.sample_rate.max(1)
@@ -300,7 +302,12 @@ impl PulseAudioAudioOutputStream {
             match outcome {
                 Ok(n) if n > 0 => {
                     // Pace to the device clock: read_pos now advances at ~1x (G4).
-                    thread::sleep(Duration::from_secs_f64(n as f64 / rate as f64));
+                    // `n` is interleaved samples, so seconds = n / (channels * rate).
+                    let channels = {
+                        let b = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        b.channels.max(1) as f64
+                    };
+                    thread::sleep(Duration::from_secs_f64(n as f64 / (channels * rate as f64)));
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => {

@@ -584,15 +584,18 @@ impl PlayerEngine {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
-        let (direct_url, abr, codec, ext) = if is_direct_stream_url(url) {
+        let (direct_url, abr, codec, ext, duration) = if is_direct_stream_url(url) {
             let ext = guess_ext_from_url(url);
-            (url.to_string(), None, None, ext)
+            (url.to_string(), None, None, ext, None)
         } else {
             resolve_youtube_stream_url(url, ceiling).await?
         };
-        // Record the delivered bitrate / codec of the chosen rendition (G2).
+        // Record the delivered bitrate / codec / duration of the chosen stream.
         self.actual_kbps = abr;
         self.codec_label = codec;
+        if let Some(dur) = duration {
+            self.duration_sec = Some(dur);
+        }
 
         // G3: fragmented MP4/M4A (YouTube DASH audio) can't be probed from a
         // partial file — its moov init isn't at the front. Download it whole and
@@ -1430,7 +1433,7 @@ fn normalize_codec(acodec: &str) -> Option<String> {
 async fn resolve_youtube_stream_url(
     url: &str,
     ceiling: u32,
-) -> Result<(String, Option<u32>, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(String, Option<u32>, Option<String>, Option<String>, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
     }
@@ -1442,7 +1445,7 @@ async fn resolve_youtube_stream_url(
         .arg(&yt_dlp_format_selector(ceiling))
         .arg("--no-playlist")
         .arg("--print")
-        .arg("%(abr)s %(acodec)s %(ext)s %(url)s")
+        .arg("%(abr)s %(acodec)s %(ext)s %(duration)s %(url)s")
         .arg(url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1467,20 +1470,25 @@ async fn resolve_youtube_stream_url(
         .lines()
         .find(|line| !line.trim().is_empty())
         .ok_or("yt-dlp returned empty output")?;
-    let mut parts = line.trim().splitn(4, ' ');
+    let mut parts = line.trim().splitn(5, ' ');
     let abr = parts
         .next()
         .and_then(|t| t.trim().parse::<f64>().ok())
         .map(|v| v.round() as u32);
     let codec = parts.next().and_then(normalize_codec);
     let ext = parts.next().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
+    let duration = parts
+        .next()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .map(|v| v.round() as u64)
+        .filter(|&d| d > 0);
     let stream_url = parts
         .next()
         .ok_or("yt-dlp returned no url")?
         .trim()
         .to_string();
 
-    Ok((stream_url, abr, codec, ext))
+    Ok((stream_url, abr, codec, ext, duration))
 }
 
 async fn stream_http_to_file(
