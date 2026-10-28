@@ -1595,7 +1595,7 @@ fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &Ato
 /// past tolerance and the caller should stop; `true` to retry. Shares one stall
 /// policy between the Opus and Symphonia streaming loops (G4). Sleeps while
 /// holding no buffer lock.
-fn wait_for_progress(path: &Path, last_file_size: &mut u64, stall_cycles: &mut u32) -> bool {
+fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cycles: &mut u32) -> bool {
     let current_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if current_size > *last_file_size {
         *last_file_size = current_size;
