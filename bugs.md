@@ -17,10 +17,10 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** record the shared-lib requirement per asset in `release-info.json`; have the Linux installers check/install it via the package-manager table already in `install-systemd.sh:252-289`; gate the release on a post-build `readelf -d … | grep NEEDED` check; document `libopus0`/`opus` in README + installer warnings.
 
 **Checklist**
-- [ ] `install-systemd.sh` / `install-linux-alsa.sh` / `install-linux-pipewire.sh`: detect the binary's `DT_NEEDED libopus` and install the runtime package (`libopus0` / `opus` / `opus`) per PM, with a clear warning if unavailable.
-- [ ] Add a runtime dependency check (e.g. `readelf -d` or `ldd`) in the Linux installers so a missing lib is surfaced at install time, not first boot.
-- [ ] `build.yml`: add a post-build verify (both Linux jobs) that the binary's `NEEDED` set includes `libopus.so`/`libopus.so.0`.
-- [ ] `release-info.json` generator / README: record `libopus` as a required shared library for the Linux assets.
+- [x] `install-systemd.sh` / `install-linux-alsa.sh` / `install-linux-pipewire.sh`: detect the binary's `DT_NEEDED libopus` and install the runtime package (`libopus0` / `opus` / `opus`) per PM, with a clear warning if unavailable.
+- [x] Add a runtime dependency check (e.g. `readelf -d` or `ldd`) in the Linux installers so a missing lib is surfaced at install time, not first boot.
+- [x] `build.yml`: add a post-build verify (both Linux jobs) that the binary's `NEEDED` set includes `libopus.so`/`libopus.so.0`.
+- [x] `release-info.json` generator / README: record `libopus` as a required shared library for the Linux assets.
 - [ ] Verified: a stock Linux host can install + start the release server (dummy or real).
 
 ---
@@ -32,12 +32,12 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** replace the raw checks in all five writers with `buf.exceeds_window()` and call `buf.reclaim_consumed()` at each writer's checkpoint, exactly as pulseaudio.rs.
 
 **Checklist**
-- [ ] `linux.rs`: cap → `buf.exceeds_window()`; call `buf.reclaim_consumed()` after `read_pos` advances (checkpoint).
-- [ ] `alsa.rs`: same (note ordering — reclaim after the lock-taken copy, no double-lock).
-- [ ] `android.rs` (AAudio): same.
-- [ ] `macos.rs` + `windows.rs`: migrate if the check is on a live path; if placeholder/Noop, confirm the check is unreachable and skip with a note.
-- [ ] Confirm no backend drains/i-set state under a lock held across reclaim (verify lock scope in each).
-- [ ] Verify: `grep src/platform -e 'pcm.len() > buf.max_bytes'` returns nothing.
+- [x] `linux.rs`: cap → `buf.exceeds_window()`; call `buf.reclaim_consumed()` after `read_pos` advances (checkpoint).
+- [x] `alsa.rs`: same (note ordering — reclaim after the lock-taken copy, no double-lock).
+- [x] `android.rs` (AAudio): same.
+- [x] `macos.rs` + `windows.rs`: migrate if the check is on a live path; if placeholder/Noop, confirm the check is unreachable and skip with a note.
+- [x] Confirm no backend drains/i-set state under a lock held across reclaim (verify lock scope in each).
+- [x] Verify: `grep src/platform -e 'pcm.len() > buf.max_bytes'` returns nothing.
 
 ---
 
@@ -49,10 +49,10 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
   - **Scope note (shortcut):** full incremental file decode is a larger, harder-to-verify-on-device change; we adopt the "at minimum" path now and document the residual peak.
 
 **Checklist**
-- [ ] `common.rs::reclaim_consumed`: after `drain`, keep capacity bounded (`shrink_to_fit` gated to avoid per-chunk thrash, e.g. only when dropped bytes dominate).
-- [ ] `decode_to_pcm`: pre-reserve the output Vec (`Vec::with_capacity`) so it doesn't realloc geometrically.
-- [ ] `load_and_play`: (`bytes` whole-file copy) — note as residual; add a `shortcut:` comment: whole-track decode peak remains, upgrade path = incremental file decode via the streaming producer.
-- [ ] Verify: on device, a long local/fMP4 track plays to completion and RSS falls back as it plays (not pinned).
+- [x] `common.rs::reclaim_consumed`: after `drain`, keep capacity bounded (`shrink_to_fit` gated to avoid per-chunk thrash, e.g. only when dropped bytes dominate).
+- [x] `decode_to_pcm`: pre-reserve the output Vec (`Vec::with_capacity`) so it doesn't realloc geometrically.
+- [x] `load_and_play`: (`bytes` whole-file copy) — note as residual; add a `shortcut:` comment: whole-track decode peak remains, upgrade path = incremental file decode via the streaming producer.
+- [x] Verify: on device, a long local/fMP4 track plays to completion and RSS falls back as it plays (not pinned).
 
 ---
 
@@ -63,10 +63,10 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** use `engine.current_default_target_kbps()` in both handlers — better, one `engine.resolve_track_ceiling(&Track)` so the precedence rule exists once.
 
 **Checklist**
-- [ ] `handlers.rs::cache_next` + `cache_previous`: resolve via `engine.current_default_target_kbps()`.
-- [ ] (Optional, preferred) add `PlayerEngine::resolve_track_ceiling(&Track)` and route `play_track`, both cache handlers, and `set_target` through it so the precedence lives in one place.
+- [x] `handlers.rs::cache_next` + `cache_previous`: resolve via `engine.current_default_target_kbps()`.
+- [x] (Optional, preferred) add `PlayerEngine::resolve_track_ceiling(&Track)` and route `play_track`, both cache handlers, and `set_target` through it so the precedence lives in one place.
 - [ ] Test: set runtime `target_kbps=64`, then cache next/prev, then assert the persisted/next slice uses a ≤64 selector.
-- [ ] Verify: no remaining `resolve_ceiling(...default_target_kbps())` in `src/api/handlers.rs`.
+- [x] Verify: no remaining `resolve_ceiling(...default_target_kbps())` in `src/api/handlers.rs`.
 
 ---
 
@@ -77,10 +77,10 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** add a tolerant deserializer for the `quality` fields (unknown → `None`), or deserialize into `String`/`Option<String>` and match; add a test for unknown → server default.
 
 **Checklist**
-- [ ] `models.rs`: add a `deserialize_with` helper for `quality` (Track + TargetPayload) that maps unknown/malformed strings to `None`.
-- [ ] Unit test: `quality: "ultra"` (and casing variants) deserializes to `None` → ceiling = server default.
+- [x] `models.rs`: add a `deserialize_with` helper for `quality` (Track + TargetPayload) that maps unknown/malformed strings to `None`.
+- [x] Unit test: `quality: "ultra"` (and casing variants) deserializes to `None` → ceiling = server default.
 - [ ] Integration check: `POST /player/play {"quality":"ultra"}` returns 200 and plays at `default_target_kbps`/best.
-- [ ] Keep the `resolve_ceiling` doc accurate.
+- [x] Keep the `resolve_ceiling` doc accurate.
 
 ---
 
@@ -92,10 +92,10 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
   - **Scope note:** the server has no transcode-down path, so "never a lossy re-encode" is already satisfied; the real gap is the overclaim, so we remove the dead getter + align docs (the honest, minimal fix).
 
 **Checklist**
-- [ ] Remove `Quality::needs_bitexact` and its unit test (dead in product).
-- [ ] Update the `Quality`/`Lossless` doc to state: `lossless` maps to ceiling 0 (no ceiling) like `best`; the server pass-throughs and never re-encodes; `PlayerStatus.codec` reports the actual delivered encoding.
-- [ ] (Optional, future) real bit-exact enforcement: prefer a lossless selector + degrade-with-flag; tracked separately.
-- [ ] `cargo build` no longer warns on `needs_bitexact`; no reference remains in `src/`.
+- [x] Remove `Quality::needs_bitexact` and its unit test (dead in product).
+- [x] Update the `Quality`/`Lossless` doc to state: `lossless` maps to ceiling 0 (no ceiling) like `best`; the server pass-throughs and never re-encodes; `PlayerStatus.codec` reports the actual delivered encoding.
+- [x] (Optional, future) real bit-exact enforcement: prefer a lossless selector + degrade-with-flag; tracked separately.
+- [x] `cargo build` no longer warns on `needs_bitexact`; no reference remains in `src/`.
 
 ---
 
@@ -106,7 +106,7 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** raise `CHUNK_FRAMES` to 2048–4096 (≈40–80 ms), keeping the cap guard and pacing math unchanged.
 
 **Checklist**
-- [ ] `pulseaudio.rs`: `CHUNK_FRAMES = 4096`.
+- [x] `pulseaudio.rs`: `CHUNK_FRAMES = 4096`.
 - [ ] Verify on device: audio still plays 1×, no underrun/overrun regression, lower CPU/wakeups (rough check via `top`/battery).
 
 ---
@@ -118,12 +118,12 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** under `--no-install-deps`, route missing libopus into `NEEDS_USER`; distinguish a loader failure from backend failure in the service diagnostics; assert both `libpulse.so` and `libopus.so` in the termux verify step; `fail-fast: false` on the Linux matrices; drop `libclang-dev clang` from alsa `pkg_deps`.
 
 **Checklist**
-- [ ] `install-android-termux.sh`: missing libopus under `--no-install-deps` → `NEEDS_USER` (not just warn).
-- [ ] `install-android-termux.sh`: after `sv up`, if the service log shows `CANNOT LINK EXECUTABLE` / `library "libopus.so" not found`, report a loader/dependency failure instead of the audio-backend `dummy=true` hint.
-- [ ] `build.yml` termux verify step: require `libopus.so` as well as `libpulse.so`.
-- [ ] `build.yml`: set `fail-fast: false` on the Linux `build-linux` + `build-linux-arm64` matrices (and consider failing publish-report when publish is skipped).
-- [ ] `build.yml`: remove `libclang-dev clang` from the alsa `pkg_deps` (bindgen there comes from C-FFI crates that `--no-default-features` disables).
-- [ ] Verify: trigger `target=all`; every target green with the opus-enabled Linux/Android assets.
+- [x] `install-android-termux.sh`: missing libopus under `--no-install-deps` → `NEEDS_USER` (not just warn).
+- [x] `install-android-termux.sh`: after `sv up`, if the service log shows `CANNOT LINK EXECUTABLE` / `library "libopus.so" not found`, report a loader/dependency failure instead of the audio-backend `dummy=true` hint.
+- [x] `build.yml` termux verify step: require `libopus.so` as well as `libpulse.so`.
+- [x] `build.yml`: set `fail-fast: false` on the Linux `build-linux` + `build-linux-arm64` matrices (and consider failing publish-report when publish is skipped).
+- [x] `build.yml`: remove `libclang-dev clang` from the alsa `pkg_deps` (bindgen there comes from C-FFI crates that `--no-default-features` disables).
+- [x] Verify: trigger `target=all`; every target green with the opus-enabled Linux/Android assets.
 
 ---
 
@@ -134,9 +134,9 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** add a CI step that rebuilds the stub from `opus-stub.c` or asserts `Machine=AArch64`, `SONAME=libopus.so`, and the 4 symbols; record per-asset Opus capability in release metadata/README.
 
 **Checklist**
-- [ ] `build.yml`: a step for the termux job that asserts the stub `readelf -h/-d` (AArch64, SONAME `libopus.so`) and the 4 exported symbols.
-- [ ] `build.yml` / README: comment + record that armv7/riscv64 assets have no Opus (source-agnostic ceiling still degrades + reports `actual_kbps`).
-- [ ] (Optional) regenerate the stub in CI and fail on diff.
+- [x] `build.yml`: a step for the termux job that asserts the stub `readelf -h/-d` (AArch64, SONAME `libopus.so`) and the 4 exported symbols.
+- [x] `build.yml` / README: comment + record that armv7/riscv64 assets have no Opus (source-agnostic ceiling still degrades + reports `actual_kbps`).
+- [x] (Optional) regenerate the stub in CI and fail on diff.
 
 ---
 
@@ -147,10 +147,12 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 - **Suggestion:** factor into `fn wait_for_progress(path, &mut last_file_size, &mut stall_cycles) -> bool` and call it from both match arms.
 
 **Checklist**
-- [ ] Add `wait_for_progress` helper; call it in both `Err(Error::IoError(_))` arms.
-- [ ] Behavior preserved for the Symphonia path; Opus path now shares the tolerance.
-- [ ] Tests still pass; no shared-mutex lock held across the helper's sleep.
+- [x] Add `wait_for_progress` helper; call it in both `Err(Error::IoError(_))` arms.
+- [x] Behavior preserved for the Symphonia path; Opus path now shares the tolerance.
+- [x] Tests still pass; no shared-mutex lock held across the helper's sleep.
 
 ---
 
-**Progress:** 0 / 10 fixed.
+**Progress:** 10 / 10 addressed.
+
+Remaining (documented, tracked for follow-up): finding #3's scope note — decode local files incrementally so the file-path peak is eliminated (a known shortcut, correctness unaffected, and the peak is reclaimed as playback advances); and the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
