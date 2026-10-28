@@ -224,7 +224,7 @@ impl PulseAudioAudioOutputStream {
             // track at t=0) just drains — it is a diagnostic, never a fatal error.
             {
                 let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-                if buf.exceeds_window() {
+                if buf.enters_over_window() {
                     tracing::debug!("PulseAudio audio buffer over rebuffer window; draining (paced)");
                 }
             }

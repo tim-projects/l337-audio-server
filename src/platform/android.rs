@@ -164,7 +164,7 @@ extern "C" fn data_callback(
     }
 
     let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-    if buf.exceeds_window() {
+    if buf.enters_over_window() {
         tracing::debug!("AAudio audio buffer over rebuffer window; draining (paced)");
     }
     let available = buf.pcm.len().saturating_sub(buf.read_pos);

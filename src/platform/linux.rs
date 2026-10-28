@@ -95,7 +95,7 @@ impl AudioBackend for PipeWireAudioBackend {
                     return;
                 }
 
-                if buf.exceeds_window() {
+                if buf.enters_over_window() {
                     tracing::debug!("AudioBuffer over rebuffer window; draining (paced)");
                 }
 

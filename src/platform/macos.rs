@@ -75,7 +75,7 @@ impl AudioBackend for CoreAudioAudioBackend {
                 }
 
                 let mut buf = ab.lock().unwrap();
-                if buf.exceeds_window() {
+                if buf.enters_over_window() {
                     tracing::debug!("CoreAudio audio buffer over rebuffer window; draining (paced)");
                 }
 

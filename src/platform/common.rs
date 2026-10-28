@@ -55,6 +55,9 @@ pub struct AudioBuffer {
     pub speed: f32,
     pub pitch: f32,
     pub     backend_error: std::sync::atomic::AtomicBool,
+    /// Set once when the unconsumed window is entered over-window, so writers
+    /// log the (non-fatal) diagnostic once per transition, not per sample write.
+    over_logged: std::sync::atomic::AtomicBool,
     /// Backend cap in bytes of the *unconsumed rebuffer window* (G4) — a few
     /// seconds of decoded PCM, not a whole track. Backends drain/reclaim consumed
     /// samples as playback advances, so memory stays independent of track length.
@@ -72,7 +75,20 @@ impl AudioBuffer {
             speed: 1.0,
             pitch: 1.0,
             backend_error: std::sync::atomic::AtomicBool::new(false),
+            over_logged: std::sync::atomic::AtomicBool::new(false),
             max_bytes: 24 * 1024 * 1024,
+        }
+    }
+
+    /// True only on the transition into the over-window state (resets on exit),
+    /// so a writer logs the non-fatal "over rebuffer window" diagnostic once per
+    /// entry instead of on every sample write.
+    pub fn enters_over_window(&self) -> bool {
+        if self.exceeds_window() {
+            !self.over_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.over_logged.store(false, std::sync::atomic::Ordering::Relaxed);
+            false
         }
     }
 

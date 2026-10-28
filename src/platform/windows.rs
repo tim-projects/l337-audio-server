@@ -122,7 +122,7 @@ impl AudioBackend for WasapiAudioBackend {
                 }
 
                 let mut buf = ab.lock().unwrap();
-                if buf.exceeds_window() {
+                if buf.enters_over_window() {
                     tracing::debug!("WASAPI audio buffer over rebuffer window; draining (paced)");
                 }
 

@@ -186,7 +186,7 @@ impl AlsaAudioOutputStream {
 
             let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
 
-            if buf.exceeds_window() {
+            if buf.enters_over_window() {
                 tracing::debug!("ALSA writer: AudioBuffer over rebuffer window; draining (paced)");
             }
 
