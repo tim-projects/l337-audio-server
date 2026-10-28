@@ -159,19 +159,27 @@ impl PulseAudioHandle {
         unsafe { pa_threaded_mainloop_unlock(self.mainloop) }
     }
 
-    fn teardown(&self) {
+    /// Idempotent teardown: frees each PulseAudio object at most once. The
+    /// writer thread must already be joined (see PulseAudioAudioOutputStream::stop)
+    /// before this runs — it races the PA ref-count assertion otherwise. Nulling
+    /// the pointers after free makes a second teardown (Drop after try_recover)
+    /// a no-op instead of a use-after-free/abort (G5).
+    fn teardown(&mut self) {
         unsafe {
             if !self.stream.is_null() {
                 pa_stream_disconnect(self.stream);
                 pa_stream_unref(self.stream);
+                self.stream = std::ptr::null_mut();
             }
             if !self.context.is_null() {
                 pa_context_disconnect(self.context);
                 pa_context_unref(self.context);
+                self.context = std::ptr::null_mut();
             }
             if !self.mainloop.is_null() {
                 pa_threaded_mainloop_stop(self.mainloop);
                 pa_threaded_mainloop_free(self.mainloop);
+                self.mainloop = std::ptr::null_mut();
             }
         }
     }
@@ -197,18 +205,23 @@ impl PulseAudioAudioOutputStream {
     fn writer_loop(state: Arc<PulseAudioState>) {
         const CHUNK_FRAMES: usize = 256;
         let silence = vec![0u8; CHUNK_FRAMES * 4];
+        // Device clock for pacing (fixed for the stream's life; engine sets 48000).
+        let rate = {
+            let b = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            b.sample_rate.max(1)
+        };
 
         loop {
             if state.cancel.load(Ordering::Relaxed) || state.backend_error.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Bail out if the buffer is over budget (mirrors the AAudio/ALSA paths).
+            // Bail out if the *unconsumed* rebuffer window is over budget (G4:
+            // consumed samples are reclaimed, so this triggers only on genuine
+            // runaway, not on a long-but-paced track).
             {
-                let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-                if buf.pcm.len() > buf.max_bytes / 4 {
-                    buf.pcm.clear();
-                    buf.read_pos = 0;
+                let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                if buf.exceeds_window() {
                     buf.backend_error.store(true, Ordering::SeqCst);
                     drop(buf);
                     tracing::warn!("PulseAudio buffer cap exceeded, signalling backend error");
@@ -231,7 +244,9 @@ impl PulseAudioAudioOutputStream {
             }
 
             let stream_ptr = handle.stream;
-            let outcome: Result<bool, String> = (|| {
+            // Returns frames of audio written this iteration (0 = silence/starved),
+            // so the writer can pace itself to the device clock (G4).
+            let outcome: Result<usize, String> = (|| {
                 let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
                 let available = buf.pcm.len().saturating_sub(buf.read_pos);
 
@@ -247,6 +262,11 @@ impl PulseAudioAudioOutputStream {
                     }
                     let data = unsafe { samples.align_to::<u8>().1 };
                     buf.read_pos += to_copy;
+                    // Reclaim consumed samples at a checkpoint so the Vec shrinks
+                    // (keep memory bounded, independent of track length — G4).
+                    if buf.read_pos >= (1 << 20) {
+                        buf.reclaim_consumed();
+                    }
                     drop(buf);
                     // pa_stream_write with a NULL free callback copies the data.
                     if unsafe {
@@ -255,7 +275,7 @@ impl PulseAudioAudioOutputStream {
                     {
                         return Err("pa_stream_write failed".to_string());
                     }
-                    Ok(false)
+                    Ok(to_copy as usize)
                 } else if !playing {
                     drop(buf);
                     // Keep the device awake with silence while paused.
@@ -265,10 +285,10 @@ impl PulseAudioAudioOutputStream {
                     {
                         return Err("pa_stream_write (silence) failed".to_string());
                     }
-                    Ok(true)
+                    Ok(0)
                 } else {
                     drop(buf);
-                    Ok(true)
+                    Ok(0)
                 }
             })();
 
@@ -278,8 +298,11 @@ impl PulseAudioAudioOutputStream {
             drop(handle);
 
             match outcome {
-                Ok(true) => thread::sleep(Duration::from_millis(10)),
-                Ok(false) => {}
+                Ok(n) if n > 0 => {
+                    // Pace to the device clock: read_pos now advances at ~1x (G4).
+                    thread::sleep(Duration::from_secs_f64(n as f64 / rate as f64));
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
                     state.backend_error.store(true, Ordering::SeqCst);
                     tracing::warn!("PulseAudio {}, signalling backend error", e);
@@ -473,7 +496,7 @@ impl AudioOutputStream for PulseAudioAudioOutputStream {
             let _ = thread.join();
         }
 
-        let handle = match self.state.handle.lock() {
+        let mut handle = match self.state.handle.lock() {
             Ok(guard) => guard,
             Err(e) => e.into_inner(),
         };

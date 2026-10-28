@@ -333,6 +333,9 @@ impl AudioOutputStream for AndroidAudioOutputStream {
             let _ = ffi::AAudioStream_close(self.stream);
             ffi::AAudioStreamBuilder_delete(self.builder);
         }
+        // Idempotent: Drop also closes; null the handle so a second stop/recover
+        // doesn't double-free the AAudioStream (G5).
+        self.stream = std::ptr::null_mut();
         let mut global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         *global = None;
     }

@@ -54,9 +54,10 @@ pub struct AudioBuffer {
     pub file_sample_rate: u32,
     pub speed: f32,
     pub pitch: f32,
-    pub backend_error: std::sync::atomic::AtomicBool,
-    /// Backend watchdog cap in bytes. Backends clear the buffer and flag an error
-    /// when `pcm.len() * 4` (size of f32 samples) exceeds this value.
+    pub     backend_error: std::sync::atomic::AtomicBool,
+    /// Backend cap in bytes of the *unconsumed rebuffer window* (G4) — a few
+    /// seconds of decoded PCM, not a whole track. Backends drain/reclaim consumed
+    /// samples as playback advances, so memory stays independent of track length.
     pub max_bytes: usize,
 }
 
@@ -71,7 +72,29 @@ impl AudioBuffer {
             speed: 1.0,
             pitch: 1.0,
             backend_error: std::sync::atomic::AtomicBool::new(false),
-            max_bytes: 8 * 1024 * 1024,
+            max_bytes: 24 * 1024 * 1024,
+        }
+    }
+
+    /// Bytes of decoded PCM buffered but not yet consumed. G4 caps *this*
+    /// (the rebuffer window), not the whole track — see `AudioBuffer::max_bytes`.
+    pub fn unconsumed_bytes(&self) -> usize {
+        self.pcm.len().saturating_sub(self.read_pos) * 4
+    }
+
+    /// Whether the unconsumed window exceeds the cap. Stream producers throttle
+    /// on this so memory stays independent of track length.
+    pub fn exceeds_window(&self) -> bool {
+        self.unconsumed_bytes() > self.max_bytes
+    }
+
+    /// Reclaim already-consumed samples so the Vec shrinks as playback advances
+    /// (G4). Call from backend writers at a checkpoint; a no-op once empty.
+    pub fn reclaim_consumed(&mut self) {
+        let rp = self.read_pos.min(self.pcm.len());
+        if rp > 0 {
+            self.pcm.drain(0..rp);
+            self.read_pos = 0;
         }
     }
 }

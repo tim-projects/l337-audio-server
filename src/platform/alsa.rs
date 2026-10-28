@@ -611,24 +611,24 @@ impl AudioOutputStream for AlsaAudioOutputStream {
     fn stop(&mut self) {
         self.state.cancel.store(true, Ordering::Relaxed);
 
-        let pcm_ptr = match self.state.pcm.lock() {
-            Ok(guard) => guard.0,
-            Err(e) => e.into_inner().0,
-        };
-
-        if !pcm_ptr.is_null() {
-            unsafe {
-                (self.funcs.snd_pcm_close)(pcm_ptr);
-            }
-        }
-
+        // Join the writer BEFORE freeing the PCM handle it writes through (G5).
         let thread = match self.thread.lock() {
             Ok(mut guard) => guard.take(),
             Err(e) => e.into_inner().take(),
         };
-
         if let Some(thread) = thread {
             let _ = thread.join();
+        }
+
+        // Idempotent close: null the handle so a second stop()/Drop is a no-op
+        // instead of a double free (G5 — try_recover stops then the stream drops).
+        let mut pcm_guard = match self.state.pcm.lock() {
+            Ok(guard) => guard,
+            Err(e) => e.into_inner(),
+        };
+        if !pcm_guard.0.is_null() {
+            unsafe { (self.funcs.snd_pcm_close)(pcm_guard.0) };
+            pcm_guard.0 = std::ptr::null_mut();
         }
     }
 }

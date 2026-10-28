@@ -229,9 +229,12 @@ impl PlayerEngine {
         if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
             self.position_sec
         } else {
-            let consumed = buf.read_pos as u64;
+            // read_pos counts interleaved samples; convert to per-channel frames
+            // before converting device-rate frames back to source-rate seconds (stereo
+            // would otherwise double-count).
+            let consumed_frames = (buf.read_pos as u64) / (buf.channels.max(1) as u64);
             let orig_frames =
-                (consumed as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
+                (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
                     as u64;
             let buffer_sec = orig_frames / buf.file_sample_rate as u64;
             self.position_sec + buffer_sec
@@ -578,14 +581,31 @@ impl PlayerEngine {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
-        let (direct_url, abr, codec) = if is_direct_stream_url(url) {
-            (url.to_string(), None, None)
+        let (direct_url, abr, codec, ext) = if is_direct_stream_url(url) {
+            let ext = guess_ext_from_url(url);
+            (url.to_string(), None, None, ext)
         } else {
             resolve_youtube_stream_url(url, ceiling).await?
         };
         // Record the delivered bitrate / codec of the chosen rendition (G2).
         self.actual_kbps = abr;
         self.codec_label = codec;
+
+        // G3: fragmented MP4/M4A (YouTube DASH audio) can't be probed from a
+        // partial file — its moov init isn't at the front. Download it whole and
+        // decode via the reliable file path. WebM/Ogg cue up-front and stream.
+        let ext_l = ext.unwrap_or_default();
+        if !ext_l.is_empty() && !incremental_streaming_container(&ext_l) {
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            stream_http_to_file(&direct_url, &path, cancel.clone()).await?;
+            {
+                let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                buf.pcm.clear();
+                buf.read_pos = 0;
+            }
+            self.load_and_play("current").await;
+            return Ok(());
+        }
 
         let dl_path = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -868,7 +888,7 @@ impl PlayerEngine {
             if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
                 Some(self.position_sec)
             } else {
-                let consumed = buf.read_pos as u64;
+                let consumed = (buf.read_pos as u64) / (buf.channels.max(1) as u64);
                 let orig_frames = (consumed as f64 * buf.file_sample_rate as f64 * buf.speed as f64
                     / buf.sample_rate as f64) as u64;
                 let buffer_sec = orig_frames / buf.file_sample_rate as u64;
@@ -1345,6 +1365,28 @@ async fn download_via_ytdlp(
     Ok(())
 }
 
+/// Whether a container can be decoded incrementally via `streaming_decode_sync`
+/// (WebM/Matroska, Ogg). fMP4/M4A (YouTube DASH audio) has a fragmented moov and
+/// never completes a probe on a truncated file, so it is downloaded whole then
+/// decoded through the reliable file path (G3). Unknown containers stream.
+fn incremental_streaming_container(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "webm" | "mkv" | "matroska" | "ogg" | "oga" | "opus"
+    )
+}
+
+/// Best-effort container extension from a direct URL's path (before `?`).
+fn guess_ext_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next()?;
+    let ext = path.rsplit('/').next()?.rsplit('.').next()?;
+    if ext.is_empty() || ext.len() > 5 || ext.contains('/') {
+        None
+    } else {
+        Some(ext.to_lowercase())
+    }
+}
+
 /// yt-dlp audio format selector for a bandwidth ceiling (G2). `0` = best. The
 /// trailing `bestaudio` fallback keeps selection from ever failing; yt-dlp's
 /// `abr` is approximate, so the result can exceed the ceiling when nothing fits
@@ -1385,7 +1427,7 @@ fn normalize_codec(acodec: &str) -> Option<String> {
 async fn resolve_youtube_stream_url(
     url: &str,
     ceiling: u32,
-) -> Result<(String, Option<u32>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(String, Option<u32>, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     if !yt_dlp_available() {
         return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
     }
@@ -1397,7 +1439,7 @@ async fn resolve_youtube_stream_url(
         .arg(&yt_dlp_format_selector(ceiling))
         .arg("--no-playlist")
         .arg("--print")
-        .arg("%(abr)s %(acodec)s %(url)s")
+        .arg("%(abr)s %(acodec)s %(ext)s %(url)s")
         .arg(url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1422,19 +1464,20 @@ async fn resolve_youtube_stream_url(
         .lines()
         .find(|line| !line.trim().is_empty())
         .ok_or("yt-dlp returned empty output")?;
-    let mut parts = line.trim().splitn(3, ' ');
+    let mut parts = line.trim().splitn(4, ' ');
     let abr = parts
         .next()
         .and_then(|t| t.trim().parse::<f64>().ok())
         .map(|v| v.round() as u32);
     let codec = parts.next().and_then(normalize_codec);
+    let ext = parts.next().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
     let stream_url = parts
         .next()
         .ok_or("yt-dlp returned no url")?
         .trim()
         .to_string();
 
-    Ok((stream_url, abr, codec))
+    Ok((stream_url, abr, codec, ext))
 }
 
 async fn stream_http_to_file(
@@ -1507,6 +1550,30 @@ impl symphonia::core::io::MediaSource for FileSource {
 ///
 /// Waits for the download to produce data, then incrementally decodes packets
 /// and appends PCM into `audio_buffer` for the audio callback to consume.
+/// G4: throttle a stream producer so the *unconsumed* rebuffer window stays
+/// bounded. The device-paced writer drains it at ~1x, so this keeps memory
+/// independent of track length and avoids tripping the backend window cap.
+/// Returns early on cancel; a generous stall valve prevents ever wedging decode.
+fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &AtomicBool) {
+    let mut stalls: u32 = 0;
+    loop {
+        {
+            let b = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            if !b.exceeds_window() {
+                return;
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stalls += 1;
+        if stalls > 3600 {
+            return;
+        }
+    }
+}
+
 fn streaming_decode_sync(
     path: PathBuf,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
@@ -1610,6 +1677,7 @@ fn streaming_decode_sync(
                     if packet.track_id() != track_id {
                         continue;
                     }
+                    throttle_stream_producer(&audio_buffer, &cancel);
                     let out = opus_dec.push(packet.buf());
                     if !out.is_empty() {
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -1711,6 +1779,7 @@ fn streaming_decode_sync(
                 if packet.track_id() != track_id {
                     continue;
                 }
+                throttle_stream_producer(&audio_buffer, &cancel);
 
                 match decoder.decode(&packet) {
                     Ok(audio_buf) => {
