@@ -190,3 +190,79 @@ must be on `PATH` for the YouTube steps. Socket mode keeps `/setup` for token di
 
 ## Packaging signal (finding #9)
 - [ ] The published Linux assets' `release-info.json`/release notes list `libopus` as a required shared library, and README's Runtime Dependencies matches.
+
+---
+
+# Host verification run — Debian 13 (trixie), x86_64, dummy output
+
+Executed against `2026.10.29-5` / `2026.10.29-6` (prereleases from
+`g1-opus-decode`), isolated instance (private `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY`,
+`L337__SERVER__PORT=13370`, `L337__SERVER__DUMMY=true`,
+`L337__SERVER__DEFAULT_TARGET_KBPS=128`, `L337__SERVER__BUFFER_MAX_BYTES=8388608`,
+`RUST_LOG=l337_audio_server=debug`, `--transport=http`). `yt-dlp`, `ffmpeg` and a
+local controllable HTTP origin were on `PATH`.
+
+## Install + linkage (finding #1) — FIXED, was not actually done
+- [x] Both Linux assets' `NEEDED` sets read back from the published release:
+      `libopus.so.0` (+ `libpipewire-0.3.so.0` on pipewire) and `ldd` resolves them.
+- [x] **Bug:** `ensure_libopus_dependency` was reachable only from
+      `check_pipewire_dependency`, and **nothing called either** — so no installer
+      ever checked libopus (the ticked checklist item was aspirational). Replaced by
+      a generic `ensure_runtime_dependencies()` that reads the binary's `DT_NEEDED`
+      set, installs the mapped package per PM, and **fails the install** if a needed
+      lib is still missing. Wired into all three Linux installers (fresh install +
+      update). Verified: real binaries report `ok "Runtime libraries present: …"`, and
+      a binary with an unresolvable `NEEDED` entry `warn`s per-library and exits 1
+      (no silent success).
+- [x] `release-info.json` gained `needed_shared_libs` per asset (verified in
+      `2026.10.29-5`: `libopus.so.0` for every Linux asset, none for
+      armv7/riscv64/darwin/windows); README's Runtime Dependencies updated to match.
+- [x] `L337__SERVER__DUMMY=1 … --version` and a dummy boot work.
+
+## Opus decode + timeline (G1) — PASS
+- [x] Opus-in-Ogg, Opus-in-WebM, MP3, FLAC, WAV(s16le), AAC/M4A all play:
+      `state=playing`, `duration_sec` populated, `codec=opus|mp3|flac|pcm_s16le|aac`,
+      `actual_kbps` populated, no `unsupported codec` in the log.
+- [x] A 100 s Opus track plays on the file path (no `buffer cap exceeded`).
+- [x] `position_sec` **cannot** be verified here: dummy output has no writer, so no
+      sample is ever consumed and `read_pos` never advances. Needs a host with a
+      real PipeWire/ALSA sink (see "left to verify").
+
+## Bandwidth ceiling (G2) — PASS (with a fix)
+- [x] All labels resolve: `low`→48, `medium`→128, `lowest`→16, `high`→256,
+      `extreme`→1024, `veryhigh`→512, `best`/`lossless`→0, `veryHigh`/`" LOW "`→case-
+      insensitive, unknown `ultra`→200 + server default (no 422).
+- [x] **Bug:** `PlayerEngine::new_dummy` ignored `buffer_max_bytes` and
+      `default_target_kbps`, so the documented testing mode silently dropped both
+      (`target_kbps` was always 0). Now passed through: an isolated instance with
+      `default_target_kbps=128` reports `target_kbps=128` and keeps it across plays,
+      and `buffer_max_bytes` is honoured. Fixes the device-only G2/G4 checks.
+- [x] Background cache resolves via the runtime ceiling (no
+      `resolve_ceiling(…default_target_kbps())` left in `src/api/handlers.rs`).
+
+## Recovery (G5)
+- [x] Play/pause/stop/seek/next/previous cycles, failed plays, 404s and HTML-content
+      refusals never abort the process or leave a poisoned log; `/health`, `/version`
+      stay 200 throughout.
+- [x] **Bug (fixed):** volume was not re-applied when `try_recover` recreated the
+      stream, so a recovery silently reset it to unity.
+- [ ] Forcing a real sink error (unload the sink mid-playback) needs a live backend.
+
+## Additional bugs found and fixed on this host
+
+| # | Sev | Bug | Fix |
+|---|-----|-----|-----|
+| 1 | CRITICAL | **Arbitrary file write + delete via `track_id`.** It was joined straight into the cache path: `X-Track-Id: ../x` wrote a file *outside* the cache dir (confirmed: `/tmp/…/state/PWNED_WRITE`, 129 KB of attacker bytes) and an absolute `X-Track-Id: /tmp/x` did too; a pool overflow then *deleted* a file outside the cache dir (confirmed: `/tmp/PWNED_DEL` removed). | One shared rule `is_safe_track_id()` (single plain component, no `/`, `\`, `.`/`..`, NUL, ≤128 chars). `get_path_for_track` → `Option`, eviction only removes paths inside the cache dir, and the API boundary (`play`, `cache_next`, `cache_previous`, `X-Track-Id`) returns 400. Verified: all traversal forms 400, nothing written/deleted outside the cache dir, valid ids still 200. |
+| 2 | WARNING | `cargo test` **did not compile**: `decode_to_pcm` returns a 4-tuple, the test destructured a 3-tuple. `cargo build`-only CI never caught it. | Test updated (+ asserts the new codec label). The suite now compiles with `--no-default-features --features alsa,opus --all-targets`. |
+| 3 | WARNING | `X-L337-Token: <token>` (and `Authorization: <token>`) **always 401** — the comparison only ran when the presented value had the same length as `"Bearer <token>"`, so the short form skipped every branch. | Compare the bearer form and the bare token independently, each constant-time. Verified: all 4 header forms 200, all wrong/short/long tokens 401. |
+| 4 | WARNING | A failed YouTube resolve ran **yt-dlp twice** (resolve, then the downloader re-resolving it) — ~2× latency per failure and 2× the chance of a rate-limit block. | `StreamStartError::Resolve`/`Playback`; only a post-resolution failure falls back to a plain download. Verified: an unresolvable YouTube URL now returns `Failed to resolve stream for …` once, and `duration_sec` no longer reports the previous track's timeline. |
+| 5 | SUGGESTION | `seek` past the end silently re-buffered the whole track from 0 while reporting `position_sec > duration_sec` (observed `99999` vs `100`). | Clamp to the decoded length; observed `100`/`0` at the end instead of `99999`/`100`. |
+
+## Left to verify (needs a real backend / network)
+- `position_sec` advancing ~1× and RSS falling back after playback (no writer in
+  dummy mode).
+- YouTube playback against a reachable YouTube (this sandbox gets
+  "This video is unavailable"), so `actual_kbps` clamping and background-cache
+  sizing under a real ceiling are unverified.
+- A stock host *without* libopus reaching the new installer fail-gate (the gate
+  itself is verified, only the package-manager install path is not).
