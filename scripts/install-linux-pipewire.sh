@@ -66,6 +66,142 @@ check_dependencies() {
     check_command "useradd"
 }
 
+# Runtime shared-library dependency handling (shared by the Linux installers).
+#
+# A `DT_NEEDED` library is resolved by the dynamic loader *before* `main()` runs,
+# so a missing one prevents the binary from exec'ing at all — including in
+# `dummy = true` mode. The glibc check only scans `GLIBC_` symbols and the
+# installer's dry-run cannot mask this, so we read the binary's real `NEEDED`
+# set with `readelf -d` and install the package that provides each missing
+# library for the detected package manager.
+
+# Map a DT_NEEDED shared-library (SONAME) to the package(s) that provide it on
+# the detected distribution. Returns 1 (with a warning) when unknown, so the
+# caller can surface it instead of installing a silently wrong package.
+runtime_pkgs_for() {
+    local soname="$1"
+
+    if command -v apt-get &>/dev/null; then
+        case "$soname" in
+            libopus.so*)        echo "libopus0" ;;
+            libasound.so*)      echo "libasound2" ;;
+            libpipewire-0.3.so*) echo "libpipewire-0.3-0" ;;
+            libpulse.so*)       echo "libpulse0" ;;
+            *) return 1 ;;
+        esac
+    elif command -v dnf &>/dev/null; then
+        case "$soname" in
+            libopus.so*)        echo "opus" ;;
+            libasound.so*)      echo "alsa-lib" ;;
+            libpipewire-0.3.so*) echo "pipewire-libs" ;;
+            libpulse.so*)       echo "pulseaudio-libs" ;;
+            *) return 1 ;;
+        esac
+    elif command -v pacman &>/dev/null; then
+        case "$soname" in
+            libopus.so*)        echo "opus" ;;
+            libasound.so*)      echo "alsa-lib" ;;
+            libpipewire-0.3.so*) echo "pipewire" ;;
+            libpulse.so*)       echo "libpulse" ;;
+            *) return 1 ;;
+        esac
+    elif command -v zypper &>/dev/null; then
+        case "$soname" in
+            libopus.so*)        echo "libopus0" ;;
+            libasound.so*)      echo "libasound2" ;;
+            libpipewire-0.3.so*) echo "libpipewire-0-3" ;;
+            libpulse.so*)       echo "libpulse0" ;;
+            *) return 1 ;;
+        esac
+    elif command -v apk &>/dev/null; then
+        case "$soname" in
+            libopus.so*)        echo "libopus" ;;
+            libasound.so*)      echo "alsa-lib" ;;
+            libpipewire-0.3.so*) echo "pipewire" ;;
+            libpulse.so*)       echo "pulseaudio" ;;
+            *) return 1 ;;
+        esac
+    else
+        return 1
+    fi
+}
+
+runtime_pkg_install_cmd() {
+    if command -v apt-get &>/dev/null; then echo "apt-get install -y"
+    elif command -v dnf &>/dev/null; then echo "dnf install -y"
+    elif command -v pacman &>/dev/null; then echo "pacman -S --noconfirm"
+    elif command -v zypper &>/dev/null; then echo "zypper install -y"
+    elif command -v apk &>/dev/null; then echo "apk add"
+    else return 1
+    fi
+}
+
+# Verify every DT_NEEDED library of $1 is loadable, installing the matching
+# package when it is not. Never a no-op on success: it prints the verified set
+# so an operator can see what was checked.
+ensure_runtime_dependencies() {
+    local bin="$1"
+    local needed missing=() lib pkgs install_cmd resolved
+
+    if ! command -v readelf &>/dev/null; then
+        warn "readelf not available; cannot verify runtime libraries for $bin"
+        return 0
+    fi
+    if ! command -v ldconfig &>/dev/null; then
+        warn "ldconfig not available; cannot verify runtime libraries for $bin"
+        return 0
+    fi
+
+    needed=$(readelf -d "$bin" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+    if [ -z "$needed" ]; then
+        warn "No DT_NEEDED entries reported for $bin; skipping library check"
+        return 0
+    fi
+
+    for lib in $needed; do
+        if ldconfig -p 2>/dev/null | grep -q -F "$lib"; then
+            continue
+        fi
+        missing+=("$lib")
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        ok "Runtime libraries present: $(echo $needed | tr '\n' ' ')"
+        return 0
+    fi
+
+    warn "Missing runtime libraries: ${missing[*]}. The server cannot start until these are installed."
+
+    install_cmd=$(runtime_pkg_install_cmd) || install_cmd=""
+    for lib in "${missing[@]}"; do
+        pkgs=$(runtime_pkgs_for "$lib") || {
+            warn "No known package provides $lib on this distribution."
+            warn "Install it manually; the server will not start without it."
+            continue
+        }
+        if [ -z "$install_cmd" ]; then
+            warn "No supported package manager to install $pkgs (for $lib). Install $lib manually."
+            continue
+        fi
+        info "Installing $pkgs (runtime dependency for $lib)..."
+        # shellcheck disable=SC2086
+        if $install_cmd $pkgs >/dev/null 2>&1; then
+            ok "Installed $pkgs"
+        else
+            warn "Could not install $pkgs. Install $lib ($pkgs) manually or the server will not start."
+        fi
+    done
+
+    # Final gate: fail before the service is written so the operator never gets
+    # a "successful" install whose server cannot exec.
+    for lib in "${missing[@]}"; do
+        if ! ldconfig -p 2>/dev/null | grep -q -F "$lib"; then
+            fail "Runtime library $lib is still missing. Install it manually, then re-run this installer."
+        fi
+    done
+    return 0
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         fail "System installation requires root privileges. Run with: sudo $0 [OPTIONS]"
@@ -821,6 +957,11 @@ else
 fi
 
 download_binary "$DOWNLOAD_URL" "$NEW_BIN"
+
+# A missing DT_NEEDED library is resolved by the loader before main(), so the
+# binary cannot exec in ANY mode (dummy = true included). Check the binary we
+# just downloaded and install the runtime packages before first boot.
+ensure_runtime_dependencies "$NEW_BIN"
 
 if [ -n "$TARGET_USER" ]; then
     if ! id "$TARGET_USER" &>/dev/null; then

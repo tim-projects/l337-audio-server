@@ -462,26 +462,46 @@ jobs:
         python3 - <<'PY'
         import json, subprocess, pathlib, datetime, os
 
+        # Always provided by the loader / libc itself; not an install dependency.
+        BASE_LIBS = {"ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
+                     "libc.so.6", "libm.so.6", "libgcc_s.so.1", "libdl.so.2",
+                     "libpthread.so.0", "librt.so.1"}
+
         root = pathlib.Path("release-artifacts")
         assets = {}
+        # Runtime shared libraries each asset needs (DT_NEEDED). These are
+        # resolved by the loader before main(), so a host missing one cannot
+        # exec the binary in ANY mode (dummy = true included). Recording them
+        # per asset also documents which builds carry Opus (armv7/riscv64 do).
+        needed = {}
 
         for f in sorted(p for p in root.rglob("*") if p.is_file()):
             if f.name.endswith(".d") or f.name == "release-info.json":
                 continue
-            out = subprocess.run(["readelf", "-V", str(f)],
+            ver = subprocess.run(["readelf", "-V", str(f)],
                                  capture_output=True, text=True).stdout
             versions = set()
-            for token in out.split():
+            for token in ver.split():
                 if token.startswith("GLIBC_"):
                     versions.add(token[len("GLIBC_"):])
-            if not versions:
+            if versions:
+                highest = max(
+                    (tuple(int(p) for p in v.split(".") if p.isdigit()), v)
+                    for v in versions
+                )
+                assets[f.name] = highest[1]
+            else:
                 assets[f.name] = None
-                continue
-            highest = max(
-                (tuple(int(p) for p in v.split(".") if p.isdigit()), v)
-                for v in versions
-            )
-            assets[f.name] = highest[1]
+
+            dyn = subprocess.run(["readelf", "-d", str(f)],
+                                 capture_output=True, text=True).stdout
+            libs = [
+                line.split("[")[-1].split("]")[0]
+                for line in dyn.splitlines()
+                if "(NEEDED)" in line and "[" in line and "]" in line
+            ]
+            # Only record what a package install would have to provide.
+            needed[f.name] = [l for l in libs if l not in BASE_LIBS]
 
         linux_glibc = [
             tuple(int(p) for p in v.split("."))
@@ -498,6 +518,7 @@ jobs:
             "glibc": ".".join(str(p) for p in max(linux_glibc))
                      if linux_glibc else None,
             "assets": assets,
+            "needed_shared_libs": needed,
         }
         pathlib.Path("release-info.json").write_text(
             json.dumps(info, indent=2) + "\n")

@@ -57,6 +57,26 @@ impl std::fmt::Display for YouTubeError {
 
 impl std::error::Error for YouTubeError {}
 
+/// Why a streaming start failed. `Resolve` means the URL never became a
+/// playable stream (yt-dlp could not select a format); `Playback` means it did
+/// and the fetch/decode broke afterwards. The caller only retries on `Playback`.
+#[derive(Debug)]
+pub enum StreamStartError {
+    Resolve(Box<dyn std::error::Error + Send + Sync>),
+    Playback(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for StreamStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamStartError::Resolve(e) => write!(f, "{e}"),
+            StreamStartError::Playback(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamStartError {}
+
 #[derive(Debug)]
 pub enum EngineError {
     YouTube(YouTubeError),
@@ -181,11 +201,18 @@ impl PlayerEngine {
         })
     }
 
-    pub fn new_dummy(storage: StorageManager) -> Self {
+    /// Dummy (no-hardware) engine: every endpoint still works and the decode /
+    /// pacing / window / ceiling logic is identical to a real backend. The
+    /// configured rebuffer window and default ceiling must still apply, or
+    /// `[server] buffer_max_bytes` / `default_target_kbps` are silently ignored
+    /// in the documented testing mode.
+    pub fn new_dummy(storage: StorageManager, buffer_max_bytes: u64, default_target_kbps: u32) -> Self {
+        let mut audio_buffer = AudioBuffer::new(48000, 0);
+        audio_buffer.max_bytes = buffer_max_bytes as usize;
         Self {
             backend: Box::new(crate::platform::common::NoopAudioBackend),
             stream: Some(Box::new(crate::platform::common::NoopAudioOutputStream)),
-            audio_buffer: Arc::new(Mutex::new(AudioBuffer::new(48000, 0))),
+            audio_buffer: Arc::new(Mutex::new(audio_buffer)),
             volume: Arc::new(Mutex::new(1.0)),
             storage,
             current_track: None,
@@ -198,9 +225,9 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
-            default_target_kbps: 0,
-            runtime_target_kbps: 0,
-            effective_target_kbps: 0,
+            default_target_kbps,
+            runtime_target_kbps: default_target_kbps,
+            effective_target_kbps: default_target_kbps,
             actual_kbps: None,
             codec_label: None,
         }
@@ -311,6 +338,10 @@ impl PlayerEngine {
         )?;
         self.stream = Some(new_stream);
 
+        // A fresh stream starts at unity software gain; re-apply the volume the
+        // operator set, or a recovery silently resets it.
+        *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
+
         let is_file_playback = self.file_sample_rate > 0 && self.channels > 0;
 
         if is_file_playback && position > 0 && self.current_track.is_some() {
@@ -348,36 +379,55 @@ impl PlayerEngine {
         self.effective_target_kbps = ceiling;
         self.actual_kbps = None;
         self.codec_label = None;
+        // A failed play must not report the previous track's timeline.
+        self.duration_sec = None;
 
-        let cached_path = self.storage.get_path_for_track(&track.track_id);
-        if cached_path.exists() {
-            info!("play_track: cache hit for {}", track.track_id);
-            let slot = self.storage.get_active_slot_path("current");
-            let _ = fs::copy(&cached_path, &slot).await;
-            self.load_and_play("current").await;
-            self.storage.update_access(&track.track_id, 0).await;
-            return Ok(());
+        if let Some(cached_path) = self.storage.get_path_for_track(&track.track_id) {
+            if cached_path.exists() {
+                info!("play_track: cache hit for {}", track.track_id);
+                let slot = self.storage.get_active_slot_path("current");
+                let _ = fs::copy(&cached_path, &slot).await;
+                self.load_and_play("current").await;
+                self.storage.update_access(&track.track_id, 0).await;
+                return Ok(());
+            }
         }
 
         if is_youtube_url(&track.stream_url) {
             info!("play_track: YouTube streaming for {}", track.stream_url);
-            if let Err(e) = self.start_streaming_playback(&track.stream_url, ceiling).await {
-                if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
-                    return Err(EngineError::YouTube(yt_err.clone()));
-                }
-                error!("YouTube streaming failed, falling back to download: {}", e);
-                let path = self.storage.get_active_slot_path("current");
-                if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
-                    let err_box = e;
-                    if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
+            match self.start_streaming_playback(&track.stream_url, ceiling).await {
+                Ok(()) => return Ok(()),
+                // Resolution failed: the URL never produced a stream, so
+                // re-running yt-dlp through the downloader would only repeat
+                // the same failure (and double the latency / block risk).
+                Err(StreamStartError::Resolve(e)) => {
+                    if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
                         return Err(EngineError::YouTube(yt_err.clone()));
                     }
-                    return Err(EngineError::Other(format!("Failed to download track: {}", err_box)));
+                    return Err(EngineError::Other(format!(
+                        "Failed to resolve stream for {}: {}",
+                        track.stream_url, e
+                    )));
                 }
-                self.load_and_play("current").await;
-                self.persist_slot(&track.track_id, &path).await;
+                // The stream broke after resolution: fall back to a plain
+                // whole-file download.
+                Err(StreamStartError::Playback(e)) => {
+                    if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                        return Err(EngineError::YouTube(yt_err.clone()));
+                    }
+                    error!("YouTube streaming failed, falling back to download: {}", e);
+                    let path = self.storage.get_active_slot_path("current");
+                    if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
+                        if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                            return Err(EngineError::YouTube(yt_err.clone()));
+                        }
+                        return Err(EngineError::Other(format!("Failed to download track: {}", e)));
+                    }
+                    self.load_and_play("current").await;
+                    self.persist_slot(&track.track_id, &path).await;
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
 
         let path = self.storage.get_active_slot_path("current");
@@ -437,7 +487,10 @@ impl PlayerEngine {
     }
 
     async fn persist_slot(&self, track_id: &str, slot_path: &PathBuf) {
-        let dest_path = self.storage.get_path_for_track(track_id);
+        let Some(dest_path) = self.storage.get_path_for_track(track_id) else {
+            error!("persist_slot: refusing unsafe track_id {:?}", track_id);
+            return;
+        };
         let _ = fs::copy(slot_path, dest_path).await;
         if let Ok(meta) = fs::metadata(slot_path).await {
             self.storage.update_access(track_id, meta.len()).await;
@@ -585,7 +638,7 @@ impl PlayerEngine {
         self.state = PlayerStateLabel::Stopped;
     }
 
-    async fn start_streaming_playback(&mut self, url: &str, ceiling: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn start_streaming_playback(&mut self, url: &str, ceiling: u32) -> Result<(), StreamStartError> {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -593,7 +646,12 @@ impl PlayerEngine {
             let ext = guess_ext_from_url(url);
             (url.to_string(), None, None, ext, None)
         } else {
-            resolve_youtube_stream_url(url, ceiling).await?
+            match resolve_youtube_stream_url(url, ceiling).await {
+                Ok(v) => v,
+                // Resolution failed: the URL never became a playable stream, so
+                // a caller must NOT retry it through another yt-dlp download.
+                Err(e) => return Err(StreamStartError::Resolve(e)),
+            }
         };
         // Record the delivered bitrate / codec / duration of the chosen stream.
         self.actual_kbps = abr;
@@ -608,7 +666,9 @@ impl PlayerEngine {
         let ext_l = ext.unwrap_or_default();
         if !ext_l.is_empty() && !incremental_streaming_container(&ext_l) {
             let cancel = std::sync::Arc::new(AtomicBool::new(false));
-            stream_http_to_file(&direct_url, &path, cancel.clone()).await?;
+            stream_http_to_file(&direct_url, &path, cancel.clone())
+                .await
+                .map_err(StreamStartError::Playback)?;
             {
                 let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 buf.pcm.clear();
@@ -635,7 +695,7 @@ impl PlayerEngine {
         .await
         {
             download_handle.abort();
-            return Err(format!("stream download failed: {}", e).into());
+            return Err(StreamStartError::Playback(format!("stream download failed: {}", e).into()));
         }
 
         {
@@ -792,6 +852,14 @@ impl PlayerEngine {
                 return;
             }
         };
+
+        // Seeking at/past the end leaves nothing to play: previously the whole
+        // track was silently re-buffered from 0 while `position_sec` reported the
+        // end (position > duration). Clamp instead so the reported position is
+        // always reachable.
+        let total_frames = pcm.len() / (channels as usize);
+        let total_sec = (total_frames as f64 / file_sample_rate as f64).round() as u64;
+        let position = position.min(total_sec);
 
         let target_orig_pos = (position as u64) * (file_sample_rate as u64);
         let start_sample = (target_orig_pos * channels as u64) as usize;
@@ -2045,7 +2113,7 @@ exit 1
         DOWNLOAD_STREAM_INVOKED.store(false, Ordering::SeqCst);
 
         let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
-        let mut engine = PlayerEngine::new_dummy(storage);
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
 
         let track = Track {
             track_id: "test".to_string(),

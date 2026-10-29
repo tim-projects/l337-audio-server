@@ -155,6 +155,11 @@ The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return 
 
   (armv7/riscv64 release binaries build without Opus and do not need it.)
 
+  The Linux installers read each binary's `DT_NEEDED` set with `readelf -d` and
+  install the missing library before first boot (and fail rather than report a
+  successful install whose server cannot exec). Each release's
+  `release-info.json` also records the required shared libraries per asset.
+
 ## Troubleshooting
 
 ### Installer falls back to the wrong backend or won’t run

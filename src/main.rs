@@ -245,7 +245,7 @@ async fn main() {
         tracing::warn!(
             "Running in DUMMY output mode. No audio will be produced. Testing only."
         );
-        PlayerEngine::new_dummy(storage)
+        PlayerEngine::new_dummy(storage, buffer_max_bytes, default_target_kbps)
     } else {
         match PlayerEngine::new(storage, buffer_max_bytes, default_target_kbps) {
             Ok(engine) => engine,

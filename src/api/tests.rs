@@ -47,7 +47,7 @@ mod tests {
         let dir = std::env::temp_dir().join("l337-test-cache");
         let _ = std::fs::create_dir_all(&dir);
         let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
-        let engine = PlayerEngine::new_dummy(storage);
+        let engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
         Arc::new(SendableEngine(Mutex::new(engine)))
     }
 
@@ -209,5 +209,96 @@ mod tests {
         .await;
         let resp = response.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// A `track_id` must never escape the cache dir: it is used as a file name
+    /// for both writing (cache/persist) and deleting (eviction).
+    #[test]
+    fn test_unsafe_track_ids_rejected() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "../../etc/passwd",
+            "/tmp/absolute",
+            "a/b",
+            "a\\b",
+            "trailing/",
+            "nul\0id",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                !crate::player::storage::is_safe_track_id(bad),
+                "unsafe id must be rejected: {bad:?}"
+            );
+        }
+        for good in ["abc123", "t-opus-ogg", "..hidden", "a.b-c_d", &"y".repeat(128)] {
+            assert!(
+                crate::player::storage::is_safe_track_id(good),
+                "safe id must be accepted: {good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_rejects_paths_outside_cache_dir() {
+        let cache = PathBuf::from("/nonexistent-cache-root");
+        let storage = StorageManager {
+            cache_dir: cache.clone(),
+            max_pool_size: 1024,
+            manifest: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+        assert_eq!(
+            storage.get_path_for_track("../escape"),
+            None,
+            "relative traversal must not resolve to a cache path"
+        );
+        assert_eq!(
+            storage.get_path_for_track("/etc/passwd"),
+            None,
+            "absolute path must not resolve to a cache path"
+        );
+        assert_eq!(
+            storage.get_path_for_track("ok-id"),
+            Some(cache.join("ok-id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_play_rejects_traversal_track_id() {
+        let state = setup_state().await;
+        let track = Track {
+            track_id: "../../escape".into(),
+            stream_url: "file:///tmp/whatever".into(),
+            title: None,
+            artist: None,
+            duration: None,
+            target_kbps: None,
+            quality: None,
+        };
+        let response = play(State(state), Json(track)).await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_rejects_traversal_track_id() {
+        let state = setup_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Track-Id", HeaderValue::from_static("../escape"));
+        let response = upload_stream(
+            State(state),
+            axum::extract::OriginalUri("/player/play/stream".parse().unwrap()),
+            headers,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            response.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 }

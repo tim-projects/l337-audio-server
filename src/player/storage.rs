@@ -12,6 +12,19 @@ pub struct StorageManager {
     pub manifest: Arc<Mutex<HashMap<String, CacheManifestEntry>>>,
 }
 
+/// A `track_id` becomes a file name inside the cache dir, so it must be one
+/// plain path component. Absolute paths, `"/"`/`"\\\\"` separators, `.`/`..`
+/// and NUL are rejected: a client-supplied id must never escape the cache dir.
+pub fn is_safe_track_id(track_id: &str) -> bool {
+    !track_id.is_empty()
+        && track_id != "."
+        && track_id != ".."
+        && !track_id.contains('/')
+        && !track_id.contains('\\')
+        && !track_id.contains('\0')
+        && track_id.len() <= 128
+}
+
 /// Default cache directory.
 ///
 /// Honors the `CACHE_DIRECTORY` / `STATE_DIRECTORY` environment variables set
@@ -124,7 +137,13 @@ impl StorageManager {
                 continue;
             }
 
-            let file_path = self.cache_dir.join(&entry.track_id);
+            // The manifest is persisted data, so never trust its keys as paths:
+            // only delete a file that resolves to a safe component inside our
+            // own cache dir.
+            let file_path = match self.get_path_for_track(&entry.track_id) {
+                Some(p) => p,
+                None => continue,
+            };
             if file_path.exists() {
                 if let Ok(_) = fs::remove_file(&file_path).await {
                     current_size -= entry.file_size;
@@ -136,8 +155,13 @@ impl StorageManager {
         self.save_manifest().await;
     }
 
-    pub fn get_path_for_track(&self, track_id: &str) -> PathBuf {
-        self.cache_dir.join(track_id)
+    /// Cache file path for `track_id`, or `None` when the id is not a safe
+    /// single path component (see [`is_safe_track_id`]).
+    pub fn get_path_for_track(&self, track_id: &str) -> Option<PathBuf> {
+        if !is_safe_track_id(track_id) {
+            return None;
+        }
+        Some(self.cache_dir.join(track_id))
     }
 
     pub fn get_active_slot_path(&self, slot: &str) -> PathBuf {

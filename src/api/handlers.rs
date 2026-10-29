@@ -162,6 +162,13 @@ pub async fn auth_redeem(
     }
 }
 
+/// A `track_id` is used as a cache file name, so it must be a single plain
+/// path component. An id carrying a path separator, `.`/`..` or a NUL is
+/// rejected here — before it can reach storage and escape the cache dir.
+fn valid_track_id(track_id: &str) -> bool {
+    crate::player::storage::is_safe_track_id(track_id)
+}
+
 fn track_id_missing() -> impl IntoResponse {
     (
         StatusCode::BAD_REQUEST,
@@ -171,7 +178,7 @@ fn track_id_missing() -> impl IntoResponse {
 }
 
 pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> impl IntoResponse {
-    if track.track_id.is_empty() || track.stream_url.is_empty() {
+    if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"ok": false, "error": "track_id and stream_url are required"})),
@@ -238,7 +245,7 @@ pub async fn cache_next(
     State(state): State<AppState>,
     Json(track): Json<Track>,
 ) -> impl IntoResponse {
-    if track.track_id.is_empty() || track.stream_url.is_empty() {
+    if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
     let state_clone = Arc::clone(&state);
@@ -264,8 +271,9 @@ pub async fn cache_next(
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
             let engine = state_clone.0.lock().await;
-            let persistent_path = engine.storage.get_path_for_track(&track_id);
-            let _ = tokio::fs::copy(&dest, &persistent_path).await;
+            if let Some(persistent_path) = engine.storage.get_path_for_track(&track_id) {
+                let _ = tokio::fs::copy(&dest, &persistent_path).await;
+            }
             if let Ok(meta) = tokio::fs::metadata(&dest).await {
                 engine.storage.update_access(&track_id, meta.len()).await;
                 engine.storage.evict_if_needed(meta.len()).await;
@@ -280,7 +288,7 @@ pub async fn cache_previous(
     State(state): State<AppState>,
     Json(track): Json<Track>,
 ) -> impl IntoResponse {
-    if track.track_id.is_empty() || track.stream_url.is_empty() {
+    if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
     let state_clone = Arc::clone(&state);
@@ -306,8 +314,9 @@ pub async fn cache_previous(
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
             let engine = state_clone.0.lock().await;
-            let persistent_path = engine.storage.get_path_for_track(&track_id);
-            let _ = tokio::fs::copy(&dest, &persistent_path).await;
+            if let Some(persistent_path) = engine.storage.get_path_for_track(&track_id) {
+                let _ = tokio::fs::copy(&dest, &persistent_path).await;
+            }
             if let Ok(meta) = tokio::fs::metadata(&dest).await {
                 engine.storage.update_access(&track_id, meta.len()).await;
                 engine.storage.evict_if_needed(meta.len()).await;
@@ -412,8 +421,14 @@ pub async fn upload_stream(
     };
 
     let track_id = match headers.get("X-Track-Id").and_then(|v| v.to_str().ok()) {
-        Some(id) if !id.is_empty() => id.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "X-Track-Id header required").into_response(),
+        Some(id) if valid_track_id(id) => id.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "X-Track-Id header must be a non-empty single path component (no /, \\, .. or NUL)",
+            )
+                .into_response();
+        }
     };
 
     let title = headers

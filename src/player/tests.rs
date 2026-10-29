@@ -40,7 +40,7 @@ mod tests {
     #[tokio::test]
     async fn test_player_engine_send_sync() {
         let storage = StorageManager::new(500 * 1024 * 1024, Some(PathBuf::from("./test_cache"))).await;
-        let _engine = PlayerEngine::new_dummy(storage);
+        let _engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
         assert_send::<PlayerEngine>();
         assert_sync::<PlayerEngine>();
     }
@@ -48,7 +48,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_speed_clamping() {
         let storage = StorageManager::new(500 * 1024 * 1024, Some(PathBuf::from("./test_cache"))).await;
-        let mut engine = PlayerEngine::new_dummy(storage);
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
         engine.set_speed(0.1);
         assert_eq!(engine.speed, 0.25);
         engine.set_speed(10.0);
@@ -60,7 +60,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_volume_clamping() {
         let storage = StorageManager::new(500 * 1024 * 1024, Some(PathBuf::from("./test_cache"))).await;
-        let mut engine = PlayerEngine::new_dummy(storage);
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
         engine.set_volume(-0.5);
         assert_eq!(engine.volume_val, 0.0);
         engine.set_volume(1.5);
@@ -74,7 +74,7 @@ mod tests {
         let dir = std::env::temp_dir().join("l337-player-test");
         let _ = std::fs::create_dir_all(&dir);
         let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
-        let mut engine = PlayerEngine::new_dummy(storage);
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
 
         let wav_path = dir.join("seek-unit-test.wav");
         write_minimal_wav(&wav_path);
@@ -100,10 +100,11 @@ mod tests {
 
         let result = decode_to_pcm(bytes);
         assert!(result.is_ok(), "decode_to_pcm failed: {:?}", result.err());
-        let (pcm, sample_rate, channels) = result.unwrap();
+        let (pcm, sample_rate, channels, codec) = result.unwrap();
         assert!(!pcm.is_empty(), "PCM output should not be empty");
         assert_eq!(sample_rate, 44100);
         assert_eq!(channels, 2);
+        assert_eq!(codec.as_deref(), Some("pcm_s16le"));
     }
 
     #[tokio::test]
