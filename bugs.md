@@ -156,3 +156,37 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 **Progress:** 10 / 10 addressed.
 
 Remaining (documented, tracked for follow-up): finding #3's scope note — decode local files incrementally so the file-path peak is eliminated (a known shortcut, correctness unaffected, and the peak is reclaimed as playback advances); and the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
+
+---
+
+# Linux host verification checklist
+
+Run on a stock Linux host (Debian/Ubuntu, Fedora, or Arch) with PipeWire **and** an
+ALSA box, newest release downloaded from GitHub. Use an **isolated instance** so the
+supervised service is untouched: a private `TMPDIR` (own socket + single-instance lock),
+its own `L337__SERVER__…` overrides, and `RUST_LOG=l337_audio_server=debug`. `yt-dlp`
+must be on `PATH` for the YouTube steps. Socket mode keeps `/setup` for token discovery.
+
+## Install + linkage (finding #1 CRITICAL)
+- [ ] `sudo ./scripts/install-linux-pipewire.sh` (then the ALSA box) completes and reports **`ok "libopus runtime library present"`** (or installs `libopus0`/`opus`).
+- [ ] A stock host that starts **without** libopus: install fails or warns clearly before first boot (never a silent success).
+- [ ] `readelf -d /opt/l337-audio-server/l337-audio-server | grep NEEDED` lists `libopus.so` (+ `libpipewire-0.3.so` for pipewire).
+- [ ] `ldd` resolves every `NEEDED` (no "not found"); the service starts (`systemctl --user status l337-audio-server` shows running).
+- [ ] `L337__SERVER__DUMMY=1 ./l337-audio-server --version` + a dummy boot work (a loader failure can't be masked by `dummy=true`).
+
+## Opus decode + timeline (G1/G4)
+- [ ] Generate/fetch an Opus-in-Ogg and Opus-in-WebM; `POST /player/play` each. Assert `state=playing`, `duration_sec` populated, `codec=opus`, no `unsupported codec` in `RUST_LOG`.
+- [ ] Over ~5–10 s of polling, `position_sec` advances ~1× toward `duration_sec`.
+- [ ] A **> 65 s** track plays to completion: no `buffer cap exceeded`, one `over rebuffer window` diagnostic (edge-triggered), and RSS (`/proc/<pid>/status` or `top`) falls back after playback rather than pinning the whole track.
+
+## Bandwidth ceiling (G2 — findings #4/#5)
+- [ ] `POST /player/target {"target_kbps":64}`, then play a YouTube URL and an audio/variants source: `PlayerStatus.target_kbps=64` and `actual_kbps<=64` (or reports the true, un-clampable bitrate); no request fails.
+- [ ] Background cache honors the runtime ceiling: after `/player/target`, the next/prev slot is fetched with the constrained selector (`next.stream` size / `PlayerStatus` for it reflects the ceiling, not best).
+- [ ] Labels: `{"quality":"low"}` (~≤48), `{"quality":"medium"}` (~≤128); `{"quality":"ultra"}` (unknown) returns **200** and falls back to the server default (no 422).
+
+## Recovery (G5)
+- [ ] Force a backend error (unload/disconnect the sink during playback, or trip the window): the process does **not** abort — it recovers a fresh stream or cleanly reports `state=stopped`/`audio_available=false`.
+- [ ] Repeated play/pause/stop/seek cycles + `sv restart` never leave a `CANNOT LINK`/assertion in the logs.
+
+## Packaging signal (finding #9)
+- [ ] The published Linux assets' `release-info.json`/release notes list `libopus` as a required shared library, and README's Runtime Dependencies matches.
