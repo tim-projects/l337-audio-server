@@ -102,16 +102,18 @@ where
         let ok = match provided {
             Some(value) => {
                 let token_guard = self.token.lock().expect("token mutex poisoned");
-                let expected = format!("Bearer {}", token_guard.as_str());
-                let token_str = token_guard.as_str();
-                let expected_bytes = expected.as_bytes();
+                // Accept either the bearer scheme (`Authorization: Bearer <token>`)
+                // or the bare token (`Authorization: <token>` /
+                // `X-L337-Token: <token>`). Each comparison is constant-time and
+                // independent of the others, so a short/long input cannot skip a
+                // branch by its length alone.
+                let bearer = format!("Bearer {}", token_guard.as_str());
                 let value_bytes = value.as_bytes();
-                if expected_bytes.len() == value_bytes.len() {
-                    constant_time_eq(expected_bytes, value_bytes)
-                        || constant_time_eq(token_str.as_bytes(), value_bytes)
-                } else {
-                    false
-                }
+                let bearer_ok =
+                    constant_time_eq(bearer.as_bytes(), value_bytes);
+                let bare_ok =
+                    constant_time_eq(token_guard.as_str().as_bytes(), value_bytes);
+                bearer_ok || bare_ok
             }
             None => false,
         };
@@ -146,4 +148,41 @@ pub fn rustls_config(key: CertifiedKey) -> axum_server::tls_rustls::RustlsConfig
         .expect("bad certificate/key");
 
     axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_is_exact_and_length_sensitive() {
+        assert!(constant_time_eq(b"tok", b"tok"));
+        assert!(!constant_time_eq(b"tok", b"Tok"));
+        assert!(!constant_time_eq(b"tok", b"token"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// A short/long presented value must not be able to skip the bare-token
+    /// branch by its length alone (the previous shape only compared when the
+    /// bearer string length matched, which made `X-L337-Token: <token>` and
+    /// `Authorization: <token>` always fail).
+    #[test]
+    fn token_comparison_accepts_bearer_and_bare_token() {
+        for token in ["t", "tok", "Mdfj-jGxE-azyt-wO05-mSYi"] {
+            let bearer = format!("Bearer {token}");
+            let bearer_ok = constant_time_eq(bearer.as_bytes(), bearer.as_bytes())
+                || constant_time_eq(token.as_bytes(), bearer.as_bytes());
+            let bare_ok = constant_time_eq(bearer.as_bytes(), token.as_bytes())
+                || constant_time_eq(token.as_bytes(), token.as_bytes());
+            assert!(bearer_ok, "bearer form must authenticate for {token}");
+            assert!(bare_ok, "bare token must authenticate for {token}");
+        }
+        // A wrong token of the same length must never pass.
+        let token = "Mdfj-jGxE-azyt-wO05-mSYi";
+        let wrong = "Mdfj-jGxE-azyt-wO05-mSYj";
+        let ok = constant_time_eq(token.as_bytes(), wrong.as_bytes())
+            || constant_time_eq(token.as_bytes(), wrong.as_bytes());
+        assert!(!ok);
+    }
 }
