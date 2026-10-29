@@ -338,10 +338,6 @@ impl PlayerEngine {
         )?;
         self.stream = Some(new_stream);
 
-        // A fresh stream starts at unity software gain; re-apply the volume the
-        // operator set, or a recovery silently resets it.
-        *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
-
         let is_file_playback = self.file_sample_rate > 0 && self.channels > 0;
 
         if is_file_playback && position > 0 && self.current_track.is_some() {
@@ -738,12 +734,25 @@ impl PlayerEngine {
         drop(buf);
     }
 
+    /// Set the output volume.
+    ///
+    /// Software gain is the single authoritative path: every backend multiplies
+    /// the samples it dequeues by this value, so it works on PipeWire, ALSA,
+    /// AAudio, CoreAudio and WASAPI alike and needs no external tool. It also
+    /// lives in the `Arc` shared with the backend, so it survives a stream
+    /// recreation (`try_recover`) unchanged — a hardware/sink-input path would
+    /// reset to 100% on every recovery and would need re-applying to a node that
+    /// may not be linked yet, and mixing the two double-attenuates.
     pub fn set_volume(&mut self, volume: f32) {
         self.volume_val = volume.clamp(0.0, 1.0);
-        if let Err(e) = self.set_pipewire_sink_input_volume(self.volume_val) {
-            tracing::warn!("PipeWire volume control unavailable, using software gain: {e}");
-            *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
-        }
+        *self.volume.lock().unwrap_or_else(|e| e.into_inner()) = self.volume_val;
+    }
+
+    /// The software gain actually applied by the backend (the `Arc` shared with
+    /// the audio stream). Exposed for tests: it must always track `volume_val`.
+    #[cfg(test)]
+    pub(crate) fn applied_gain(&self) -> f32 {
+        *self.volume.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// G2: change the default bandwidth ceiling at runtime without a restart.
@@ -766,53 +775,6 @@ impl PlayerEngine {
     /// default after `set_target`. `0` = best.
     pub fn current_default_target_kbps(&self) -> u32 {
         self.runtime_target_kbps
-    }
-
-    fn set_pipewire_sink_input_volume(&self, volume: f32) -> Result<(), String> {
-        let sink_input = Command::new("pactl")
-            .arg("list")
-            .arg("sink-inputs")
-            .output()
-            .map_err(|e| format!("pactl not available: {e}"))?;
-
-        if !sink_input.status.success() {
-            return Err("pactl list sink-inputs failed".into());
-        }
-
-        let output = String::from_utf8_lossy(&sink_input.stdout);
-        let mut current_index: Option<u32> = None;
-        let mut in_target = false;
-
-        for line in output.lines() {
-            let line = line.trim();
-            if line.starts_with("Sink Input #") {
-                current_index = line.rsplit('#').next().and_then(|s| s.trim().parse().ok());
-                in_target = false;
-            } else if line.starts_with("application.name =") || line.starts_with("node.name =") {
-                in_target = line.contains("l337-audio-server");
-            }
-
-            if in_target && line.starts_with("volume:") {
-                if let Some(index) = current_index {
-                    let percentage = (volume * 100.0).round().clamp(0.0, 100.0);
-                    let value = (volume * 65536.0).round().clamp(0.0, 65536.0) as u32;
-                    let status = Command::new("pactl")
-                        .arg("set-sink-input-volume")
-                        .arg(index.to_string())
-                        .arg(format!("{}%", percentage))
-                        .status()
-                        .map_err(|e| format!("pactl set-sink-input-volume failed: {e}"))?;
-
-                    if !status.success() {
-                        return Err(format!("pactl set-sink-input-volume exited with {}", status));
-                    }
-                    tracing::info!("Set PipeWire sink-input #{} volume to {}% ({})", index, percentage, value);
-                    return Ok(());
-                }
-            }
-        }
-
-        Err("l337-audio-server sink input not found".into())
     }
 
     pub fn seek(&mut self, position: u64) {

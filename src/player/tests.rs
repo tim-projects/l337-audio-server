@@ -67,6 +67,9 @@ mod tests {
         assert_eq!(engine.volume_val, 1.0);
         engine.set_volume(0.5);
         assert_eq!(engine.volume_val, 0.5);
+        // Software gain is the single authoritative path: it must track
+        // volume_val exactly, or lowering after a recovery double-attenuates.
+        assert_eq!(engine.applied_gain(), 0.5);
     }
 
     #[tokio::test]
