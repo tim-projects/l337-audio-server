@@ -157,6 +157,14 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 
 Remaining (documented, tracked for follow-up): finding #3's scope note — decode local files incrementally so the file-path peak is eliminated (a known shortcut, correctness unaffected, and the peak is reclaimed as playback advances); and the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
 
+**Host verification round 2** (Debian 13, x86_64, dummy output, prereleases
+`2026.10.29-5` … `-7`) closed the merge gate on this host and found six further
+defects — two of them security-relevant — plus one regression introduced by an
+earlier fix on this same round. See
+[Host verification run](#host-verification-run--debian-13-trixie-x86_64-dummy-output)
+and [Skipped work](#skipped-work-hand-off-for-a-linux-host-with-a-real-pipewirealsa-sink)
+for the remaining device-only items.
+
 ---
 
 # Linux host verification checklist
@@ -258,11 +266,265 @@ local controllable HTTP origin were on `PATH`.
 | 4 | WARNING | A failed YouTube resolve ran **yt-dlp twice** (resolve, then the downloader re-resolving it) — ~2× latency per failure and 2× the chance of a rate-limit block. | `StreamStartError::Resolve`/`Playback`; only a post-resolution failure falls back to a plain download. Verified: an unresolvable YouTube URL now returns `Failed to resolve stream for …` once, and `duration_sec` no longer reports the previous track's timeline. |
 | 5 | SUGGESTION | `seek` past the end silently re-buffered the whole track from 0 while reporting `position_sec > duration_sec` (observed `99999` vs `100`). | Clamp to the decoded length; observed `100`/`0` at the end instead of `99999`/`100`. |
 
-## Left to verify (needs a real backend / network)
-- `position_sec` advancing ~1× and RSS falling back after playback (no writer in
-  dummy mode).
-- YouTube playback against a reachable YouTube (this sandbox gets
-  "This video is unavailable"), so `actual_kbps` clamping and background-cache
-  sizing under a real ceiling are unverified.
-- A stock host *without* libopus reaching the new installer fail-gate (the gate
-  itself is verified, only the package-manager install path is not).
+---
+
+# Skipped work: hand-off for a Linux host with a real PipeWire/ALSA sink
+
+Everything below was **not** executed on the Debian 13 dummy-output host, because
+the host cannot exercise it. Each item states **why** it was skipped, **exactly**
+what to run, what **pass** looks like, and where the code lives if it fails.
+Fixture generation, the HTTP origin and the isolated-instance recipe are all
+reproduced verbatim so nothing is re-derived.
+
+Environment used here (recreate the same, minus `dummy`):
+
+```bash
+mkdir -p /tmp/l337iso/{data,run,state,cache,logs} && chmod 700 /tmp/l337iso/run
+# fixtures
+cd /tmp/l337iso/data
+for spec in "440 10 test_opus_ogg.opus opus" "330 10 test_opus_webm.webm opus" \
+            "220 100 long_opus_ogg.opus opus" "500 8 test.mp3 libmp3lame" \
+            "600 8 test.flac flac" "700 8 test.wav pcm_s16le" "800 8 test.m4a aac"; do
+  set -- $spec
+  ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=$1:duration=$2:sample_rate=48000" \
+    -ac 2 -c:a $4 $3 -y
+done
+
+env L337__SERVER__TRANSPORT=http L337__SERVER__HOST=127.0.0.1 L337__SERVER__PORT=13370 \
+    L337__SERVER__DEFAULT_TARGET_KBPS=128 L337__SERVER__BUFFER_MAX_BYTES=8388608 \
+    L337__SERVER__DUMMY=1 \
+    RUST_LOG=l337_audio_server=debug HOME=/tmp/l337iso XDG_RUNTIME_DIR=/tmp/l337iso/run \
+    XDG_CACHE_HOME=/tmp/l337iso/cache STATE_DIRECTORY=/tmp/l337iso/state TMPDIR=/tmp/l337iso \
+    ./l337-audio-server            # drop DUMMY=1 on the real host
+TOKEN=$(cat /tmp/l337iso/state/server_token.txt)
+BASE=https://127.0.0.1:13370; alias q="curl -sk -H \"Authorization: Bearer $TOKEN\""
+```
+
+A controllable HTTP origin (throttle / stall / forced content-type) was used for
+the streaming-path tests; `/tmp/l337iso/origin.py` in this session's scratch is
+portable if it is needed again, but it is **not** required for the items below
+except where stated.
+
+---
+
+## 1. `position_sec` does not advance in dummy mode — never verified
+
+**Why skipped:** the dummy backend is `NoopAudioOutputStream`, whose `play()` is a
+no-op. Nothing ever advances `AudioBuffer::read_pos`, and
+`get_status()` derives `position_sec` from `(read_pos / channels)` converted back
+to source-rate seconds (`PlayerEngine::calculate_position` /
+`get_status`, src/player/engine.rs:262 and :908). With no writer, `read_pos` is
+permanently 0, so `position_sec` stayed 0 for every track on this host **by
+construction** — not because of a bug. It requires a backend that dequeues
+samples.
+
+**Run:**
+
+```bash
+q -X POST $BASE/player/play/stream -H 'X-Track-Id: pos1' --data-binary @/tmp/l337iso/data/test_opus_ogg.opus
+for i in $(seq 1 10); do sleep 1; q $BASE/player/status | jq -c '{position_sec,duration_sec,state}'; done
+```
+
+**Pass:** `state=playing` throughout, `position_sec` increases monotonically and
+lands on ~`10` at the end (10 s fixture). Drift of more than ±1 s over 10 s is a
+failure — that is the conversion in `calculate_position` double-counting stereo
+or mixing device/source rates.
+
+**Watch for:** `position_sec` in *jumps* (the `stretch_and_resample` ratio), or
+reaching `duration_sec` early/late. Both are arithmetic bugs in
+`calculate_position`, not in the backend.
+
+---
+
+## 2. RSS reclaim after playback (finding #3) — never verified
+
+**Why skipped:** reclaim is driven by the *device writer* calling
+`buf.reclaim_consumed()` at its checkpoint, and only after it has advanced
+`read_pos` by ≥ `1<<20` samples. No writer runs in dummy mode, so nothing is ever
+reclaimed, and the whole decoded track stays pinned. This is precisely the
+residual documented in finding #3's scope note.
+
+**Run:**
+
+```bash
+PID=$(pgrep -x l337-audio-server | head -1)
+q -X POST $BASE/player/play/stream -H 'X-Track-Id: rss1' --data-binary @/tmp/l337iso/data/long_opus_ogg.opus   # 100 s ≈ 38 MB decoded
+grep VmRSS /proc/$PID/status                     # T0
+sleep 30; grep VmRSS /proc/$PID/status           # mid-playback
+q -X POST $BASE/player/stop >/dev/null; sleep 2; grep VmRSS /proc/$PID/status   # after
+```
+
+**Pass:** RSS rises while buffering the initial window, then **falls back**
+toward the ~window size (config 8 MiB here → ~24–30 MiB steady) rather than
+pinning the full 38 MB; `load_and_play` logs no `buffer cap exceeded`.
+
+**Where it fails if it fails:** the cap guard is `AudioBuffer::exceeds_window()`
+and the reclaim is `AudioBuffer::reclaim_consumed()` (src/platform/common.rs:103
+and :109), called from each writer after `read_pos` advances. Verified present in
+`linux.rs:98/136`, `pulseaudio.rs:227/268`, `alsa.rs:189/212`,
+`android.rs:167/180`, `macos.rs:78/121`, `windows.rs:125/138`; the raw
+`pcm.len() > buf.max_bytes` pattern is gone from `src/platform/` entirely.
+
+**Known shortcut (finding #3, unchanged):** the *file* path still decodes the
+whole track into `buf.pcm` in one shot, so the peak is track-length-shaped for
+the file/`/player/play/stream` path. Only the streaming path
+(`streaming_decode_sync` → `throttle_stream_producer`) is length-independent.
+The upgrade path (decode local files incrementally into the throttled producer)
+is still open.
+
+---
+
+## 3. Real backend error + `try_recover` (G5) — never verified
+
+**Why skipped:** forcing a `StreamState::Error` requires unloading the sink the
+stream is connected to, i.e. a live PipeWire graph. In dummy mode nothing can
+raise `backend_error`, so the recovery path was never executed end-to-end.
+
+**Run:** start playback, then break the sink:
+
+```bash
+q -X POST $BASE/player/play/stream -H 'X-Track-Id: rec1' --data-binary @/tmp/l337iso/data/long_opus_ogg.opus
+sleep 2
+pactl unload-module module-loopback      # or: systemctl --user stop pipewire{,-pulse}.socket
+# then observe for ~10 s
+for i in $(seq 1 10); do sleep 1; q $BASE/player/status | jq -c '{state,audio_available,position_sec}'; done
+```
+
+**Pass:** the process does **not** exit. The 500 ms recovery task
+(`main.rs:268`) calls `try_recover()`, which rebuilds the stream, re-buffers from
+`position` and returns to `state=playing`; or it cleanly reports
+`state=stopped` / `audio_available=false`. One `PipeWire stream entered error
+state` + one `backend_error` handling per disturbance is expected.
+
+**Changed on this branch, so re-check specifically:** `try_recover` no longer
+touches the volume (the software gain lives in the `Arc` shared with the backend
+and survives stream recreation by construction). Confirm volume still reads back
+what you set *after* a recovery, and that it is not doubled or reset:
+
+```bash
+q -X POST $BASE/player/volume -H 'Content-Type: application/json' -d '{"volume":0.3}'
+# ...force a sink error as above...
+q $BASE/player/status | jq -c '{volume}'
+```
+
+---
+
+## 4. YouTube + real bandwidth ceiling (G2, findings #4/#5) — never verified
+
+**Why skipped:** this sandbox gets `ERROR: [youtube] … This video is unavailable`
+from yt-dlp, so no YouTube stream could be resolved. Everything that depends on
+observing a *delivered* bitrate is therefore untested against a real target.
+
+**Run:**
+
+```bash
+q -X POST $BASE/player/target -H 'Content-Type: application/json' -d '{"target_kbps":64}'
+q -X POST $BASE/player/play -H 'Content-Type: application/json' \
+   -d '{"track_id":"yt64","stream_url":"https://www.youtube.com/watch?v=<known-good>"}'
+q $BASE/player/status | jq '{target_kbps,actual_kbps,codec,duration_sec}'
+```
+
+**Pass:** `target_kbps=64`, and `actual_kbps<=64` (or, if nothing fits under the
+ceiling, the true un-clampable bitrate reported honestly — `yt_dlp_format_selector`
+degrades to `bestaudio`). No 4xx/5xx from any endpoint.
+
+**Background cache under a runtime ceiling** (finding #4, fixed but unverified
+against a live target):
+
+```bash
+q -X POST $BASE/player/target -H 'Content-Type: application/json' -d '{"target_kbps":64}'
+q -X POST $BASE/player/cache/next -H 'Content-Type: application/json' \
+   -d '{"track_id":"ytnext","stream_url":"https://www.youtube.com/watch?v=<known-good>"}'
+sleep 20; ls -l /tmp/l337iso/state/cache/next.stream      # must reflect ≤64 kbps
+```
+
+**Watch for (static risk, unverified):** `detect_youtube_block`
+(src/player/engine.rs) classifies a block by substring on yt-dlp's stderr, and
+`"403"`/`"cloudflare"` map to `bot_detected`. Any unrelated yt-dlp error
+message containing `403` will be reported to the client as
+`youtube_blocked` with `block_type=bot_detected`. If you see a spurious
+`youtube_blocked`, this is the cause.
+
+---
+
+## 5. Installer's package-install path — gate verified, install not
+
+**Why skipped:** the fail-gate is verified, but the `apt-get`/`dnf`/`pacman`/
+`zypper`/`apk` *install* invocation only runs as root on a host that is actually
+missing a library, which no sandbox can reproduce safely.
+
+**Verified here:** `ensure_runtime_dependencies()` prints
+`ok "Runtime libraries present: libopus.so.0 libpipewire-0.3.so.0 …"` for both
+real Linux assets, and for a binary with an unresolvable `DT_NEEDED` entry it
+`warn`s per library and **exits 1** before the service is written.
+
+**Run on a host without libopus** (e.g. a container based on `debian:13-slim`
+minus `libopus0`, or temporarily hide the .pc/lib):
+
+```bash
+sudo ./scripts/install-linux-pipewire.sh --dry-run
+sudo ./scripts/install-linux-pipewire.sh          # expect: warn + install libopus0 + ok
+readelf -d /opt/l337-audio-server/l337-audio-server | grep NEEDED
+systemctl --user status l337-audio-server          # running, no CANNOT LINK
+```
+
+**Pass:** the installer prints the missing library, installs it, re-checks, and
+reports `Runtime libraries present: …`; if it cannot, it exits non-zero instead
+of reporting success.
+
+**Static risk (unverified):** the SONAME→package table lives in
+`runtime_pkgs_for()` (scripts/install-linux-{pipewire,alsa}.sh and
+scripts/install-systemd.sh, three identical copies because each installer is
+downloaded standalone). The zypper/apk names (`libopus0`, `libopus`) and the
+`libpipewire-0.3-0`/`pipewire` split are best-effort and have not been executed
+on those distributions.
+
+---
+
+## 6. `cargo test` **execution** — compiles, not run
+
+**Why skipped:** only `cargo check --all-targets` was run on this host, because a
+debug build of every dependency needs several GB and `/tmp` was already at ~79%.
+
+**Verified here:** the test target compiles
+(`cargo check --no-default-features --features alsa,opus --all-targets`, 0 errors).
+
+**Run:**
+
+```bash
+CARGO_HOME=/tmp/cargo-home RUSTUP_HOME=/tmp/rustup CARGO_TARGET_DIR=/tmp/l337-build \
+  cargo test --no-default-features --features alsa,opus
+```
+
+Note this host has no PipeWire **dev** headers (only the runtime `.so`), so the
+default `backend` feature cannot compile locally; `alsa,opus` does, because
+`alsa.pc` is present. CI covers the pipewire variant. `libopus.so` (the dev
+symlink) is also absent, which is fine for `cargo check` but would fail a local
+link.
+
+---
+
+## 7. Known-but-unfixed items carried over (unchanged, still open)
+
+- **finding #3** — whole-track decode on the file/`/player/play/stream` path
+  (see §2). Upgrade path: incremental file decode via the throttled producer.
+- **finding #6** — `Quality::Lossless` maps to ceiling 0 (no ceiling) and the
+  server pass-throughs; there is still no lossless-format preference or
+  degradation flag. `PlayerStatus.codec` is the only signal.
+- **finding #7** — `CHUNK_FRAMES = 4096` in `src/platform/pulseaudio.rs` is
+  unverified on device (audio still 1×, no underrun, lower wakeups).
+- **finding #9** — the committed `scripts/opus-stubs/libopus.so` blob is still
+  not regenerated/validated in CI.
+- `install-systemd.sh` writes `/etc/l337-audio-server/config.toml`, which
+  `load_settings()` never reads (it reads `…/config` and `…/server.ini`) — the
+  systemd installer's host/port/token are silently ignored. **Not fixed; needs a
+  decision on which file is authoritative.**
+
+## What is already green (do not redo)
+
+Dummy-mode API surface (all endpoints + 400/401/422/500 paths), all six codecs,
+`position`/`seek` clamping, the `track_id` traversal write+delete, the four auth
+header forms, `X-L337-Token`, `ensure_runtime_dependencies` on both real Linux
+assets, the release-info `needed_shared_libs` field, and every installer's
+`bash -n` + `--dry-run`.
+
