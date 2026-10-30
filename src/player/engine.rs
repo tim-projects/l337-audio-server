@@ -253,25 +253,30 @@ impl PlayerEngine {
         buf.backend_error.load(Ordering::SeqCst)
     }
 
-    fn calculate_position(&self, buf: &AudioBuffer) -> u64 {
-        // Keyed on samples-consumed, not `pcm.is_empty()`: a fully reclaimed
-        // window has an empty `pcm` while the track is mid-playback, and the
-        // recovery path (take_backend_error -> try_recover -> seek_and_resume)
-        // resumes from this value — the seek base would drop the reclaimed
-        // prefix (~11 s at a 1<<20 checkpoint). Matches the get_status logic.
-        if (buf.consumed_total + buf.read_pos) == 0 || buf.file_sample_rate == 0 {
-            self.position_sec
-        } else {
-            // read_pos counts interleaved samples since the last reclaim; add the
-            // reclaimed prefix so a drained window does not rewind the timeline.
-            let consumed_frames = ((buf.consumed_total + buf.read_pos) as u64)
-                / (buf.channels.max(1) as u64);
-            let orig_frames =
-                (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
-                    as u64;
-            let buffer_sec = orig_frames / buf.file_sample_rate as u64;
-            self.position_sec + buffer_sec
+    /// Playhead in source seconds for a buffer, or `None` when nothing has been
+    /// consumed yet (caller falls back to the seek base).
+    ///
+    /// The samples-consumed count is the reclaimed prefix plus `read_pos`, never
+    /// `read_pos` alone: a writer reclaim drops the consumed prefix and resets
+    /// `read_pos`, which would rewind the timeline every checkpoint (~10.9 s at
+    /// 1<<20 samples). `pcm.is_empty()` is equally wrong as a "nothing played"
+    /// test — a fully reclaimed window is mid-playback. Shared by
+    /// `calculate_position` (recovery path) and `get_status`, which must not
+    /// drift apart.
+    fn buffer_position_sec(buf: &AudioBuffer, position_sec: u64) -> Option<u64> {
+        let consumed_total = buf.consumed_total + buf.read_pos;
+        if consumed_total == 0 || buf.file_sample_rate == 0 {
+            return None;
         }
+        let consumed_frames = (consumed_total as u64) / (buf.channels.max(1) as u64);
+        let orig_frames =
+            (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
+                as u64;
+        Some(position_sec + orig_frames / buf.file_sample_rate as u64)
+    }
+
+    fn calculate_position(&self, buf: &AudioBuffer) -> u64 {
+        Self::buffer_position_sec(buf, self.position_sec).unwrap_or(self.position_sec)
     }
 
     fn take_backend_error(&mut self) -> Option<u64> {
@@ -927,17 +932,7 @@ impl PlayerEngine {
                 .as_ref()
                 .map_or(true, |s| s.decode_handle.is_finished());
             let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
-            let consumed_total = buf.consumed_total + buf.read_pos;
-            let position = if consumed_total == 0 || buf.file_sample_rate == 0 {
-                None
-            } else {
-                let consumed = (consumed_total as u64) / (buf.channels.max(1) as u64);
-                let orig_frames = (consumed as f64 * buf.file_sample_rate as f64
-                    * buf.speed as f64
-                    / buf.sample_rate as f64) as u64;
-                Some(self.position_sec + orig_frames / buf.file_sample_rate as u64)
-            };
-            (decode_done, unconsumed, position)
+            (decode_done, unconsumed, Self::buffer_position_sec(&buf, self.position_sec))
         };
         let mut position_sec = position_from_buffer;
 

@@ -53,7 +53,12 @@ function Ensure-Administrator {
     }
 }
 
-Ensure-Administrator
+# A dry-run changes nothing on the system (it only reads the GitHub API and
+# prints a plan), so it must not trigger a UAC prompt — a CI runner has no
+# interactive session to consent in.
+if (-not $DryRun) {
+    Ensure-Administrator
+}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -295,7 +300,22 @@ if ($DryRun) {
             Write-Info "  Retain data: $DataDir"
         }
     } else {
+        # Actually run the release selection: the walk (Select-ReleaseWithAsset)
+        # is the part that most needs exercising — it parses the GitHub API and
+        # release-info.json — and a CI dry-run is the only place it runs on
+        # Windows-less hosts.
         Write-Info "  Query GitHub for $($PreRelease ? 'latest prerelease' : 'latest stable release')"
+        $assetName = Get-AssetName
+        Write-Info "  Selected asset: $assetName"
+        $selected = Select-ReleaseWithAsset -AssetName $assetName
+        if (-not $selected) {
+            if ($PreRelease) {
+                Write-Fail "No prerelease for $Repo publishes $assetName. Check https://github.com/$Repo/releases."
+            }
+            Write-Fail "No stable release for $Repo publishes $assetName. Re-run with -PreRelease to install a prerelease."
+        }
+        Write-Info "  Would install release: $($selected.Tag) (published: $($selected.Published))"
+        Write-Info "  Would download from: $($selected.Url)"
         Write-Info "  Download Windows binary to: $InstallDir\l337-audio-server.exe"
         Write-Info "  Create service wrapper: $InstallDir\$WrapperName"
         Write-Info "  Install service: $ServiceName"

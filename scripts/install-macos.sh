@@ -151,7 +151,7 @@ release_asset_rows() {
 select_release_with_asset() {
     local want_name="$1"
     local response rows r_tag r_pre r_name r_pub r_url
-    local r_info_url r_info_file info_dir
+    local r_info_url r_info_file http_code message
 
     response=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
         fail "Could not create a temporary file for GitHub release data."

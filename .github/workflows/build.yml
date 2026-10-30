@@ -573,3 +573,19 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors -and $errors.Count -gt 0) { $errors; exit 1 }
           Write-Host "ok: scripts/install.ps1 parses"'
+    # Functional smoke of the Windows install path: the dry-run actually runs the
+    # release selection (GitHub API + release-info.json walk, the part most worth
+    # exercising) without touching the system, so the only untested installer is
+    # no longer unexercised. A "no release publishes the asset" result is a valid
+    # selection outcome (partial releases legitimately lack the Windows asset)
+    # and must not redden CI; every other failure must.
+    - name: Run install.ps1 dry-run against the live release API
+      run: |
+        set +e
+        out=$(pwsh -NoProfile -File scripts/install.ps1 -DryRun -PreRelease 2>&1)
+        code=$?
+        set -e
+        echo "$out"
+        if [ "$code" -ne 0 ] && ! printf '%s' "$out" | grep -q "No prerelease for .* publishes"; then
+          exit "$code"
+        fi
