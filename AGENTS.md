@@ -125,6 +125,24 @@ L337__SERVER__PORT=1337 ./bin/l337-audio-server --dummy   # env-var config overr
 cargo test
 ```
 
+## Changelog / Release Notes
+
+The file `CHANGELOG.md` at the repository root is the single source of truth
+for release notes. Every code-changing change — including installer refactors
+in `scripts/` — must add an entry under the `[Unreleased]` heading, grouped
+under `Added`, `Changed`, `Removed`, or `Fixed`.
+
+The `build.yml` `publish-release` job automatically extracts the
+`[Unreleased]` section and passes it to `gh release create --notes-file`,
+so any entry you add becomes the body of the next GitHub Release without
+manual copy-paste. When a release is actually cut, promote the section by
+renaming the heading from `## [Unreleased]` to `## [YYYY.MM.DD-N]`
+(the CalVer tag scheme) and update the comparison links at the bottom of
+the file.
+
+Do not edit the auto-generated `release-notes.md` artifact directly; it is
+created at build time from `CHANGELOG.md`.
+
 ## Install (systemd)
 
 ```bash

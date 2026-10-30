@@ -34,6 +34,7 @@ set -euo pipefail
 USER_NAME="l337"
 GROUP_NAME="l337"
 INSTALL_DIR="/opt/l337-audio-server"
+REPO="tim-projects/l337-audio-server"
 SYSTEM_SERVICE="/etc/systemd/system/l337-audio-server.service"
 STATE_DIR="/var/lib/l337-audio-server"
 CACHE_DIR="/var/cache/l337-audio-server"
@@ -51,6 +52,7 @@ MODE="auto"
 DRY_RUN=false
 UNINSTALL=false
 REMOVE_DATA=false
+AUTO_INSTALL_DEPS=true
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -60,6 +62,7 @@ while [ $# -gt 0 ]; do
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --no-install-deps) AUTO_INSTALL_DEPS=false; shift ;;
         -h|--help) cat <<EOF
 Usage: $0 [OPTIONS]
 
@@ -73,6 +76,7 @@ Options:
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   --dry-run              Show what would happen without making changes
+  --no-install-deps      Do not auto-install missing base tools and audio libraries
   -h, --help             Show this help message
 EOF
             exit 0 ;;
@@ -86,6 +90,42 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Source shared library (lib-distro.sh)
+# ---------------------------------------------------------------------------
+# Prefers a local copy from the repo checkout ($SCRIPT_DIR/scripts/lib-distro.sh);
+# falls back to downloading from raw.githubusercontent.com using REPO and
+# SCRIPT_TAG when launched via install.sh.
+SOURCE_LIB() {
+    if [ -n "${LIB_DISTRO_LOADED:-}" ]; then
+        return 0
+    fi
+
+    local lib=""
+
+    local local_lib="${SCRIPT_DIR}/scripts/lib-distro.sh"
+    if [ -f "$local_lib" ]; then
+        lib="$local_lib"
+    fi
+
+    if [ -z "$lib" ]; then
+        if [ -z "${REPO:-}" ] || [ -z "${SCRIPT_TAG:-}" ]; then
+            fail "Cannot locate lib-distro.sh: no local copy found and REPO/SCRIPT_TAG are not set."
+        fi
+        local url="https://raw.githubusercontent.com/${REPO}/${SCRIPT_TAG}/scripts/lib-distro.sh"
+        lib="${TMPDIR:-/tmp}/l337-lib-distro.$$.sh"
+        info "Downloading lib-distro.sh from GitHub..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 30 -o "$lib" "$url"; then
+            rm -f "$lib"
+            fail "Failed to download lib-distro.sh from $url"
+        fi
+    fi
+
+    # shellcheck disable=SC1090
+    source "$lib"
+    LIB_DISTRO_LOADED=true
+}
 
 # ── Audio backend detection ──────────────────────────────────────────────
 
@@ -226,82 +266,15 @@ require_prebuilt_binary() {
     echo "$bin"
 }
 
-# Runtime shared-library dependency handling (shared by the Linux installers).
-#
-# A `DT_NEEDED` library is resolved by the dynamic loader *before* `main()` runs,
-# so a missing one prevents the binary from exec'ing at all — including in
-# `dummy = true` mode. The glibc check only scans `GLIBC_` symbols and the
-# installer's dry-run cannot mask this, so we read the binary's real `NEEDED`
-# set with `readelf -d` and install the package that provides each missing
-# library for the detected package manager.
-
-# Map a DT_NEEDED shared-library (SONAME) to the package(s) that provide it on
-# the detected distribution. Returns 1 (with a warning) when unknown, so the
-# caller can surface it instead of installing a silently wrong package.
-runtime_pkgs_for() {
-    local soname="$1"
-
-    if command -v apt-get &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus0" ;;
-            libasound.so*)      echo "libasound2" ;;
-            libpipewire-0.3.so*) echo "libpipewire-0.3-0" ;;
-            libpulse.so*)       echo "libpulse0" ;;
-            *) return 1 ;;
-        esac
-    elif command -v dnf &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "opus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire-libs" ;;
-            libpulse.so*)       echo "pulseaudio-libs" ;;
-            *) return 1 ;;
-        esac
-    elif command -v pacman &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "opus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire" ;;
-            libpulse.so*)       echo "libpulse" ;;
-            *) return 1 ;;
-        esac
-    elif command -v zypper &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus0" ;;
-            libasound.so*)      echo "libasound2" ;;
-            libpipewire-0.3.so*) echo "libpipewire-0-3" ;;
-            libpulse.so*)       echo "libpulse0" ;;
-            *) return 1 ;;
-        esac
-    elif command -v apk &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire" ;;
-            libpulse.so*)       echo "pulseaudio" ;;
-            *) return 1 ;;
-        esac
-    else
-        return 1
-    fi
-}
-
-runtime_pkg_install_cmd() {
-    if command -v apt-get &>/dev/null; then echo "apt-get install -y"
-    elif command -v dnf &>/dev/null; then echo "dnf install -y"
-    elif command -v pacman &>/dev/null; then echo "pacman -S --noconfirm"
-    elif command -v zypper &>/dev/null; then echo "zypper install -y"
-    elif command -v apk &>/dev/null; then echo "apk add"
-    else return 1
-    fi
-}
+# Runtime shared-library dependency handling relies on lib-distro.sh functions
+# (pkg_for_lib, pkg_install_prefix). Those are sourced by SOURCE_LIB() above.
 
 # Verify every DT_NEEDED library of $1 is loadable, installing the matching
 # package when it is not. Never a no-op on success: it prints the verified set
 # so an operator can see what was checked.
 ensure_runtime_dependencies() {
     local bin="$1"
-    local needed missing=() lib pkgs install_cmd resolved
+    local needed missing=() lib pkgs install_cmd
 
     if ! command -v readelf &>/dev/null; then
         warn "readelf not available; cannot verify runtime libraries for $bin"
@@ -332,9 +305,24 @@ ensure_runtime_dependencies() {
 
     warn "Missing runtime libraries: ${missing[*]}. The server cannot start until these are installed."
 
-    install_cmd=$(runtime_pkg_install_cmd) || install_cmd=""
+    install_cmd=$(pkg_install_prefix) || install_cmd=""
+
+    if [ "$AUTO_INSTALL_DEPS" = false ]; then
+        local n=0
+        for lib in "${missing[@]}"; do
+            n=$((n + 1))
+            pkgs=$(pkg_for_lib "$lib") || pkgs=""
+            if [ -n "$pkgs" ]; then
+                printf '  %d. Install: %s (runtime dependency: %s)\n' "$n" "$pkgs" "$lib" >&2
+            else
+                printf '  %d. Install: %s (unknown package — search manually)\n' "$n" "$lib" >&2
+            fi
+        done
+        fail "Missing runtime libraries. Install them manually, then re-run the installer."
+    fi
+
     for lib in "${missing[@]}"; do
-        pkgs=$(runtime_pkgs_for "$lib") || {
+        pkgs=$(pkg_for_lib "$lib") || {
             warn "No known package provides $lib on this distribution."
             warn "Install it manually; the server will not start without it."
             continue
@@ -363,51 +351,44 @@ ensure_runtime_dependencies() {
 }
 
 install_verification_tools() {
-    local pkg_manager=""
-    local install_cmd=""
-    local remove_cmd=""
-    local pkg_name=""
+    local pm pkg_name remove_cmd install_cmd
 
-    if command -v pacman &>/dev/null; then
-        pkg_manager="pacman"
-        install_cmd="pacman -S --noconfirm"
-        remove_cmd="pacman -Rns --noconfirm"
-        pkg_name="pipewire-utils"
-    elif command -v apt-get &>/dev/null; then
-        pkg_manager="apt"
-        install_cmd="apt-get install -y"
-        remove_cmd="apt-get purge -y"
-        pkg_name="pipewire-utils"
-    elif command -v dnf &>/dev/null; then
-        pkg_manager="dnf"
-        install_cmd="dnf install -y"
-        remove_cmd="dnf remove -y"
-        pkg_name="pipewire-utils"
-    elif command -v yum &>/dev/null; then
-        pkg_manager="yum"
-        install_cmd="yum install -y"
-        remove_cmd="yum remove -y"
-        pkg_name="pipewire-utils"
-    elif command -v zypper &>/dev/null; then
-        pkg_manager="zypper"
-        install_cmd="zypper install -y"
-        remove_cmd="zypper remove -y"
-        pkg_name="pipewire-utils"
-    elif command -v apk &>/dev/null; then
-        pkg_manager="apk"
-        install_cmd="apk add"
-        remove_cmd="apk del"
-        pkg_name="pipewire-utils"
-    else
+    if ! pm=$(pkg_manager); then
         warn "No supported package manager found. Cannot install verification tools."
         return 1
     fi
+
+    pkg_name="pipewire-utils"
+    case "$pm" in
+        apt-get) remove_cmd="apt-get purge -y" ;;
+        dnf)     remove_cmd="dnf remove -y" ;;
+        pacman)  remove_cmd="pacman -Rns --noconfirm" ;;
+        zypper)  remove_cmd="zypper remove -y" ;;
+        apk)     remove_cmd="apk del" ;;
+        *)       remove_cmd="" ;;
+    esac
+
+    if [ "$AUTO_INSTALL_DEPS" = false ]; then
+        warn "Not installing verification tools (--no-install-deps given)."
+        warn "Install $pkg_name manually for verification."
+        return 1
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        info "Dry-run: would install $pkg_name for verification"
+        return 0
+    fi
+
+    install_cmd=$(pkg_install_prefix) || {
+        warn "Cannot determine install command for $pm."
+        return 1
+    }
 
     info "Installing $pkg_name temporarily for verification..."
     if $install_cmd "$pkg_name" >/dev/null 2>&1; then
         ok "Installed $pkg_name for verification"
         VERIFICATION_TOOLS_INSTALLED="$pkg_name"
-        VERIFICATION_PKG_MANAGER="$pkg_manager"
+        VERIFICATION_PKG_MANAGER="$pm"
         VERIFICATION_REMOVE_CMD="$remove_cmd"
         return 0
     else
@@ -831,6 +812,13 @@ install_hybrid_service() {
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$SCRIPTS_DIR"
+    backend=$(detect_audio_backend)
+    info "Detected audio backend: $backend"
+    case "$backend" in
+        alsa)            ensure_audio_libs alsa ;;
+        pipewire-system|desktop-pipewire) ensure_audio_libs pipewire ;;
+        none)            warn "No audio backend detected; audio packages not installed" ;;
+    esac
     ensure_runtime_dependencies "$BIN"
     cp "$BIN" "$BIN_DIR/l337-audio-server"
     chmod +x "$BIN_DIR/l337-audio-server"
@@ -946,6 +934,11 @@ update_system_service() {
         warn "System service may conflict with desktop audio."
         audio_backend="alsa"
     fi
+
+    case "$audio_backend" in
+        alsa)            ensure_audio_libs alsa ;;
+        pipewire-system) ensure_audio_libs pipewire ;;
+    esac
 
     echo "Deploying new binary to $INSTALL_DIR (config/state/cache untouched)..."
     cp "$BIN" "$INSTALL_DIR/l337-audio-server"
@@ -1128,6 +1121,10 @@ if [ "$DRY_RUN" = true ]; then
     info "  Configure $SYSTEM_SERVICE and the user unit"
     exit 0
 fi
+
+# Source shared library and ensure base tools are available
+SOURCE_LIB
+ensure_base_tools curl readelf ldconfig groupadd useradd systemctl
 
 case "$MODE" in
 

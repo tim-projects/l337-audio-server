@@ -48,6 +48,7 @@ TARGET_GROUP=""
 NO_AUDIO_GROUP=false
 GROUP_ACCESS=false
 PREFIX_INSTALL_DIR=""
+AUTO_INSTALL_DEPS=true
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,6 +57,49 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Source shared library (lib-distro.sh)
+# ---------------------------------------------------------------------------
+# Prefers a local copy when running from a checkout; falls back to downloading
+# from raw.githubusercontent.com using REPO and SCRIPT_TAG (both available when
+# launched via install.sh).
+SOURCE_LIB() {
+    if [ -n "${LIB_DISTRO_LOADED:-}" ]; then
+        return 0
+    fi
+
+    local lib=""
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    for candidate in \
+        "${script_dir}/lib-distro.sh" \
+        "${SCRIPT_DIR:-${script_dir}}/scripts/lib-distro.sh" \
+        "${LIB_DIR:-}/lib-distro.sh"; do
+        if [ -f "$candidate" ]; then
+            lib="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$lib" ]; then
+        if [ -z "${REPO:-}" ] || [ -z "${SCRIPT_TAG:-}" ]; then
+            fail "Cannot locate lib-distro.sh: no local copy found and REPO/SCRIPT_TAG are not set."
+        fi
+        local url="https://raw.githubusercontent.com/${REPO}/${SCRIPT_TAG}/scripts/lib-distro.sh"
+        lib="${TMPDIR:-/tmp}/l337-lib-distro.$$.sh"
+        info "Downloading lib-distro.sh from GitHub..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 30 -o "$lib" "$url"; then
+            rm -f "$lib"
+            fail "Failed to download lib-distro.sh from $url"
+        fi
+    fi
+
+    # shellcheck disable=SC1090
+    source "$lib"
+    LIB_DISTRO_LOADED=true
+}
 
 check_command() {
     if command -v "$1" &>/dev/null; then
@@ -66,89 +110,20 @@ check_command() {
 }
 
 check_dependencies() {
-    check_command "curl"
+    SOURCE_LIB
+    ensure_base_tools curl file readelf ldconfig groupadd useradd
     check_command "systemctl"
-    check_command "file"
-    check_command "groupadd"
-    check_command "useradd"
 }
 
-# Runtime shared-library dependency handling (shared by the Linux installers).
-#
-# A `DT_NEEDED` library is resolved by the dynamic loader *before* `main()` runs,
-# so a missing one prevents the binary from exec'ing at all — including in
-# `dummy = true` mode. The glibc check only scans `GLIBC_` symbols and the
-# installer's dry-run cannot mask this, so we read the binary's real `NEEDED`
-# set with `readelf -d` and install the package that provides each missing
-# library for the detected package manager.
-
-# Map a DT_NEEDED shared-library (SONAME) to the package(s) that provide it on
-# the detected distribution. Returns 1 (with a warning) when unknown, so the
-# caller can surface it instead of installing a silently wrong package.
-runtime_pkgs_for() {
-    local soname="$1"
-
-    if command -v apt-get &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus0" ;;
-            libasound.so*)      echo "libasound2" ;;
-            libpipewire-0.3.so*) echo "libpipewire-0.3-0" ;;
-            libpulse.so*)       echo "libpulse0" ;;
-            *) return 1 ;;
-        esac
-    elif command -v dnf &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "opus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire-libs" ;;
-            libpulse.so*)       echo "pulseaudio-libs" ;;
-            *) return 1 ;;
-        esac
-    elif command -v pacman &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "opus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire" ;;
-            libpulse.so*)       echo "libpulse" ;;
-            *) return 1 ;;
-        esac
-    elif command -v zypper &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus0" ;;
-            libasound.so*)      echo "libasound2" ;;
-            libpipewire-0.3.so*) echo "libpipewire-0-3" ;;
-            libpulse.so*)       echo "libpulse0" ;;
-            *) return 1 ;;
-        esac
-    elif command -v apk &>/dev/null; then
-        case "$soname" in
-            libopus.so*)        echo "libopus" ;;
-            libasound.so*)      echo "alsa-lib" ;;
-            libpipewire-0.3.so*) echo "pipewire" ;;
-            libpulse.so*)       echo "pulseaudio" ;;
-            *) return 1 ;;
-        esac
-    else
-        return 1
-    fi
-}
-
-runtime_pkg_install_cmd() {
-    if command -v apt-get &>/dev/null; then echo "apt-get install -y"
-    elif command -v dnf &>/dev/null; then echo "dnf install -y"
-    elif command -v pacman &>/dev/null; then echo "pacman -S --noconfirm"
-    elif command -v zypper &>/dev/null; then echo "zypper install -y"
-    elif command -v apk &>/dev/null; then echo "apk add"
-    else return 1
-    fi
-}
+# Runtime shared-library dependency handling relies on lib-distro.sh functions
+# (pkg_for_lib, pkg_install_prefix). Those are sourced by SOURCE_LIB() above.
 
 # Verify every DT_NEEDED library of $1 is loadable, installing the matching
 # package when it is not. Never a no-op on success: it prints the verified set
 # so an operator can see what was checked.
 ensure_runtime_dependencies() {
     local bin="$1"
-    local needed missing=() lib pkgs install_cmd resolved
+    local needed missing=() lib pkgs install_cmd
 
     if ! command -v readelf &>/dev/null; then
         warn "readelf not available; cannot verify runtime libraries for $bin"
@@ -179,9 +154,24 @@ ensure_runtime_dependencies() {
 
     warn "Missing runtime libraries: ${missing[*]}. The server cannot start until these are installed."
 
-    install_cmd=$(runtime_pkg_install_cmd) || install_cmd=""
+    install_cmd=$(pkg_install_prefix) || install_cmd=""
+
+    if [ "$AUTO_INSTALL_DEPS" = false ]; then
+        local n=0
+        for lib in "${missing[@]}"; do
+            n=$((n + 1))
+            pkgs=$(pkg_for_lib "$lib") || pkgs=""
+            if [ -n "$pkgs" ]; then
+                printf '  %d. Install: %s (runtime dependency: %s)\n' "$n" "$pkgs" "$lib" >&2
+            else
+                printf '  %d. Install: %s (unknown package — search manually)\n' "$n" "$lib" >&2
+            fi
+        done
+        fail "Missing runtime libraries. Install them manually, then re-run the installer."
+    fi
+
     for lib in "${missing[@]}"; do
-        pkgs=$(runtime_pkgs_for "$lib") || {
+        pkgs=$(pkg_for_lib "$lib") || {
             warn "No known package provides $lib on this distribution."
             warn "Install it manually; the server will not start without it."
             continue
@@ -223,6 +213,7 @@ while [ $# -gt 0 ]; do
          --dry-run) DRY_RUN=true; shift ;;
          --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
          --force|-f) FORCE=true; shift ;;
+         --no-install-deps) AUTO_INSTALL_DEPS=false; shift ;;
          --user) TARGET_USER="$2"; shift 2 ;;
          --group) TARGET_GROUP="$2"; shift 2 ;;
          --group-access) GROUP_ACCESS=true; shift ;;
@@ -243,6 +234,7 @@ Options:
   --pre-release, --prerelease
                          Install the latest prerelease instead of stable release
   --force, -f            Force reinstall even if the same version is already installed
+  --no-install-deps      Do not auto-install missing base tools and audio libraries
   --user <username>      Run service as this user (default: create l337 system user)
   --group <groupname>    Run service under this group (default: l337)
   --group-access         Add local users to the service group for Unix socket access
@@ -1014,6 +1006,11 @@ else
 fi
 
 download_binary "$DOWNLOAD_URL" "$NEW_BIN"
+
+# Ensure the audio backend libraries are present before checking DT_NEEDED
+# entries — the binary may be statically linked against some libs and thus
+# not list them, yet still need them at runtime.
+ensure_audio_libs alsa
 
 # A missing DT_NEEDED library is resolved by the loader before main(), so the
 # binary cannot exec in ANY mode (dummy = true included). Check the binary we

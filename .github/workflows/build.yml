@@ -546,10 +546,25 @@ jobs:
         if [ "${OFFICIAL:-false}" = "true" ]; then
           FLAGS="--latest"
         fi
+
+        # Release notes: prefer the [Unreleased] section of CHANGELOG.md (kept
+        # in sync by humans); fall back to GitHub's auto-generated notes when
+        # the changelog is absent or the section is empty.
+        if [ -f CHANGELOG.md ]; then
+          awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{if(f)exit} f' CHANGELOG.md > release-notes.md
+        fi
+        if [ -s release-notes.md 2>/dev/null ]; then
+          NOTES_ARGS=(--notes-file release-notes.md)
+          echo "Using CHANGELOG.md [Unreleased] section as release notes"
+        else
+          NOTES_ARGS=(--generate-notes)
+          echo "No changelog entries - using auto-generated notes"
+        fi
+
         gh release create "${{ needs.determine-version.outputs.tag }}" \
           --title "L337 Audio Server ${{ needs.determine-version.outputs.tag }}" \
           $FLAGS \
-          --generate-notes \
+          "${NOTES_ARGS[@]}" \
           $(find ./release-artifacts -type f -printf '%p ')
 
   validate-installers:
@@ -563,7 +578,7 @@ jobs:
     - name: Syntax-check the bash installers
       run: |
         for s in install.sh scripts/install-android-termux.sh scripts/install-linux-alsa.sh \
-                 scripts/install-linux-pipewire.sh scripts/install-macos.sh scripts/install-systemd.sh; do
+                 scripts/install-linux-pipewire.sh scripts/lib-distro.sh scripts/install-macos.sh scripts/install-systemd.sh; do
           bash -n "$s" && echo "ok: $s"
         done
     - name: Parse install.ps1

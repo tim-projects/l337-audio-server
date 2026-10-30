@@ -25,6 +25,7 @@ wget -qO- https://github.com/tim-projects/l337-audio-server/raw/main/install.sh 
 | `--dry-run` | Show what would happen without making changes |
 | `--uninstall` | Remove the service and installed files |
 | `--remove-data` | Also remove configuration and data directories |
+| `--no-install-deps` | *(Linux, Termux)* Do not auto-install missing system packages; print what to install manually |
 | `--group-access` | *(ALSA only)* Add local users to the service group so they can reach the Unix socket |
 
 ## Post-Install
@@ -132,10 +133,29 @@ is printed instead.
 
 Flags are shared where the platforms overlap: `--pre-release`, `--uninstall`,
 `--remove-data` and `--help` work on all of them; `--force`, `--no-audio`,
-`--dry-run` and `--group-access` are ALSA/systemd only. `--no-install-deps` is
-Termux-only — only that installer installs its own dependencies.
+`--dry-run` and `--group-access` are ALSA/systemd only; `--no-install-deps`
+works on Linux and Termux — it skips the automatic installation of missing
+system packages and prints what to install manually instead.
 
 ## Runtime Dependencies
+
+### Automatic package installation (Linux)
+
+The Linux installers read `/etc/os-release` to identify the distribution
+(Debian/Ubuntu, Fedora/RHEL, Arch, Alpine) and cross to its package manager
+(`apt-get`, `dnf`, `pacman`, `zypper`, `apk`, in that order of discovery). Before
+anything else they install the base tools the install itself needs (`curl`,
+`file`, `readelf` from `binutils`, `ldconfig`, and `groupadd`/`useradd` from
+`shadow`), then the audio backend libraries (`libasound2`/`alsa-lib` +
+libopus for ALSA, `libpipewire-0.3-0`/`pipewire-libs` + libopus + pulse for
+PipeWire), then every missing `DT_NEEDED` library of the downloaded binary.
+A distribution with no matching package-manager command on `PATH` gets a manual
+install instruction instead of a silent skip.
+
+Pass `--no-install-deps` to opt out: nothing is installed, and each missing
+package is printed with its exact install command so you can install it
+yourself. It composes with `--dry-run`, which prints what *would* be installed
+without installing it.
 
 - **yt-dlp** — required for YouTube URL playback. Install separately:
   - Debian/Ubuntu: `sudo apt install yt-dlp`
@@ -155,9 +175,12 @@ The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return 
 
   (armv7/riscv64 release binaries build without Opus and do not need it.)
 
-  The Linux installers read each binary's `DT_NEEDED` set with `readelf -d` and
-  install the missing library before first boot (and fail rather than report a
-  successful install whose server cannot exec). Each release's
+  The Linux installers install the audio backend libraries for the detected
+  distribution up front, read each binary's `DT_NEEDED` set with `readelf -d`
+  and install anything still missing before first boot (and fail rather than
+  report a successful install whose server cannot exec). The distro detection,
+  package-name mapping and search fallback live in `scripts/lib-distro.sh`, one
+  shared library used by all three Linux installers. Each release's
   `release-info.json` also records the required shared libraries per asset.
 
 ## Troubleshooting

@@ -3,7 +3,8 @@
 set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-REPO="tim-projects/l337-audio-server"
+export REPO="tim-projects/l337-audio-server"
+export SCRIPT_TAG
 
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
@@ -18,7 +19,7 @@ while [ $# -gt 0 ]; do
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --uninstall|-u)             UNINSTALL_REQUESTED=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data]"
+            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data] [--no-install-deps]"
             echo ""
             echo "Delegates to the platform-specific installer on GitHub. All options"
             echo "are forwarded, so --uninstall behaves exactly like the platform's own"
@@ -28,6 +29,7 @@ while [ $# -gt 0 ]; do
             echo "  --pre-release      Install the latest prerelease instead of the stable release"
             echo "  --uninstall, -u    Remove the service and installed binary (data kept)"
             echo "  --remove-data      With --uninstall: also delete playlists, token and logs"
+            echo "  --no-install-deps  Do not auto-install missing system packages (Linux only)"
             exit 0 ;;
         *) shift ;;
     esac
