@@ -4,6 +4,12 @@
 # as a Windows service for all users. Registers itself in Add/Remove
 # Programs and supports UAC self-elevation.
 #
+# Every release ships a release-info.json beside its binaries listing the assets
+# that release actually contains. Releases are walked newest-first and the newest
+# one whose release-info.json confirms this platform's binary is in it is
+# installed, so a partial release (e.g. a targeted CI build that publishes only
+# some targets) is skipped instead of downloading into a 404.
+#
 # Requirements:
 #   - PowerShell 5.1 or later
 #   - Internet access to GitHub Releases
@@ -77,15 +83,59 @@ function Write-Fail($msg) {
     exit 1
 }
 
-function Get-GithubRelease {
-    param([string]$Endpoint)
-    $url = "https://api.github.com/repos/$Repo/$Endpoint"
+function Get-GithubReleases {
+    # Full list, newest release first, as the API orders it. Both modes use the
+    # same list: the prerelease filter is applied while walking, so a partial
+    # release can be skipped in either mode.
+    $url = "https://api.github.com/repos/$Repo/releases?per_page=100"
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
-        return $response
+        return @(Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop)
     } catch {
         Write-Fail "Failed to contact GitHub Releases API: $_"
     }
+}
+
+function Select-ReleaseWithAsset {
+    param([string]$AssetName)
+    # Walk releases newest-first and select the newest one that publishes
+    # $AssetName AND confirms it in that release's own release-info.json
+    # (generated from the artifacts that actually downloaded, so its asset map
+    # is authoritative). A partial release - e.g. a targeted CI build that
+    # publishes only some targets - is skipped instead of being downloaded into
+    # a 404. Returns the tag, publish date and the API's own download URL.
+    # shortcut: only the newest 100 releases are searched (the API page size;
+    # this script does not follow pagination).
+    $newestTag = $null
+    foreach ($release in (Get-GithubReleases)) {
+        if ($PreRelease -and -not $release.prerelease) { continue }
+        if (-not $PreRelease -and $release.prerelease) { continue }
+        # Newest release this mode would use if it published every asset, so the
+        # caller can say why an older one is installed instead.
+        if (-not $newestTag) { $newestTag = $release.tag_name }
+        $asset = @($release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+        if (-not $asset) { continue }
+        $infoAsset = @($release.assets) | Where-Object { $_.name -eq "release-info.json" } | Select-Object -First 1
+        if (-not $infoAsset) { continue }
+        try {
+            $info = Invoke-RestMethod -Uri $infoAsset.browser_download_url -Method Get -ErrorAction Stop
+        } catch {
+            # Fail loudly: Invoke-RestMethod throws on non-2xx, and swallowing
+            # that here would save the error body as "the manifest", skip the
+            # release as if it did not publish the asset, and silently install
+            # an older one.
+            Write-Fail "Could not download release-info.json for $($release.tag_name): $_"
+        }
+        if (-not $info.assets) { continue }
+        # The manifest's asset map is a JSON object; its keys are asset names.
+        if (-not ($info.assets.PSObject.Properties.Name -contains $AssetName)) { continue }
+        return [pscustomobject]@{
+            Tag        = $release.tag_name
+            NewestTag  = $newestTag
+            Published  = $release.published_at
+            Url        = $asset.browser_download_url
+        }
+    }
+    return $null
 }
 
 function Get-AssetName {
@@ -283,18 +333,27 @@ if ($Uninstall) {
 }
 
 Write-Info "Checking for latest release..."
-$endpoint = if ($PreRelease) { "releases?per_page=100" } else { "releases/latest" }
-$release = Get-GithubRelease -Endpoint $endpoint
-$tag = $release.tag_name
-$published = $release.published_at
-if (-not $tag) {
-    Write-Fail "Could not determine latest release tag"
+$assetName = Get-AssetName
+Write-Info "Selected asset: $assetName"
+
+$selected = Select-ReleaseWithAsset -AssetName $assetName
+if (-not $selected) {
+    if ($PreRelease) {
+        Write-Fail "No prerelease for $Repo publishes $assetName. Check https://github.com/$Repo/releases."
+    }
+    Write-Fail "No stable release for $Repo publishes $assetName. Re-run with -PreRelease to install a prerelease."
+}
+$tag = $selected.Tag
+$published = $selected.Published
+# The download URL comes from the selected release's own asset (matched by the
+# API's asset name, never constructed here), so a release that publishes our
+# binary can never 404 at download time.
+$downloadUrl = $selected.Url
+if ($selected.NewestTag -and $selected.NewestTag -ne $tag) {
+    Write-Info "Newest release $($selected.NewestTag) does not publish $assetName"
+    Write-Info "Installing release $tag instead, the newest one that does."
 }
 Write-Info "Latest release: $tag (published: $published)"
-
-$assetName = Get-AssetName
-$downloadUrl = "https://github.com/$Repo/releases/download/$tag/$assetName"
-Write-Info "Selected asset: $assetName"
 
 $installedVersion = ""
 if (Test-Path (Join-Path $InstallDir "l337-audio-server.exe")) {

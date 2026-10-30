@@ -4,6 +4,12 @@
 # Downloads l337-audio-server-{arch}-apple-darwin from GitHub releases and
 # installs it as a launchd user service.
 #
+# Every release ships a release-info.json beside its binaries listing the assets
+# that release actually contains. Releases are walked newest-first and the newest
+# one whose release-info.json confirms this platform's binary is in it is
+# installed, so a partial release (e.g. a targeted CI build that publishes only
+# some targets) is skipped instead of downloading into a 404.
+#
 # Usage:
 #   ./scripts/install-macos.sh
 #   ./scripts/install-macos.sh --pre-release
@@ -109,81 +115,118 @@ info "Platform: $OS_TYPE / $ARCH_TYPE"
 # ---------------------------------------------------------------------------
 # GitHub release helpers
 # ---------------------------------------------------------------------------
-extract_prerelease() {
+# Flatten the release list into one line per published asset:
+#   <tag> <prerelease:0|1> <asset name> <published_at> <browser download url>
+# Every name comes from the API's own "name" field, never from a URL this script
+# builds, so only an asset GitHub actually publishes in that release can be
+# selected.
+release_asset_rows() {
     awk '
-        /^  \{/ {
-            release=$0 "\n"
-            in_release=1
+        /"tag_name"[[:space:]]*:/ {
+            t=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",t); sub(/".*/,"",t); tag=t; next
+        }
+        /"prerelease"[[:space:]]*:/ { pre=($0 ~ /: *true/) ? 1 : 0; next }
+        /"published_at"[[:space:]]*:/ {
+            p=$0; sub(/.*"published_at"[[:space:]]*:[[:space:]]*"/,"",p); sub(/".*/,"",p); pub=p; next
+        }
+        /"name"[[:space:]]*:/ {
+            n=$0; sub(/.*"name"[[:space:]]*:[[:space:]]*"/,"",n); sub(/".*/,"",n); name=n; next
+        }
+        /"browser_download_url"[[:space:]]*:/ {
+            u=$0; sub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/,"",u); sub(/".*/,"",u)
+            printf "%s\t%d\t%s\t%s\t%s\n", tag, pre, name, pub, u
             next
         }
-        in_release {
-            release=release $0 "\n"
-            if ($0 ~ /^  \},?$/) {
-                if (release ~ /"prerelease"[[:space:]]*:[[:space:]]*true/) {
-                    printf "%s", release
-                    exit
-                }
-                release=""
-                in_release=0
-            }
-        }
-    '
+    ' "$1"
 }
 
-get_latest_release_json() {
-    local endpoint
-    local url
-    local response_file
-    local http_code
-    local message
-    local release
+# Walk releases newest-first and select the newest one that publishes $1 AND
+# confirms it in that release's own release-info.json (generated from the
+# artifacts that actually downloaded, so its asset map is authoritative). A
+# partial release — e.g. a targeted CI build that publishes only some targets —
+# is skipped instead of being downloaded into a 404. Sets SELECTED_TAG,
+# SELECTED_PUBLISHED and SELECTED_URL; returns 1 when no release qualifies.
+# shortcut: only the newest 100 releases are searched (the API page size; this
+# script does not follow pagination).
+select_release_with_asset() {
+    local want_name="$1"
+    local response rows r_tag r_pre r_name r_pub r_url
+    local r_info_url r_info_file info_dir
 
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        endpoint="releases?per_page=100"
-    else
-        endpoint="releases/latest"
-    fi
-
-    url="https://api.github.com/repos/${REPO}/${endpoint}"
-    response_file=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
+    response=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
         fail "Could not create a temporary file for GitHub release data."
-
-    if ! http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-        -o "$response_file" -w '%{http_code}' "$url"); then
-        rm -f "$response_file"
+    http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
+        -o "$response" -w '%{http_code}' \
+        "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
+        rm -f "$response"
         fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
-    fi
-
+    }
+    # curl exits 0 on a 403/5xx body (rate limits, outages), and an error body
+    # flattens to zero asset rows — which would be misreported below as "no
+    # release publishes our asset". Surface the API's own message instead.
     if [ "$http_code" != "200" ]; then
-        message=$(parse_json_field "$(cat "$response_file")" "message" 2>/dev/null || true)
-        rm -f "$response_file"
+        message=$(grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$response" \
+            | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
+        rm -f "$response"
+        fail "GitHub returned HTTP ${http_code} while listing releases. ${message:-Check network connectivity or proxy settings.}"
+    fi
+    rows=$(release_asset_rows "$response")
+    rm -f "$response"
+
+    SELECTED_TAG=""
+    SELECTED_PUBLISHED=""
+    SELECTED_URL=""
+    NEWEST_TAG=""
+
+    # tag -> release-info.json URL, built in one pass so the walk below never
+    # has to re-scan every row (and spawn an awk) per candidate release.
+    declare -A INFO_URL=()
+    while IFS=$'\t' read -r r_tag r_url; do
+        [ -n "$r_tag" ] && INFO_URL["$r_tag"]="$r_url"
+    done < <(printf '%s\n' "$rows" | awk -F'\t' \
+        '$3 == "release-info.json" { print $1 "\t" $5 }')
+
+    while IFS=$'\t' read -r r_tag r_pre r_name r_pub r_url; do
+        # --pre-release walks prereleases; a plain install walks the stable
+        # releases. Both stop at the newest one that publishes our asset.
         if [ "$INSTALL_PRERELEASE" = true ]; then
-            fail "GitHub returned HTTP $http_code while querying prereleases. ${message:-}"
+            [ "$r_pre" = "1" ] || continue
+        else
+            [ "$r_pre" = "0" ] || continue
         fi
-        fail "GitHub returned HTTP $http_code while querying stable releases. ${message:-} Re-run with --pre-release to install a prerelease."
-    fi
+        # Newest release this mode would use if it published every asset, so the
+        # caller can say why an older one is installed instead.
+        [ -z "$NEWEST_TAG" ] && NEWEST_TAG="$r_tag"
+        [ "$r_name" = "$want_name" ] || continue
 
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        release=$(extract_prerelease < "$response_file")
-    else
-        release=$(cat "$response_file")
-    fi
-    rm -f "$response_file"
-
-    if [ -z "$release" ]; then
-        if [ "$INSTALL_PRERELEASE" = true ]; then
-            fail "No prerelease found for ${REPO}."
+        r_info_url="${INFO_URL[$r_tag]:-}"
+        if [ -z "$r_info_url" ]; then
+            continue
         fi
-        fail "No stable release found for ${REPO}."
-    fi
+        r_info_file=$(mktemp "${TMPDIR:-/tmp}/l337-revinfo.XXXXXX") || return 1
+        # -f: a 403/404/5xx body would otherwise be saved as the "manifest" and
+        # read below as "does not list the asset" — a silent skip that walks the
+        # install back to an older release. A network/API failure must fail loudly.
+        if ! curl -fsSL --connect-timeout 15 --max-time 30 \
+                -o "$r_info_file" "$r_info_url"; then
+            rm -f "$r_info_file"
+            fail "Could not download release-info.json for ${r_tag} from ${r_info_url} — the release cannot be verified. Check network connectivity or proxy settings."
+        fi
+        # The trailing colon anchors the key so a longer asset name that merely
+        # starts with this one can never be mistaken for it.
+        if ! grep -qF "\"$want_name\":" "$r_info_file"; then
+            rm -f "$r_info_file"
+            continue
+        fi
+        rm -f "$r_info_file"
 
-    printf '%s\n' "$release"
-}
+        SELECTED_TAG="$r_tag"
+        SELECTED_PUBLISHED="$r_pub"
+        SELECTED_URL="$r_url"
+        break
+    done <<<"$rows"
 
-parse_json_field() {
-    local json="$1"
-    local field="$2"
-    echo "$json" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true
+    [ -n "$SELECTED_TAG" ]
 }
 
 get_asset_name() {
@@ -525,18 +568,28 @@ fi
 check_dependencies
 
 info "Checking for latest release..."
-RELEASE_JSON=$(get_latest_release_json)
-LATEST_TAG=$(parse_json_field "$RELEASE_JSON" "tag_name")
-PUBLISHED_AT=$(parse_json_field "$RELEASE_JSON" "published_at")
+ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")
+info "Selected asset: $ASSET_NAME"
 
-if [ -z "$LATEST_TAG" ]; then
-    fail "Could not determine latest release tag"
+if ! select_release_with_asset "$ASSET_NAME"; then
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        fail "No prerelease for ${REPO} publishes ${ASSET_NAME}. Check https://github.com/${REPO}/releases."
+    fi
+    fail "No stable release for ${REPO} publishes ${ASSET_NAME}. Re-run with --pre-release to install a prerelease."
+fi
+LATEST_TAG="$SELECTED_TAG"
+PUBLISHED_AT="$SELECTED_PUBLISHED"
+
+if [ -n "$NEWEST_TAG" ] && [ "$LATEST_TAG" != "$NEWEST_TAG" ]; then
+    if [ "$INSTALL_PRERELEASE" = true ]; then
+        info "Newest prerelease ${NEWEST_TAG} does not publish ${ASSET_NAME}"
+    else
+        info "Newest stable release ${NEWEST_TAG} does not publish ${ASSET_NAME}"
+    fi
+    info "Installing release ${LATEST_TAG} instead, the newest one that does."
 fi
 
 info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
-
-ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")
-info "Selected asset: $ASSET_NAME"
 
 INSTALLED_VERSION=""
 if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
@@ -573,7 +626,10 @@ if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
     fi
 fi
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET_NAME}"
+# The download URL comes from the selected release's own asset (matched by the
+# API's asset name, never constructed here), so a release that publishes our
+# binary can never 404 at download time.
+DOWNLOAD_URL="$SELECTED_URL"
 NEW_BIN=""
 if mkdir -p "$INSTALL_DIR/.tmp" 2>/dev/null && [ -w "$INSTALL_DIR/.tmp" ]; then
     NEW_BIN="$INSTALL_DIR/.tmp/l337-audio-server.new"

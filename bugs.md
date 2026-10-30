@@ -530,3 +530,40 @@ header forms, `X-L337-Token`, `ensure_runtime_dependencies` on both real Linux
 assets, the release-info `needed_shared_libs` field, and every installer's
 `bash -n` + `--dry-run`.
 
+---
+
+# Termux device session — 2026-10-30 (the device this project's Linux docs could not cover)
+
+Everything below was executed **on the Termux/aarch64 device** against the live
+PulseAudio (OpenSL ES) sink. Full details + live traces: the update section of
+`bugs2.md`.
+
+## Closed on-device
+
+| # | Item | Outcome |
+|---|------|---------|
+| 1 | **Installer picked a release without our binary** (the reported 404: `2026.10.29-6/-7` ship only x86_64 Linux assets) | All asset-publishing installers now walk releases newest-first and select the newest whose **release-info.json confirms the wanted asset**, downloading the API's own `browser_download_url`. Verified end-to-end here: `-7 → -5` fallback with a printed reason; service registered and healthy. `install-macos.sh` mirrors it; `install.ps1` mirrors it (unexecuted — no pwsh on device). |
+| 2 | **BUG-1 timeline sawtooth** (`bugs2.md`) — rewound every ~10.9 s | Root cause: `reclaim_consumed()` resets `read_pos` and drops the prefix, but the playhead was derived from `read_pos` alone. Fixed via `AudioBuffer::consumed_total`; verified live (`0…8,10,11…29`, no reset) + unit test. |
+| 3 | **BUG-3 no end-of-track** (`bugs2.md`) | `get_status` finishes as `state=stopped` when decode is done and the buffer is drained; verified live (`playing → stopped` at track end). Rebuffer vs EOS distinguished by the decode handle. |
+| 4 | **BUG-2 sink backlog** (`bugs2.md`) | Verified bounded: one 30 s track holds ~38 s of PA latency (the SL ES queue), server window drains at ~1×. The 9975 s backlog is gone. |
+| 5 | **`cargo test` never executed** (see §6 above) | First real run fixed: pitch≠1 duration bug (`tempo = speed / pitch` → `speed`; the pitch shifter is length-preserving) in both file and streaming paths; Termux `#!/bin/bash` fake-script fallthrough (→ `#!/bin/sh`); endpoints binary path (`CARGO_BIN_EXE_l337-audio-server`); parallel test servers stealing the single-instance lock/token (per-spawn `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY` isolation). **45/45 unit + 22/22 endpoints green in parallel.** |
+
+## Device-only notes for future work
+
+- **On-device builds are OOM-limited**: `rustc` host is `aarch64-linux-android`, and one
+  `CARGO_HOME=$HOME/.cargo CARGO_TARGET_DIR=$TMPDIR/l337-build RUSTFLAGS="-C debug-assertions=off" cargo build --features pulseaudio,opus`
+  succeeded (~5 min; dev builds need `-C debug-assertions=off` because tokio 1.52's
+  `debug_assert!` in `check_socket_for_blocking` panics on the blocking Unix socket in
+  socket mode — release builds are unaffected). However, **repeated builds on this device
+  are killed by the lowmemorykiller** (a second build aborted mid-compile), so treat
+  on-device builds as a one-shot verification, not a loop; release builds come from CI.
+  The OOM kill also restarts runsvdir, so re-check `sv status` and `sv up` after a build.
+- `/tmp` is not writable by the app user on Termux — `AGENTS.md`'s `/tmp` build paths do
+  not apply on-device; use `TMPDIR` (`$PREFIX/tmp`).
+- Engine fixes above are **not** in the published release yet: the device currently runs
+  `2026.10.29-5`, which predates them. They need a publish before a device run of the
+  release binary can show the BUG-1/BUG-3 fixes.
+- `bugs2.md` BUG-4 (best = highest available rendering) remains open and unverifiable
+  here (no resolvable YouTube target on this device).
+
+

@@ -238,6 +238,7 @@ impl PlayerEngine {
         if buf.backend_error.load(Ordering::SeqCst) {
             buf.pcm.clear();
             buf.read_pos = 0;
+            buf.consumed_total = 0;
             buf.backend_error.store(false, Ordering::SeqCst);
             self.state = PlayerStateLabel::Stopped;
             self.position_sec = 0;
@@ -253,13 +254,18 @@ impl PlayerEngine {
     }
 
     fn calculate_position(&self, buf: &AudioBuffer) -> u64 {
-        if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
+        // Keyed on samples-consumed, not `pcm.is_empty()`: a fully reclaimed
+        // window has an empty `pcm` while the track is mid-playback, and the
+        // recovery path (take_backend_error -> try_recover -> seek_and_resume)
+        // resumes from this value — the seek base would drop the reclaimed
+        // prefix (~11 s at a 1<<20 checkpoint). Matches the get_status logic.
+        if (buf.consumed_total + buf.read_pos) == 0 || buf.file_sample_rate == 0 {
             self.position_sec
         } else {
-            // read_pos counts interleaved samples; convert to per-channel frames
-            // before converting device-rate frames back to source-rate seconds (stereo
-            // would otherwise double-count).
-            let consumed_frames = (buf.read_pos as u64) / (buf.channels.max(1) as u64);
+            // read_pos counts interleaved samples since the last reclaim; add the
+            // reclaimed prefix so a drained window does not rewind the timeline.
+            let consumed_frames = ((buf.consumed_total + buf.read_pos) as u64)
+                / (buf.channels.max(1) as u64);
             let orig_frames =
                 (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
                     as u64;
@@ -274,6 +280,7 @@ impl PlayerEngine {
             let position = self.calculate_position(&buf);
             buf.pcm.clear();
             buf.read_pos = 0;
+            buf.consumed_total = 0;
             buf.backend_error.store(false, Ordering::SeqCst);
             self.state = PlayerStateLabel::Stopped;
             self.position_sec = 0;
@@ -309,6 +316,7 @@ impl PlayerEngine {
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
+        buf.consumed_total = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
@@ -575,6 +583,7 @@ impl PlayerEngine {
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
+        buf.consumed_total = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
@@ -624,6 +633,7 @@ impl PlayerEngine {
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm.clear();
         buf.read_pos = 0;
+        buf.consumed_total = 0;
         drop(buf);
         if let Some(stream) = self.stream.as_mut() {
             if let Err(e) = stream.pause() {
@@ -669,6 +679,7 @@ impl PlayerEngine {
                 let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 buf.pcm.clear();
                 buf.read_pos = 0;
+                buf.consumed_total = 0;
             }
             self.load_and_play("current").await;
             return Ok(());
@@ -698,6 +709,7 @@ impl PlayerEngine {
             let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.pcm.clear();
             buf.read_pos = 0;
+            buf.consumed_total = 0;
             buf.channels = 0;
             buf.file_sample_rate = 0;
         }
@@ -844,6 +856,7 @@ impl PlayerEngine {
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
+        buf.consumed_total = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
@@ -901,6 +914,48 @@ impl PlayerEngine {
             let _ = self.try_recover();
         }
 
+        // One lock acquisition per poll serves both the end-of-track decision
+        // and the playhead: the writer holds this mutex across its reclaim
+        // memmove, so a poll must not walk it twice. The playhead is the
+        // samples-consumed count (reclaimed prefix + read_pos), never
+        // `read_pos` alone (a reclaim would rewind it) nor `pcm.is_empty()`
+        // (a drained window is not "nothing played").
+        let (decode_done, unconsumed, position_from_buffer) = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            let decode_done = self
+                .streaming
+                .as_ref()
+                .map_or(true, |s| s.decode_handle.is_finished());
+            let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
+            let consumed_total = buf.consumed_total + buf.read_pos;
+            let position = if consumed_total == 0 || buf.file_sample_rate == 0 {
+                None
+            } else {
+                let consumed = (consumed_total as u64) / (buf.channels.max(1) as u64);
+                let orig_frames = (consumed as f64 * buf.file_sample_rate as f64
+                    * buf.speed as f64
+                    / buf.sample_rate as f64) as u64;
+                Some(self.position_sec + orig_frames / buf.file_sample_rate as u64)
+            };
+            (decode_done, unconsumed, position)
+        };
+        let mut position_sec = position_from_buffer;
+
+        // BUG-3 (device report): there was no end-of-track, so state stayed
+        // `playing` forever with a frozen head and the client never advanced.
+        // Once the decode task has delivered the whole track and the writer has
+        // consumed every buffered sample, playback is over: finish as Stopped.
+        // A momentarily drained buffer mid-stream is a rebuffer, not EOS, hence
+        // the decode-finished condition (`streaming` is None on the file path,
+        // where the whole track is already decoded when state turns Playing).
+        if self.state == PlayerStateLabel::Playing && decode_done && unconsumed == 0 {
+            self.stop();
+            info!("end of track reached: state = stopped");
+            // stop() cleared the buffer and reset the seek base, so the
+            // snapshot taken above is stale.
+            position_sec = Some(0);
+        }
+
         if self.state == PlayerStateLabel::Stopped && self.stream.is_none() {
             return PlayerStatus {
                 state: PlayerStateLabel::Stopped,
@@ -924,18 +979,7 @@ impl PlayerEngine {
         let prev_cached = self.storage.get_active_slot_path("prev").exists();
         let utilization = self.storage.get_total_size().await;
 
-        let position_sec = {
-            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            if buf.pcm.is_empty() || buf.file_sample_rate == 0 {
-                Some(self.position_sec)
-            } else {
-                let consumed = (buf.read_pos as u64) / (buf.channels.max(1) as u64);
-                let orig_frames = (consumed as f64 * buf.file_sample_rate as f64 * buf.speed as f64
-                    / buf.sample_rate as f64) as u64;
-                let buffer_sec = orig_frames / buf.file_sample_rate as u64;
-                Some(self.position_sec + buffer_sec)
-            }
-        };
+        let position_sec = position_sec.or(Some(self.position_sec));
 
         PlayerStatus {
             state: self.state,
@@ -1212,7 +1256,11 @@ pub(crate) fn stretch_and_resample(
     }
 
     let channels = channels as usize;
-    let tempo = speed / pitch;
+    // The pitch shifter is length-preserving, so pitch is *not* pre-compensated
+    // by a slower time-stretch here: stretching by `speed` and shifting by
+    // `pitch` yields duration/speed and frequency×pitch. Pre-dividing by pitch
+    // made every pitch≠1 track play 1/pitch too long (device bug report).
+    let tempo = speed;
 
     let stretched = if tempo != 1.0 {
         wsola::stretch(input, file_sample_rate, channels as u16, tempo)
@@ -1787,7 +1835,11 @@ fn streaming_decode_sync(
         (ab.speed, ab.pitch)
     };
 
-    let tempo = speed / pitch;
+    // Same rule as the file path (`stretch_and_resample`): the pitch shifter
+    // preserves length, so only `speed` drives the time-stretch; compensating
+    // by pitch here would make streaming playback a different length than the
+    // file path for the same track.
+    let tempo = speed;
     let mut stretcher = if tempo != 1.0 {
         wsola::TimeStretch::new(file_sample_rate, channels)
             .ok()
@@ -2054,12 +2106,153 @@ mod tests {
         assert_eq!(format!("{}", other_err), "generic failure");
     }
 
+    // BUG-3 (device report): there was no end-of-track, so the state stayed
+    // `playing` with a frozen head and the client never advanced. Once the
+    // decode task has delivered the whole track and the writer has drained the
+    // buffer, get_status must report Stopped with the position reset; a drained
+    // buffer with the decode still running is a rebuffer, not EOS.
+    #[tokio::test]
+    async fn test_end_of_track_reports_stopped() {
+        let dir = std::env::temp_dir().join("l337-eos-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
+
+        engine.state = PlayerStateLabel::Playing;
+        engine.duration_sec = Some(1);
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.pcm = vec![0.0f32; 48000 * 2];
+            buf.read_pos = 48000 * 2 - 10;
+            buf.channels = 2;
+            buf.file_sample_rate = 48000;
+        }
+
+        // Rebuffer: the decode task is still running, so a (nearly) drained
+        // buffer must not end the track.
+        engine.streaming = Some(StreamingPlayback {
+            download_handle: None,
+            decode_handle: tokio::task::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let status = engine.get_status().await;
+        assert_eq!(status.state, PlayerStateLabel::Playing);
+
+        // End-of-track: the decode task finished. A partially drained buffer is
+        // still playing; a fully drained one ends the track as Stopped with the
+        // position reset.
+        if let Some(mut streaming) = engine.streaming.take() {
+            streaming.decode_handle.abort();
+        }
+        engine.streaming = Some(StreamingPlayback {
+            download_handle: None,
+            decode_handle: tokio::task::spawn(async {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        tokio::task::yield_now().await;
+
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.pcm = vec![0.0f32; 48000 * 2];
+            buf.read_pos = 48000 * 2 - 10;
+        }
+        let status = engine.get_status().await;
+        assert_eq!(
+            status.state,
+            PlayerStateLabel::Playing,
+            "a partially drained buffer is not end-of-track"
+        );
+
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            // A completed reclaim checkpoint, so stop() must clear the
+            // reclaimed prefix as well as read_pos for the position to reset.
+            buf.consumed_total = 11 * 48000 * 2;
+            buf.read_pos = buf.pcm.len();
+        }
+        let status = engine.get_status().await;
+        assert_eq!(status.state, PlayerStateLabel::Stopped);
+        assert_eq!(
+            status.position_sec,
+            Some(0),
+            "stop()/EOS must reset the reclaimed prefix too, not just read_pos"
+        );
+    }
+
+    // BUG-1 (verified live on the device): the writers reclaim consumed samples
+    // every 1<<20 samples, which drains the prefix out of `pcm` and resets
+    // `read_pos` to 0. The reported playhead must not rewind to the seek base at
+    // each such checkpoint (the observed symptom was a ~10.9s sawtooth: 9 -> 0
+    // -> 9 ...), so `calculate_position` counts the reclaimed prefix too.
+    #[tokio::test]
+    async fn test_position_survives_writer_reclaim() {
+        let dir = std::env::temp_dir().join("l337-reclaim-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
+        engine.state = PlayerStateLabel::Playing;
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.pcm = vec![0.1f32; 30 * 48000 * 2];
+            buf.channels = 2;
+            buf.file_sample_rate = 48000;
+            buf.sample_rate = 48000;
+            buf.read_pos = 0;
+            buf.consumed_total = 0;
+        }
+
+        // The writer consumes 11 s, hits its 1<<20-sample checkpoint, drains and
+        // reclaims the consumed prefix (read_pos back to 0).
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.read_pos += 11 * 48000 * 2;
+            buf.reclaim_consumed();
+        }
+        let p1 = engine.calculate_position(&engine.audio_buffer.lock().unwrap());
+        assert!(
+            (10..=12).contains(&p1),
+            "position rewound to {p1}s at the reclaim checkpoint (was the live BUG-1 sawtooth)"
+        );
+
+        // Playback continues from the reclaimed base.
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.read_pos += 5 * 48000 * 2;
+        }
+        let p2 = engine.calculate_position(&engine.audio_buffer.lock().unwrap());
+        assert!(
+            (15..=17).contains(&p2),
+            "position not monotonic across the reclaim: {p1} -> {p2}"
+        );
+
+        // Fully drained window: the writer consumes the rest and its checkpoint
+        // reclaims it, leaving pcm empty with everything in consumed_total. The
+        // recovery path (take_backend_error -> try_recover -> seek_and_resume)
+        // resumes from this value, so it must be the total consumed, not the
+        // seek base just because pcm is empty.
+        {
+            let mut buf = engine.audio_buffer.lock().unwrap();
+            buf.read_pos = buf.pcm.len();
+            buf.reclaim_consumed();
+        }
+        let p3 = engine.calculate_position(&engine.audio_buffer.lock().unwrap());
+        assert!(
+            p3 >= 29,
+            "calculate_position lost the reclaimed prefix on a drained window: {p3}"
+        );
+    }
+
     #[tokio::test]
     async fn test_play_track_short_circuits_on_youtube_block() {
         let dir = std::env::temp_dir().join("l337-block-test");
         let _ = std::fs::create_dir_all(&dir);
         let fake_ytdlp = dir.join("yt-dlp");
-        let script = r#"#!/bin/bash
+        // `#!/bin/sh`, not bash: /bin/bash does not exist on Termux (/bin is
+        // /system/bin), and a missing interpreter makes execvp report ENOENT,
+        // so it would silently fall through to a real yt-dlp further down PATH.
+        let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     echo "fake yt-dlp"
     exit 0

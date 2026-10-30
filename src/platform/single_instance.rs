@@ -149,6 +149,17 @@ impl Drop for InstanceLock {
 }
 
 fn instance_lock_candidates() -> Vec<PathBuf> {
+    // An isolated instance (L337_RUNTIME_DIR set — tests, side-by-side runs)
+    // must not also lock the shared platform fallbacks: the hardcoded /tmp
+    // candidate exists to detect two instances that use *different* temp dirs,
+    // which is exactly what isolation means here. With the override set, the
+    // runtime dir is the only candidate.
+    if let Some(dir) = std::env::var_os("L337_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return vec![PathBuf::from(dir).join("instance.lock")];
+        }
+    }
+
     let mut paths = Vec::new();
 
     let rt = super::common::runtime_dir();

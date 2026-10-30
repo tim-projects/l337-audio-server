@@ -49,6 +49,12 @@ impl PlatformInfo {
 pub struct AudioBuffer {
     pub pcm: Vec<f32>,
     pub read_pos: usize,
+    /// Interleaved samples already reclaimed (drained out of `pcm`) since the
+    /// buffer was last (re)filled. `reclaim_consumed` drops the consumed prefix
+    /// and resets `read_pos`, so the playhead position is
+    /// `consumed_total + read_pos`, never `read_pos` alone — otherwise every
+    /// reclaim checkpoint rewinds the reported timeline to the seek base.
+    pub consumed_total: usize,
     pub channels: u16,
     pub sample_rate: u32,
     pub file_sample_rate: u32,
@@ -69,6 +75,7 @@ impl AudioBuffer {
         Self {
             pcm: Vec::new(),
             read_pos: 0,
+            consumed_total: 0,
             channels: 0,
             sample_rate,
             file_sample_rate,
@@ -109,6 +116,7 @@ impl AudioBuffer {
     pub fn reclaim_consumed(&mut self) {
         let rp = self.read_pos.min(self.pcm.len());
         if rp > 0 {
+            self.consumed_total = self.consumed_total.saturating_add(rp);
             self.pcm.drain(0..rp);
             self.read_pos = 0;
             // Bound *capacity* too, not just length: after draining a large
@@ -128,6 +136,18 @@ impl AudioBuffer {
 /// back to /run/l337-audio-server for traditional runs.
 /// On other platforms it falls back to a cache dir.
 pub fn runtime_dir() -> PathBuf {
+    // Escape hatch for isolated instances (tests, side-by-side installs): when
+    // set, every runtime path — socket, instance lock and their shared
+    // fallbacks — moves inside this directory instead of the platform default,
+    // so two instances with different values never collide. Unset in normal
+    // operation, where the platform defaults (including the deliberate /tmp
+    // fallback for cross-TMPDIR detection) apply.
+    if let Some(dir) = std::env::var_os("L337_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         std::env::var_os("XDG_RUNTIME_DIR")

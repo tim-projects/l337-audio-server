@@ -551,3 +551,25 @@ jobs:
           $FLAGS \
           --generate-notes \
           $(find ./release-artifacts -type f -printf '%p ')
+
+  validate-installers:
+    name: Validate installer scripts
+    runs-on: ubuntu-latest
+    # Every trigger, including pull_request: an installer that cannot be parsed
+    # cannot install anything, and install.ps1 has no other execution path in
+    # CI (it was rewritten and never run anywhere).
+    steps:
+    - uses: actions/checkout@v4
+    - name: Syntax-check the bash installers
+      run: |
+        for s in install.sh scripts/install-android-termux.sh scripts/install-linux-alsa.sh \
+                 scripts/install-linux-pipewire.sh scripts/install-macos.sh scripts/install-systemd.sh; do
+          bash -n "$s" && echo "ok: $s"
+        done
+    - name: Parse install.ps1
+      run: |
+        pwsh -NoProfile -Command '
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) { $errors; exit 1 }
+          Write-Host "ok: scripts/install.ps1 parses"'

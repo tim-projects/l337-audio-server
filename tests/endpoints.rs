@@ -46,54 +46,46 @@ async fn find_available_port() -> u16 {
 
 /// Spawn the server on an available port in dummy HTTP mode.
 ///
-/// Uses `cargo run --bin l337-audio-server` so the binary does not need to be
-/// pre-built. Returns the port, a handle to the child process, and the XDG
-/// config directory used for the challenge token.
+/// Returns the port, a handle to the child process, and the state directory the
+/// challenge token is written to.
 async fn spawn_server() -> (u16, tokio::process::Child, PathBuf) {
-    let config_dir = std::env::temp_dir().join("l337-test-config").join("l337-audio-server");
+    // Per-spawn isolation, not a shared config dir: the server locks fixed
+    // runtime paths (its runtime dir plus a hardcoded /tmp fallback candidate)
+    // and writes its challenge token to STATE_DIRECTORY, so concurrently
+    // spawned test servers would otherwise steal each other's single-instance
+    // lock ("Another instance is already running") and read each other's
+    // tokens. L337_RUNTIME_DIR moves every runtime path (socket + all lock
+    // candidates) inside the per-spawn dir on every platform; TMPDIR covers
+    // temp-dir lookups; STATE_DIRECTORY is where the server actually resolves
+    // the challenge token from (it never reads XDG_CONFIG_HOME).
+    static SPAWN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let base_dir = std::env::temp_dir().join(format!(
+        "l337-test-{}-{seq}",
+        std::process::id()
+    ));
+    let config_dir = base_dir.join("l337-audio-server");
     let _ = std::fs::create_dir_all(&config_dir);
-
-    // Clean up any stale instance lock from previous test runs.
-    let _ = std::fs::remove_file(
-        std::env::temp_dir()
-            .join("l337-audio-server-runtime")
-            .join("instance.lock"),
-    );
-    let _ = std::fs::remove_file(
-        dirs::cache_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
-            .join("l337")
-            .join("l337-audio-server")
-            .join("instance.lock"),
-    );
-    let _ = std::fs::remove_file(config_dir.join("instance.lock"));
 
     let port = find_available_port().await;
 
-    let binary_path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-        .and_then(|mut p| {
-            p.pop();
-            p.pop();
-            p.push("bin");
-            p.push("l337-audio-server");
-            if p.exists() { Some(p) } else { None }
-        })
-        .or_else(|| {
-            let mut p = std::env::current_dir().unwrap_or_default();
-            p.push("bin");
-            p.push("l337-audio-server");
-            if p.exists() { Some(p) } else { None }
-        })
-        .unwrap_or_else(|| PathBuf::from("l337-audio-server"));
+    // Cargo sets this for integration tests to the binary it just built in the
+    // target dir; path-guessing (a repo bin/ dir, or PATH) only finds a released
+    // binary, which may not exist on a fresh checkout or a device.
+    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_l337-audio-server"));
 
     let mut child = Command::new(binary_path)
         .arg("--dummy")
         .arg("--transport=http")
         .env("L337__SERVER__PORT", port.to_string())
         .env("L337__SERVER__HOST", "127.0.0.1")
-        .env("XDG_CONFIG_HOME", config_dir.parent().unwrap())
+        .env("TMPDIR", &base_dir)
+        .env("L337_RUNTIME_DIR", &base_dir)
+        // The server resolves the challenge token's directory from
+        // STATE_DIRECTORY (falling back to the platform cache dir), never from
+        // XDG_CONFIG_HOME — point it at this test's isolated dir so the token
+        // lands exactly where get_token_via_challenge() reads it.
+        .env("STATE_DIRECTORY", &config_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -106,7 +98,10 @@ async fn spawn_server() -> (u16, tokio::process::Child, PathBuf) {
         .expect("Failed to build reqwest client");
 
     let url = format!("https://127.0.0.1:{}/health", port);
-    for _ in 0..120 {
+    // 180s, not 60: the whole suite runs these in parallel, and on a slow device
+    // (a phone running 22 servers at once, each generating its TLS cert) the
+    // default budget expires under CPU contention.
+    for _ in 0..360 {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
                 return (port, child, config_dir);

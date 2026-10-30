@@ -80,6 +80,7 @@ impl AudioBackend for PipeWireAudioBackend {
                         buf.backend_error.store(true, Ordering::SeqCst);
                         buf.pcm.clear();
                         buf.read_pos = 0;
+                        buf.consumed_total = 0;
                     }
                 }
             })
