@@ -584,6 +584,16 @@ for _ in $(seq 1 10); do
     esac
     sleep 1
 done
+# First start sometimes exits before PulseAudio is ready; retry once.
+if [ "$ok" != true ]; then
+    sv restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do
+        case "$(sv status "${SERVICE_NAME}" 2>/dev/null)" in
+            run:*) ok=true; break ;;
+        esac
+        sleep 1
+    done
+fi
 if [ "$ok" = true ]; then
     ok "Service running: $(sv status "${SERVICE_NAME}" 2>/dev/null | tr -s ' ')"
     # Verify it is really serving, not just supervised: runit reports "run" for
