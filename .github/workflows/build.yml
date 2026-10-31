@@ -469,7 +469,7 @@ jobs:
 
         root = pathlib.Path("release-artifacts")
         assets = {}
-        # Runtime shared libraries each asset needs (DT_NEEDED). These are
+        needed = {}
         # resolved by the loader before main(), so a host missing one cannot
         # exec the binary in ANY mode (dummy = true included). Recording them
         # per asset also documents which builds carry Opus (armv7/riscv64 do).
