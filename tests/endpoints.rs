@@ -160,6 +160,23 @@ async fn test_health_endpoint() {
     assert_eq!(body["status"], "ok");
     assert!(body["capabilities"].is_object());
 
+    // Capabilities must advertise what the binary can actually do, so a
+    // front-end can drop its "assume AAC only" stopgap and offer quality presets.
+    let caps = &body["capabilities"];
+    assert!(caps["yt_dlp"].is_boolean());
+    let codecs = caps["codecs"].as_array().expect("capabilities.codecs");
+    let codecs: Vec<&str> = codecs.iter().filter_map(|c| c.as_str()).collect();
+    assert!(
+        codecs.contains(&"aac") && codecs.contains(&"pcm_s16le"),
+        "unexpected advertised codecs: {codecs:?}"
+    );
+    // Opus is compile-time optional: advertised only when it is linked in.
+    #[cfg(feature = "opus")]
+    assert!(codecs.contains(&"opus"), "opus is linked in but not advertised");
+    #[cfg(not(feature = "opus"))]
+    assert!(!codecs.contains(&"opus"), "opus is not linked in but is advertised");
+    assert_eq!(caps["quality"], true);
+
     let _ = child.kill().await;
     let _ = child.wait().await;
 }

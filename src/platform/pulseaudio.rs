@@ -285,7 +285,11 @@ impl PulseAudioAudioOutputStream {
                     {
                         return Err("pa_stream_write (silence) failed".to_string());
                     }
-                    Ok(0)
+                    // Report the samples written so the caller paces this like
+                    // audio: an unpaced keep-alive writes ~8x real time and piles
+                    // a ~1000 s backlog into the sink-input, which is what made
+                    // a *paused* stream look like the unbounded-buffer bug.
+                    Ok(silence.len() / 4)
                 } else {
                     drop(buf);
                     Ok(0)

@@ -317,3 +317,107 @@ Verified: Unix socket /…/tmp/l337-audio-server/runtime/l337.sock
 - Reason a pure-bash hash was rejected: bash cannot hold NUL bytes, and a per-byte
   loop measured ~4 KB/s here (≈1 hour for 15 MB).
 - No playback changes; BUG-1..BUG-4 status unchanged.
+
+---
+
+# Update 3 — 2026-10-31: re-test of the *installed* binary (Termux device, live PulseAudio)
+
+Re-ran the end-to-end playback checks from the player app side against the server install
+(`~/.local/share/l337-player/bin/l337-audio-server`, mtime `2026-10-31 06:52`, pid 12977 →
+restarted 15625). Method: dependency-free stdlib HTTP client on the Unix socket (the device Python has
+no httpx/pytest/textual), an isolated second instance with `RUST_LOG=debug` for logs, and
+`pactl`/`parec` on the OpenSL monitor sink for audio verification. All requests are exactly what the
+player app sends.
+
+**Headline: the app still produced NO AUDIO, and I have a proven root cause.** This does **not**
+contradict the 2026-10-30 dev-build results — it says the artifact actually running on this device is
+**not** the build you fixed (see C below).
+
+## A. New root cause (P0): `resample_interleaved` emits ZEROS for `file_rate != device_rate`
+
+Proven by isolation — two locally generated WAVs pushed through `POST /player/play/stream`, identical
+except sample rate:
+
+| Input | Path taken (`stretch_and_resample`) | Sink monitor peak | Status |
+|---|---|---|---|
+| **48 000 Hz** WAV | decode → gain → writer, **no resample** | **11002** (audible) | `codec=pcm_s16le dur=4 pos=4` |
+| **44 100 Hz** WAV | decode → **`resample_interleaved` 44100→48000** → writer | **0** (silence) | `codec=pcm_s16le dur=4 pos=4` |
+
+So decode (`codec AAC 44100, n_frames 10169128 ≈ 231 s` in the logs), the shared `AudioBuffer`,
+the writer, the software-gain path, and PulseAudio→OpenSL are **all correct** — the 48 kHz source
+plays audibly through the whole chain. The only difference is the rate conversion, which returns
+**literal zeros** (peak exactly 0, not merely attenuated). Almost every real track (AAC/MP3/Opus,
+44100 Hz) hits this, so the server writes silence to a healthy, running sink.
+
+In the current tree, `src/player/engine.rs::resample_interleaved` (~1121–1187) also assembles its
+output as `output.extend_from_slice(&output_planar[ch])` per channel — i.e. **planar**, not the
+interleaved `L R L R …` the stream requires. Fix the interleave (`for i { for ch { output.push(output_planar[ch][i]) } }`)
+and add a unit test that pins 44100→48000 to non-zero, length ≈ `in_len * ratio`. (The exact reason the
+release binary yields literal zeros rather than planar garbage needs that unit test to pin, but the
+isolation result already proves `resample_interleaved` is the cause.)
+
+Measurement integrity was established first by a **control experiment**: playing a known 440 Hz tone
+into the sink made the monitor read peak **11999**, so "monitor = 0" really means "server wrote silence".
+
+## B. `stop()` never tears the stream down → the paused writer feeds silence forever (P1)
+
+The engine's `stop()` calls `stream.pause()` (engine.rs ~643), never `stream.stop()`/Drop. So after
+stop, the writer thread and the PulseAudio sink-input stay alive and the paused writer keeps
+`pa_stream_write`-ing silence every loop. Observed: one sink-input surviving `POST /player/stop`, and
+`pactl` sink-input `Buffer Latency` ≈ **1000 s** draining only ~0.03× real time. This is what produced
+the earlier "9975 s backlog" number and re-open's BUG-2's *residual* (the bounded window itself is in
+place; RSS stayed ~100 MB flat). Fix: `stop()` must stop/join the backend stream and free the
+sink-input; a paused stream must not append silence indefinitely.
+
+## C. The installed binary is stale → BUG-1/2/3 fixes are NOT in the running artifact (P0 for verification)
+
+While testing, `position_sec` still **sawtoothed 0 → ~10.9 s → 0** (10.9 s = the writer's
+`1 << 20` reclaim checkpoint at 48 kHz stereo) — i.e. the exact pre-`consumed_total` behaviour your
+2026-10-30 update says was fixed. The working tree is clean and does contain `consumed_total`
+(`buffer_position_sec` = `consumed_total + read_pos`, unit test `test_position_survives_writer_reclaim`).
+The installed binary was downloaded by the hardened `install.sh` as release **2026.10.29-5**
+(pre-dates the Oct-30 engine commits; last engine commit `817fff1` 2026-10-30). Conclusion: *this
+device is running the older release, not a build of HEAD*, so the BUG-1/2/3 fixes cannot be confirmed
+here and BUG-4 could not be judged.
+Re-verify on the device with a **current-HEAD build** (`cargo build --features pulseaudio,opus`,
+`RUSTFLAGS="-C debug-assertions=off"`, `CARGO_HOME=$HOME/.cargo CARGO_TARGET_DIR=$TMPDIR/…`): position
+monotonic to `duration`, buffer bounded, `playing → stopped` at EOS, and best-quality resolution.
+
+## D. BUG-4 is verifiable on this device after all
+
+Unlike the 2026-10-30 note, a resolvable YouTube target *does* exist here now: `yt-dlp -F` returns
+itag 140 (AAC ~129 k), 139, and **251/250/249 Opus**. The running binary reports `codec=aac,
+actual_kbps=129` at `target_kbps=0`, i.e. "best" still resolves to the low AAC variant. Verify
+best→highest (Opus) on a current build.
+
+## Re-ranked priority (from this session)
+
+1. **P0 — `resample_interleaved` zeros** (kills all normal playback; unit test 44100→48000).
+2. **P0 — install/build current HEAD on the device**, then re-confirm BUG-1/2/3 on the *installed*
+   artifact (this round's results were from a stale release).
+3. **P1 — `stop()` must tear down the stream** (no leaked sink-input, no silent append while paused).
+4. **P2 — BUG-4** best→highest, now verifiable.
+
+## E. Other observations kept on file
+
+- **The device Python has lost its third-party deps** since the rebuild (`httpx`, `pytest`, `textual`
+  all `ModuleNotFoundError`), so the player's `./run-test.sh` cannot exec on-device and the TUI cannot
+  be imported here. Any future *device* verification of these bugs must use a stdlib HTTP client
+  (what this session did) or run the suite off-device.
+- **The running `-5` binary does carry G2 + Opus**: `/health` → `{"capabilities":{"yt_dlp":true},"status":"ok"}`,
+  `DT_NEEDED` includes `libopus.so`, and `PlayerStatus` already reports `target_kbps`, `actual_kbps`,
+  `codec`. Capabilities still advertise only `yt_dlp` (no `codecs`/`quality`), so the player cannot
+  tell an Opus/quality-capable server from an old one.
+- **Short-file playback shows `pos == dur` then stops** (the 4 s WAV reported `duration_sec=4,
+  position_sec=4`), i.e. the EOS/last-position wiring on the *file* path works even on this binary;
+  BUG-3 is only unresolved for the streaming path and its interaction with C.
+- **`/health` and sockets/transport unchanged**: Unix socket at
+  `$TMPDIR/l337-audio-server/runtime/l337.sock`, persisted token read from
+  `~/.cache/l337/l337-audio-server/server_token.txt` (unchanged across reinstall).
+- **`sv restart` fully clears the leaked state**: restarting the service removed the surviving
+  sink-input and reset position/state, which is why the device is currently in a clean `stopped`
+  state (pid 15625).
+- **Still un-pinned (needs the unit test)**: *why* `resample_interleaved` returns literal zeros rather
+  than garbage — the planar-append bug in the current tree is a second, separate defect, so the fix
+  should be validated by the 44100→48000 sine test, not by reading the code alone.
+

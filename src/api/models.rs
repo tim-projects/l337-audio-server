@@ -152,6 +152,12 @@ pub struct PlayerStatus {
     pub prev_cached: bool,
     pub position_sec: Option<u64>,
     pub duration_sec: Option<u64>,
+    /// Human playhead for progress-bar front-ends: `"m:ss/m:ss"`
+    /// (`position/duration`) once both are known, otherwise the position alone.
+    /// A front-end reading only `position_sec`/`duration_sec` ints has to build
+    /// this itself, and one that only reads `time` gets no progress at all.
+    #[serde(default)]
+    pub time: Option<String>,
     pub audio_available: bool,
     /// The bandwidth ceiling (kbps) applied to the current/last track. `0` =
     /// best (no ceiling).

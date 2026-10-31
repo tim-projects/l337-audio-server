@@ -392,10 +392,19 @@ pub async fn health() -> impl IntoResponse {
         .map(|s| s.success())
         .unwrap_or(false);
 
+    // Codecs the server can actually decode, so a front-end can drop its
+    // "assume AAC only" stopgap and expose quality presets. Opus is compile-time
+    // optional (`--features opus`), so it is advertised only when linked in.
+    let mut codecs = vec!["aac", "vorbis", "mp3", "flac", "alac", "pcm_s16le"];
+    #[cfg(feature = "opus")]
+    codecs.insert(0, "opus");
+
     Json(serde_json::json!({
         "status": "ok",
         "capabilities": {
             "yt_dlp": has_ytdlp,
+            "codecs": codecs,
+            "quality": true,
         }
     })).into_response()
 }

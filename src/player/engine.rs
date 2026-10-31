@@ -507,6 +507,7 @@ impl PlayerEngine {
     }
 
     pub async fn load_and_play(&mut self, slot: &str) {
+        self.ensure_stream();
         if self.has_backend_error() {
             return;
         }
@@ -635,18 +636,54 @@ impl PlayerEngine {
             }
             streaming.decode_handle.abort();
         }
+        // Tear the backend stream down, not just pause it: a paused PulseAudio
+        // stream stays connected (the sink-input survives), and its writer keeps
+        // appending silence, so the sink-input's Buffer Latency grows to ~1000 s
+        // and only drains at 0.03x — the "9975 s backlog" of the original report,
+        // and a leaked sink-input that survived every `POST /player/stop`.
+        // Dropping the stream frees it; the next play reopens one.
+        if let Some(mut stream) = self.stream.take() {
+            stream.stop();
+        }
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm.clear();
         buf.read_pos = 0;
         buf.consumed_total = 0;
         drop(buf);
-        if let Some(stream) = self.stream.as_mut() {
-            if let Err(e) = stream.pause() {
-                error!("stop: stream.pause failed: {}", e);
-            }
-        }
         self.position_sec = 0;
         self.state = PlayerStateLabel::Stopped;
+    }
+
+    /// Reopen the backend stream after `stop` tore it down (or a backend error
+    /// dropped it). Every playback entry point must call this before filling the
+    /// buffer: the writer thread lives inside the stream, so a torn-down stream
+    /// with a full buffer would look like a rebuffer that never drains.
+    fn ensure_stream(&mut self) {
+        if self.stream.is_some() {
+            return;
+        }
+        match self.backend.start_stream(
+            "l337-audio-server",
+            48000,
+            2,
+            self.audio_buffer.clone(),
+            self.volume.clone(),
+        ) {
+            Ok(stream) => self.stream = Some(stream),
+            Err(e) => {
+                // Surface the failure the same way a writer does: without this a
+                // failed restart leaves the buffer filling with no writer, which
+                // reads as `Playing` forever (decode never finishes, buffer never
+                // drains) instead of a visible stop.
+                error!("ensure_stream: backend start failed: {}", e);
+                self.audio_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .backend_error
+                    .store(true, Ordering::SeqCst);
+                self.state = PlayerStateLabel::Stopped;
+            }
+        }
     }
 
     async fn start_streaming_playback(&mut self, url: &str, ceiling: u32) -> Result<(), StreamStartError> {
@@ -686,6 +723,7 @@ impl PlayerEngine {
                 buf.read_pos = 0;
                 buf.consumed_total = 0;
             }
+            self.ensure_stream();
             self.load_and_play("current").await;
             return Ok(());
         }
@@ -718,6 +756,10 @@ impl PlayerEngine {
             buf.channels = 0;
             buf.file_sample_rate = 0;
         }
+
+        // The producer below fills the buffer with nothing to drain it unless a
+        // writer is running, and `stop()` tore the previous one down.
+        self.ensure_stream();
 
         let audio_buffer = self.audio_buffer.clone();
         let decode_path = path.clone();
@@ -803,6 +845,9 @@ impl PlayerEngine {
             tracing::warn!("seek ignored during streaming playback");
             return;
         }
+
+        // Seek refills the buffer, so it needs a live writer to drain it.
+        self.ensure_stream();
 
         let path = self.storage.get_active_slot_path("current");
 
@@ -951,25 +996,11 @@ impl PlayerEngine {
             position_sec = Some(0);
         }
 
-        if self.state == PlayerStateLabel::Stopped && self.stream.is_none() {
-            return PlayerStatus {
-                state: PlayerStateLabel::Stopped,
-                volume: self.volume_val,
-                speed: self.speed,
-                pitch: self.pitch,
-                current_track: self.current_track.clone(),
-                disk_pool_utilization_bytes: self.storage.get_total_size().await,
-                next_cached: self.storage.get_active_slot_path("next").exists(),
-                prev_cached: self.storage.get_active_slot_path("prev").exists(),
-                position_sec: Some(0),
-                duration_sec: self.duration_sec,
-                audio_available: self.stream.is_some(),
-                target_kbps: self.effective_target_kbps,
-                actual_kbps: self.actual_kbps,
-                codec: self.codec_label.clone(),
-            };
-        }
-
+        // One construction site for `PlayerStatus`, not two: a second literal is
+        // how a field lands in one branch and not the other. A stopped engine
+        // with no stream reaches the same values here — `stop()` clears the
+        // buffer (so the playhead is the seek base, which it just reset to 0) and
+        // `audio_available` reports whether a writer thread still exists.
         let next_cached = self.storage.get_active_slot_path("next").exists();
         let prev_cached = self.storage.get_active_slot_path("prev").exists();
         let utilization = self.storage.get_total_size().await;
@@ -987,11 +1018,30 @@ impl PlayerEngine {
             prev_cached,
             position_sec,
             duration_sec: self.duration_sec,
+            time: status_time(position_sec, self.duration_sec),
             audio_available: self.stream.is_some(),
             target_kbps: self.effective_target_kbps,
             actual_kbps: self.actual_kbps,
             codec: self.codec_label.clone(),
         }
+    }
+}
+
+/// `"m:ss/m:ss"` playhead for progress-bar front-ends. A front-end that only
+/// reads `position_sec`/`duration_sec` has to build this itself; one that only
+/// reads `time` (the shape the player app historically asked for) gets nothing.
+/// Falls back to the position alone when no duration is known yet.
+fn status_time(position_sec: Option<u64>, duration_sec: Option<u64>) -> Option<String> {
+    match (position_sec, duration_sec) {
+        (Some(p), Some(d)) => Some(format!(
+            "{:02}:{:02}/{:02}:{:02}",
+            p / 60,
+            p % 60,
+            d / 60,
+            d % 60
+        )),
+        (Some(p), None) => Some(format!("{:02}:{:02}", p / 60, p % 60)),
+        _ => None,
     }
 }
 
@@ -1118,70 +1168,135 @@ pub(crate) fn decode_to_pcm(
     Ok((pcm, sample_rate, channels.max(1), codec))
 }
 
-pub(crate) fn resample_interleaved(
-    input: &[f32],
-    channels: u16,
-    in_rate: u32,
-    out_rate: u32,
-    speed: f32,
-) -> Vec<f32> {
-    if input.is_empty() || speed <= 0.0 {
+/// Input chunk size (frames per channel) that rubato's `SincFixedIn` demands
+/// per call. `chunk_size` counts *input* frames, so handing it any other length
+/// fails with `InsufficientInputBufferSize`.
+const RESAMPLE_CHUNK_FRAMES: usize = 4096;
+
+/// Convert interleaved PCM to a new sample rate.
+///
+/// `rubato::SincFixedIn` accepts only its fixed input chunk per call and returns
+/// its result *channel-planar*, and both requirements bit every caller: the old
+/// file path handed it arbitrary lengths, and the old streaming path handed it
+/// each decoded packet (~1024 frames) — every call failed the length check and
+/// the `if let Ok(...)` guard discarded it, so a 44.1 kHz AAC/MP3 source decoded
+/// correctly and then nothing at all was written to a healthy sink (device
+/// report: sink monitor peak exactly 0). The old file path also appended
+/// `output_planar[ch]` per channel — i.e. planar `LLL...RRR...` — where the
+/// stream format needs interleaved `L R L R ...`.
+///
+/// This wrapper owns the chunking (so any input length works, including the
+/// ~1024-frame packets of a stream) and returns the interleaved layout the audio
+/// stream requires. `finish` emits the short tail, zero-padded as rubato
+/// documents, so the last frames of a track are never lost.
+pub(crate) struct InterleavedResampler {
+    inner: Option<SincFixedIn<f32>>,
+    channels: usize,
+    pending: Vec<f32>,
+}
+
+impl InterleavedResampler {
+    /// `None`-equivalent passthrough when both rates match (no allocation, no
+    /// resampler) or when construction fails for a rate pair that should be
+    /// impossible — a passthrough is wrong-rate-but-audible, a panic here would
+    /// kill the decode task and return silence instead.
+    pub(crate) fn new(channels: u16, in_rate: u32, out_rate: u32) -> Self {
+        let channels = channels.max(1) as usize;
+        let inner = if in_rate == out_rate || in_rate == 0 || out_rate == 0 {
+            None
+        } else {
+            let params = SincInterpolationParameters {
+                sinc_len: 1024,
+                f_cutoff: 0.95,
+                oversampling_factor: 128,
+                interpolation: SincInterpolationType::Cubic,
+                window: WindowFunction::BlackmanHarris2,
+            };
+            SincFixedIn::<f32>::new(
+                out_rate as f64 / in_rate as f64,
+                10.0,
+                params,
+                RESAMPLE_CHUNK_FRAMES,
+                channels,
+            )
+            .ok()
+        };
+        Self {
+            inner,
+            channels,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Resample `input` (interleaved, `channels` per frame). A tail shorter than
+    /// one chunk is buffered until the next call or [`InterleavedResampler::finish`].
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        let Some(resampler) = self.inner.as_mut() else {
+            return input.to_vec();
+        };
+        self.pending.extend_from_slice(input);
+        let chunk_samples = RESAMPLE_CHUNK_FRAMES * self.channels;
+        let mut output = Vec::new();
+        // Consume by cursor and compact once: draining a prefix per chunk
+        // memmoves the rest of the buffer every iteration, which is quadratic in
+        // track length on the whole-file path (a 4-minute track = ~110 GB of
+        // memmove). The streaming path appends a packet at a time, so the
+        // compaction below stays small there.
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= chunk_samples {
+            let wave_in =
+                deinterleave(&self.pending[consumed..consumed + chunk_samples], self.channels);
+            if let Ok(planar) = resampler.process(&wave_in, None) {
+                output.extend_from_slice(&interleave(&planar));
+            }
+            consumed += chunk_samples;
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+
+    /// Emit the buffered tail and flush the resampler's internal pipeline.
+    /// A no-op (empty output) when no rate change is in effect.
+    pub(crate) fn finish(&mut self) -> Vec<f32> {
+        let Some(resampler) = self.inner.as_mut() else {
+            return std::mem::take(&mut self.pending);
+        };
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let wave_in = deinterleave(&self.pending, self.channels);
+        self.pending.clear();
+        resampler
+            .process_partial(Some(&wave_in), None)
+            .map(|planar| interleave(&planar))
+            .unwrap_or_default()
+    }
+}
+
+/// Split interleaved samples into per-channel vectors (whole frames only).
+fn deinterleave(input: &[f32], channels: usize) -> Vec<Vec<f32>> {
+    let frames = input.len() / channels;
+    let mut planar = vec![Vec::with_capacity(frames); channels];
+    for frame in input[..frames * channels].chunks(channels) {
+        for (ch, &sample) in frame.iter().enumerate() {
+            planar[ch].push(sample);
+        }
+    }
+    planar
+}
+
+/// Join per-channel vectors back into the interleaved layout the stream wants.
+fn interleave(planar: &[Vec<f32>]) -> Vec<f32> {
+    let channels = planar.len();
+    if channels == 0 {
         return Vec::new();
     }
-
-    let channels = channels as usize;
-    let params = SincInterpolationParameters {
-        sinc_len: 1024,
-        f_cutoff: 0.95,
-        oversampling_factor: 128,
-        interpolation: SincInterpolationType::Cubic,
-        window: WindowFunction::BlackmanHarris2,
-    };
-    let chunk_size = 4096;
-
-    let effective_in_rate = (in_rate as f64) * (speed as f64);
-    let ratio = out_rate as f64 / effective_in_rate;
-
-    let mut resampler = SincFixedIn::<f32>::new(ratio, 10.0, params, chunk_size, channels).unwrap();
-
-    let mut input_planar = vec![Vec::new(); channels];
-    for chunk in input.chunks(channels) {
-        for (ch, &sample) in chunk.iter().enumerate() {
-            input_planar[ch].push(sample);
-        }
-    }
-
-    let mut output = Vec::new();
-    let mut input_offset = 0;
-    loop {
-        let frames_needed = resampler.input_frames_next();
-        if frames_needed == 0 {
-            break;
-        }
-        if input_offset + frames_needed > input_planar[0].len() {
-            if input_offset < input_planar[0].len() {
-                let _remaining = &input_planar[0].len() - input_offset;
-                let mut remaining_input: Vec<Vec<f32>> = input_planar
-                    .iter()
-                    .map(|v| v[input_offset..].to_vec())
-                    .collect();
-                let output_planar = resampler.process_partial(Some(&remaining_input), None).unwrap();
-                for ch in 0..channels {
-                    output.extend_from_slice(&output_planar[ch]);
-                }
-            }
-            break;
-        }
-
-        let mut chunk_input: Vec<Vec<f32>> = input_planar
-            .iter()
-            .map(|v| v[input_offset..input_offset + frames_needed].to_vec())
-            .collect();
-        let output_planar = resampler.process(&chunk_input, None).unwrap();
+    let frames = planar[0].len();
+    let mut output = Vec::with_capacity(frames * channels);
+    for frame in 0..frames {
         for ch in 0..channels {
-            output.extend_from_slice(&output_planar[ch]);
+            output.push(planar[ch][frame]);
         }
-        input_offset += frames_needed;
     }
     output
 }
@@ -1274,7 +1389,13 @@ pub(crate) fn stretch_and_resample(
         return pitched;
     }
 
-    resample_interleaved(&pitched, channels as u16, file_sample_rate, device_rate, 1.0)
+    // One pass through the shared wrapper: full chunks for rubato, interleaved
+    // output for the stream, tail flushed so a rate change never shortens the
+    // track (identical policy to the streaming producer below).
+    let mut resampler = InterleavedResampler::new(channels as u16, file_sample_rate, device_rate);
+    let mut playback_pcm = resampler.process(&pitched);
+    playback_pcm.extend(resampler.finish());
+    playback_pcm
 }
 
 #[cfg(test)]
@@ -1410,9 +1531,15 @@ async fn download_via_ytdlp(
     dest: &PathBuf,
     ceiling: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !yt_dlp_available() {
-        return Err("yt-dlp is not installed. Install yt-dlp to download YouTube URLs.".into());
-    }
+    // Same policy as the streaming path: pick the rendition ourselves, then ask
+    // yt-dlp for that exact format, so a ceiling (or `best`) never plays one
+    // rendition and downloads another behind the user's back.
+    let selection = ytdlp_selection_json(url, ceiling).await?;
+    let format_id = selection
+        .get("format_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("yt-dlp returned no audio format")?
+        .to_string();
 
     let _ = tokio::fs::remove_file(dest).await;
 
@@ -1420,7 +1547,7 @@ async fn download_via_ytdlp(
         .arg("--no-config")
         .arg("--no-warnings")
         .arg("-f")
-        .arg(&yt_dlp_format_selector(ceiling))
+        .arg(&format_id)
         .arg("--no-playlist")
         .arg("-o")
         .arg(dest)
@@ -1471,16 +1598,202 @@ fn guess_ext_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// yt-dlp audio format selector for a bandwidth ceiling (G2). `0` = best. The
-/// trailing `bestaudio` fallback keeps selection from ever failing; yt-dlp's
-/// `abr` is approximate, so the result can exceed the ceiling when nothing fits
-/// under it — reported honestly via `actual_kbps`.
+/// Run yt-dlp for a URL with the shared flag set and the shared block detection.
+/// `args` are the mode-specific flags (before the URL).
+async fn run_ytdlp(
+    url: &str,
+    args: &[&str],
+) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
+    if !yt_dlp_available() {
+        return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
+    }
+
+    let mut command = TokioCommand::new("yt-dlp");
+    command
+        .arg("--no-config")
+        .arg("--no-warnings")
+        .arg("--no-playlist")
+        .args(args)
+        .arg(url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = command.output().await?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(block_type) = detect_youtube_block(&stderr) {
+        return Err(YouTubeError {
+            block_type,
+            message: format!("yt-dlp block detected: {:?}", block_type),
+        }
+        .into());
+    }
+
+    if !output.status.success() {
+        return Err("yt-dlp format selection failed".into());
+    }
+    Ok(output)
+}
+
+/// `--dump-single-json` + our own selection, returning the single chosen
+/// rendition as a JSON object. `Ok(None)` means the output could not be used
+/// (not JSON, no `formats` array, no audio rendition) and the caller should
+/// degrade to the classic selector instead of failing playback.
+async fn ytdlp_selection_via_dump(
+    url: &str,
+    ceiling: u32,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let output = run_ytdlp(url, &["--dump-single-json"]).await?;
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Ok(None);
+    };
+    let Some(formats) = json.get("formats").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let Some(chosen) = select_audio_format(formats, ceiling).cloned() else {
+        return Ok(None);
+    };
+    // yt-dlp reports duration at the video level; keep the rendition's own value
+    // when it has one so the caller sees a single consistent object.
+    let mut chosen = chosen;
+    if let Some(object) = chosen.as_object_mut() {
+        if !object.contains_key("duration") {
+            if let Some(duration) = json.get("duration") {
+                object.insert("duration".to_string(), duration.clone());
+            }
+        }
+    }
+    Ok(Some(chosen))
+}
+
+/// Classic-selector fallback: yt-dlp picks the format, we record which one it
+/// picked. This is the `-f <selector> --print` pair yt-dlp has supported for a
+/// decade, so a JSON-shape regression degrades quality reporting instead of
+/// ending playback.
+async fn ytdlp_selection_via_selector(
+    url: &str,
+    ceiling: u32,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let selector = yt_dlp_format_selector(ceiling);
+    let output = run_ytdlp(
+        url,
+        &[
+            "-f",
+            &selector,
+            "--print",
+            "%(format_id)s %(abr)s %(acodec)s %(ext)s %(duration)s %(url)s",
+        ],
+    )
+    .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("yt-dlp returned empty output")?;
+    let mut parts = line.trim().splitn(6, ' ');
+    let format_id = parts.next().unwrap_or_default().trim().to_string();
+    let abr = parts
+        .next()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .map(|v| v.round());
+    let codec = parts.next().map(|t| t.trim().to_lowercase());
+    let ext = parts
+        .next()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty());
+    let duration = parts
+        .next()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .map(|v| v.round() as u64)
+        .filter(|&d| d > 0);
+    let stream_url = parts
+        .next()
+        .ok_or("yt-dlp returned no url")?
+        .trim()
+        .to_string();
+
+    Ok(serde_json::json!({
+        "format_id": format_id,
+        "abr": abr,
+        "acodec": codec,
+        "ext": ext,
+        "duration": duration,
+        "url": stream_url,
+    }))
+}
+
+/// The rendition yt-dlp selected for a URL, as one JSON object, preferring the
+/// full format list (so G2's highest-bitrate policy is ours) and degrading to
+/// the classic selector when that output is unusable.
+async fn ytdlp_selection_json(
+    url: &str,
+    ceiling: u32,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(format) = ytdlp_selection_via_dump(url, ceiling).await? {
+        return Ok(format);
+    }
+    ytdlp_selection_via_selector(url, ceiling).await
+}
+
+/// yt-dlp audio format selector for a bandwidth ceiling (G2), used as the
+/// fallback when the full format list can't be used. `0` = best.
 fn yt_dlp_format_selector(ceiling: u32) -> String {
     if ceiling == 0 {
         "bestaudio".to_string()
     } else {
         format!("bestaudio[abr<={ceiling}]/bestaudio")
     }
+}
+
+/// G2 rendition policy applied to yt-dlp's format list: the **highest average
+/// bitrate** audio rendition at or below `ceiling` (`0` = best, no ceiling),
+/// falling back to the *lowest* available when nothing fits so a ceiling can
+/// never fail playback (reported honestly as `actual_kbps`).
+///
+/// The choice is made here rather than left to yt-dlp's `bestaudio` ranking:
+/// yt-dlp resolves `bestaudio` to a ~129 kbps AAC m4a even when a higher-bitrate
+/// Opus (itag 251) exists, so "best" silently under-selected quality for
+/// everyone by default (BUG-4).
+fn select_audio_format<'a>(
+    formats: &'a [serde_json::Value],
+    ceiling: u32,
+) -> Option<&'a serde_json::Value> {
+    let abr = |f: &serde_json::Value| {
+        f.get("abr")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    // "Audio only" == the rendition carries no video track. A rendition with no
+    // audio codec at all is never a candidate (it would be silence).
+    let carries_audio = |f: &serde_json::Value| {
+        f.get("acodec")
+            .and_then(serde_json::Value::as_str)
+            .map_or(true, |c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
+    };
+    let mut audio: Vec<&serde_json::Value> = formats
+        .iter()
+        .filter(|f| {
+            carries_audio(f)
+                && f.get("vcodec").and_then(serde_json::Value::as_str) == Some("none")
+        })
+        .collect();
+    if audio.is_empty() {
+        // Some sources expose no audio-only rendition (merged DASH/HLS); any
+        // rendition carrying audio is still playable.
+        audio = formats.iter().filter(|f| carries_audio(f)).collect();
+    }
+    let mut best: Option<&serde_json::Value> = None;
+    let mut lowest: Option<&serde_json::Value> = None;
+    for format in &audio {
+        let bitrate = abr(format);
+        if best.map_or(true, |b| bitrate > abr(b)) && (ceiling == 0 || bitrate <= ceiling as f64) {
+            best = Some(format);
+        }
+        if lowest.map_or(true, |l| bitrate < abr(l)) {
+            lowest = Some(format);
+        }
+    }
+    best.or(lowest)
 }
 
 /// Map a yt-dlp `acodec` string to the short label used in `PlayerStatus.codec`.
@@ -1512,58 +1825,31 @@ async fn resolve_youtube_stream_url(
     url: &str,
     ceiling: u32,
 ) -> Result<(String, Option<u32>, Option<String>, Option<String>, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
-    if !yt_dlp_available() {
-        return Err("yt-dlp is not installed. Install yt-dlp to resolve YouTube URLs.".into());
-    }
+    let format = ytdlp_selection_json(url, ceiling).await?;
 
-    let output = TokioCommand::new("yt-dlp")
-        .arg("--no-config")
-        .arg("--no-warnings")
-        .arg("-f")
-        .arg(&yt_dlp_format_selector(ceiling))
-        .arg("--no-playlist")
-        .arg("--print")
-        .arg("%(abr)s %(acodec)s %(ext)s %(duration)s %(url)s")
-        .arg(url)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if let Some(block_type) = detect_youtube_block(&stderr) {
-        return Err(YouTubeError {
-            block_type,
-            message: format!("yt-dlp block detected: {:?}", block_type),
-        }
-        .into());
-    }
-
-    if !output.status.success() {
-        return Err("yt-dlp format selection failed".into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .ok_or("yt-dlp returned empty output")?;
-    let mut parts = line.trim().splitn(5, ' ');
-    let abr = parts
-        .next()
-        .and_then(|t| t.trim().parse::<f64>().ok())
+    // Record the delivered bitrate / codec / duration of the chosen stream.
+    let abr = format
+        .get("abr")
+        .and_then(serde_json::Value::as_f64)
         .map(|v| v.round() as u32);
-    let codec = parts.next().and_then(normalize_codec);
-    let ext = parts.next().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
-    let duration = parts
-        .next()
-        .and_then(|t| t.trim().parse::<f64>().ok())
+    let codec = format
+        .get("acodec")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_codec);
+    let ext = format
+        .get("ext")
+        .and_then(serde_json::Value::as_str)
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty());
+    let duration = format
+        .get("duration")
+        .and_then(serde_json::Value::as_f64)
         .map(|v| v.round() as u64)
         .filter(|&d| d > 0);
-    let stream_url = parts
-        .next()
-        .ok_or("yt-dlp returned no url")?
-        .trim()
+    let stream_url = format
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("selected format has no url")?
         .to_string();
 
     Ok((stream_url, abr, codec, ext, duration))
@@ -1854,21 +2140,13 @@ fn streaming_decode_sync(
         None
     };
 
-    let mut resampler = if file_sample_rate != device_rate {
-        let channels = channels as usize;
-        let params = SincInterpolationParameters {
-            sinc_len: 1024,
-            f_cutoff: 0.95,
-            oversampling_factor: 128,
-            interpolation: SincInterpolationType::Cubic,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let chunk_size = 4096;
-        let ratio = device_rate as f64 / file_sample_rate as f64;
-        Some(SincFixedIn::<f32>::new(ratio, 10.0, params, chunk_size, channels).unwrap())
-    } else {
-        None
-    };
+    // G4/device report: this used to build a `SincFixedIn` and feed each decoded
+    // packet straight into it. A packet is ~1024 frames, a `SincFixedIn` chunk is
+    // 4096 input frames, so `process` failed validation on *every* packet and the
+    // `if let Ok(...)` guard discarded all of them: a 44.1 kHz AAC/MP3 stream
+    // reached a healthy sink as pure silence. The shared wrapper buffers short
+    // inputs and never fails on length.
+    let mut resampler = InterleavedResampler::new(channels, file_sample_rate, device_rate);
 
     let mut sample_buf = None;
     let mut last_file_size = file_size;
@@ -1935,27 +2213,9 @@ fn streaming_decode_sync(
                                 }
                             }
 
-                            if let Some(ref mut resampler) = resampler {
-                                let mut input_planar = vec![Vec::new(); channels as usize];
-                                for chunk in output.chunks(channels as usize) {
-                                    for (ch, &sample) in chunk.iter().enumerate() {
-                                        input_planar[ch].push(sample);
-                                    }
-                                }
-
-                                if let Ok(output_planar) = resampler.process(&input_planar, None) {
-                                    let output_len = output_planar[0].len();
-                                    let mut output = Vec::with_capacity(output_len * channels as usize);
-                                    for i in 0..output_len {
-                                        for ch in 0..channels as usize {
-                                            output.push(output_planar[ch][i]);
-                                        }
-                                    }
-                                    ab.pcm.extend_from_slice(&output);
-                                }
-                            } else {
-                                ab.pcm.extend_from_slice(&output);
-                            }
+                            // Rate conversion + append in one step: the wrapper
+                            // buffers short packets instead of dropping them.
+                            ab.pcm.extend_from_slice(&resampler.process(&output));
                         }
 
                         stall_cycles = 0;
@@ -1991,6 +2251,16 @@ fn streaming_decode_sync(
         }
     }
 
+    // End of stream: flush the resampler's buffered tail, or the last frames of
+    // the track (a partial chunk at 44.1 kHz) never reach the buffer and the
+    // writer underruns before `get_status` declares end-of-track. Skipped on
+    // cancel, where the buffer is being torn down anyway.
+    let tail = resampler.finish();
+    if !tail.is_empty() {
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        ab.pcm.extend_from_slice(&tail);
+    }
+
     Ok(())
 }
 
@@ -2010,12 +2280,107 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::Ordering;
 
+    /// yt-dlp's own fixture shape: `vcodec == "none"` marks an audio-only
+    /// rendition; `abr` is its average bitrate in kbps.
+    fn fmt(id: &str, abr: Option<f64>, acodec: &str) -> serde_json::Value {
+        serde_json::json!({
+            "format_id": id,
+            "abr": abr,
+            "acodec": acodec,
+            "vcodec": "none",
+        })
+    }
+
+    /// A rendition that carries video as well as audio (yt-dlp `vcodec != "none"`).
+    fn fmt_video(id: &str, abr: f64, acodec: &str) -> serde_json::Value {
+        serde_json::json!({
+            "format_id": id,
+            "abr": abr,
+            "acodec": acodec,
+            "vcodec": "avc1.42001E",
+        })
+    }
+
+    // BUG-4: `best` must be the *highest available* rendition. yt-dlp's
+    // `bestaudio` ranking resolved this very fixture to the 129 kbps AAC m4a
+    // (itag 140) even though a higher-bitrate Opus (itag 251) was available, so
+    // "best" under-selected quality for every user by default.
     #[test]
-    fn test_yt_dlp_format_selector() {
-        assert_eq!(yt_dlp_format_selector(0), "bestaudio");
-        assert_eq!(yt_dlp_format_selector(128), "bestaudio[abr<=128]/bestaudio");
-        assert_eq!(yt_dlp_format_selector(48), "bestaudio[abr<=48]/bestaudio");
-        assert_eq!(yt_dlp_format_selector(1024), "bestaudio[abr<=1024]/bestaudio");
+    fn test_select_audio_format_best_picks_highest_bitrate() {
+        // YouTube's typical audio-only ladder, deliberately out of order.
+        let formats = vec![
+            fmt("140", Some(129.0), "mp4a.40.2"),   // AAC m4a, the wrong pick
+            fmt("139", Some(49.0), "mp4a.40.5"),
+            fmt("251", Some(158.0), "opus"),        // highest available
+            fmt("250", Some(74.0), "opus"),
+            fmt("249", Some(51.0), "opus"),
+        ];
+        let best = select_audio_format(&formats, 0).expect("some format must be chosen");
+        assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"));
+        assert_eq!(
+            best.get("abr").and_then(|v| v.as_f64()),
+            Some(158.0),
+            "best must report the delivered bitrate of the rendition actually chosen"
+        );
+    }
+
+    #[test]
+    fn test_select_audio_format_ceiling_picks_highest_that_fits() {
+        let formats = vec![
+            fmt("140", Some(129.0), "mp4a.40.2"),
+            fmt("139", Some(49.0), "mp4a.40.5"),
+            fmt("251", Some(158.0), "opus"),
+            fmt("250", Some(74.0), "opus"),
+        ];
+
+        // Nothing fits the ceiling except the lowest: deliver the lowest rather
+        // than failing playback, and report it as the true actual_kbps.
+        let chosen = select_audio_format(&formats, 60).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("139"));
+
+        // 130 admits 129 but not 158: the 129 kbps AAC is the highest that fits.
+        let chosen = select_audio_format(&formats, 130).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("140"));
+
+        // 128 admits neither 129 nor 158, so the 74 kbps tier is the highest fit.
+        let chosen = select_audio_format(&formats, 128).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("250"));
+
+        // Just above an Opus tier: that tier, not a lower one.
+        let chosen = select_audio_format(&formats, 100).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("250"));
+
+        // Wide open ceiling behaves like best.
+        let chosen = select_audio_format(&formats, 1024).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("251"));
+    }
+
+    #[test]
+    fn test_select_audio_format_prefers_audio_only_then_any_carrying_audio() {
+        let formats = vec![
+            fmt_video("22", 700.0, "mp4a.40.2"), // video rendition that carries audio
+            fmt("140", Some(129.0), "mp4a.40.2"),
+            fmt("251", Some(158.0), "opus"),
+        ];
+        let chosen = select_audio_format(&formats, 0).expect("a format must be chosen");
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("251"),
+            "audio-only renditions must win over higher-bitrate video renditions"
+        );
+
+        // Only a rendition that carries audio: it is still the playable choice.
+        let mixed = vec![fmt_video("22", 700.0, "mp4a.40.2")];
+        let chosen = select_audio_format(&mixed, 0).expect("a format must be chosen");
+        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("22"));
+
+        // No audio anywhere would be silence, and an empty list is None, not a panic.
+        let silent = vec![serde_json::json!({
+            "format_id": "136", "abr": Some(700.0),
+            "acodec": "none", "vcodec": "avc1",
+        })];
+        assert!(select_audio_format(&silent, 0).is_none());
+        assert!(select_audio_format(&[], 0).is_none());
     }
 
     #[test]
@@ -2080,12 +2445,51 @@ mod tests {
         assert_eq!(detect_youtube_block(""), None);
     }
 
+    // The classic-selector fallback (used only when the full format list can't
+    // be used) must keep the documented G2 mapping, including the trailing
+    // `bestaudio` so selection never fails outright.
+    #[test]
+    fn test_yt_dlp_format_selector_fallback() {
+        assert_eq!(yt_dlp_format_selector(0), "bestaudio");
+        assert_eq!(
+            yt_dlp_format_selector(128),
+            "bestaudio[abr<=128]/bestaudio"
+        );
+        assert_eq!(
+            yt_dlp_format_selector(48),
+            "bestaudio[abr<=48]/bestaudio"
+        );
+        assert_eq!(
+            yt_dlp_format_selector(1024),
+            "bestaudio[abr<=1024]/bestaudio"
+        );
+    }
+
     #[test]
     fn test_youtube_block_type_as_str() {
         assert_eq!(YouTubeBlockType::RateLimit.as_str(), "rate_limit");
         assert_eq!(YouTubeBlockType::Captcha.as_str(), "captcha");
         assert_eq!(YouTubeBlockType::BotDetected.as_str(), "bot_detected");
         assert_eq!(YouTubeBlockType::IpBlocked.as_str(), "ip_blocked");
+    }
+
+    // Integration NOTE: a front-end that reads only `time` (the shape the player
+    // app historically asked for) got no progress at all. Pin the exact wire
+    // format — "m:ss/m:ss", minutes zero-padded.
+    #[test]
+    fn test_status_time_human_playhead() {
+        assert_eq!(
+            status_time(Some(0), Some(231)).as_deref(),
+            Some("00:00/03:51")
+        );
+        assert_eq!(
+            status_time(Some(65), Some(231)).as_deref(),
+            Some("01:05/03:51")
+        );
+        // Duration unknown (a track with no metadata yet): position alone.
+        assert_eq!(status_time(Some(0), None).as_deref(), Some("00:00"));
+        // At rest with nothing played: nothing to show.
+        assert_eq!(status_time(None, None), None);
     }
 
     #[test]

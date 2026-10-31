@@ -47,6 +47,16 @@ with the new version heading.
   path is never executed. The documented `curl ... install.sh | sudo bash` runs
   the script from stdin, so a CWD-relative path would otherwise be an
   attacker-placeable file executed as root.
+- `PlayerStatus.time` — a human playhead (`"m:ss/m:ss"`, position/duration) for
+  progress-bar front-ends that read exactly that shape. A front-end reading only
+  the `position_sec`/`duration_sec` ints can still build it; one reading only
+  `time` previously got no progress at all. Falls back to the position alone when
+  no duration is known yet (a seek of a track without metadata).
+- `/health` now advertises the real capabilities rather than only `yt_dlp`:
+  `capabilities.codecs` lists the codecs this binary can decode (Opus only when
+  compiled with `--features opus`) and `capabilities.quality` signals the G2
+  bandwidth API, so a front-end can drop its "assume AAC only" stopgap and expose
+  quality presets.
 
 ### Changed
 - **Platform installers now enable, start and verify the service.**
@@ -71,6 +81,65 @@ with the new version heading.
   others died deeper in on an empty path).
 
 ### Fixed
+- **Playback wrote silence for every track not at 48 kHz** (device P0). Proven by
+  isolation: an identical 44.1 kHz WAV decoded to a healthy, running PulseAudio
+  sink-input with `codec=pcm_s16le` and correct duration, but the monitor read a
+  peak of exactly 0 — only the rate-conversion path differed. Two defects in one
+  path: `rubato::SincFixedIn` takes a *fixed* input chunk and returns its result
+  **channel-planar**, so the streaming producer fed each ~1024-frame packet
+  straight into a 4096-frame chunk resampler — every call failed validation and
+  its `if let Ok(...)` guard dropped the packet, so a whole 44.1 kHz stream
+  reached the sink as nothing at all; and the file path appended
+  `output_planar[ch]` per channel, i.e. `LLL...RRR...`, where the stream format
+  needs interleaved `L R L R ...`. Both paths now share one
+  `InterleavedResampler`: it buffers any input length, always advances (a chunk
+  is never re-fed and never stalls the stream), and returns interleaved output,
+  with `finish()` flushing the zero-padded tail so a rate change no longer
+  shortens a track. Unit tests pin 44100→48000 to non-zero with length
+  ≈ `input × ratio`, pin the interleave, and pin that odd-size packets
+  (1024/512/2048/128) deliver the same audio as the whole buffer.
+- **`stop()` never tore the stream down** (device P1), so the sink-input survived
+  `POST /player/stop` and the paused writer kept appending keep-alive silence to
+  it — the sink-input's `Buffer Latency` grew to ~1000 s draining only at 0.03×,
+  which is the "9975 s backlog" number of the original report. `stop()` now stops
+  and joins the backend stream (freeing the sink-input) instead of pausing it,
+  and `ensure_stream()` reopens one at each playback entry point so a decoupled
+  writer thread is never missing while the buffer fills.
+- The PulseAudio writer's keep-alive silence was unpaced: it wrote a 4096-sample
+  chunk every ~10 ms (≈8× real time) so a *paused* stream reproduced the
+  unbounded-backlog symptom. Keep-alive writes are now paced to the device clock
+  like audio, so latency stays bounded in PulseAudio rather than growing.
+- **`best` quality under-selected the rendition** (BUG-4). yt-dlp's own
+  `bestaudio` ranking resolved YouTube's "best" to a ~129 kbps AAC m4a (itag 140)
+  even when a higher-bitrate Opus (itag 251) was available, so the default
+  silently degraded everyone's audio. Rendition choice now comes from
+  `yt-dlp --dump-single-json` through one policy function
+  (`select_audio_format`): the **highest average bitrate** audio rendition at or
+  below the ceiling (0 = best), the lowest available when nothing fits (a ceiling
+  never fails playback), audio-only renditions preferred over video renditions
+  that merely carry audio, and never a rendition with no audio at all. Resolution
+  and download share the same call, so a play and its download can no longer pick
+  different renditions. Tests cover the YouTube AAC/Opus ladder and each ceiling.
+- The device Python's third-party deps (`httpx`, `pytest`, `textual`) are gone
+  after a rebuild, so player-side end-to-end checks now run as a stdlib-only
+  HTTP client against the Unix socket.
+- The new `InterleavedResampler` originally drained its consumed prefix from
+  `pending` once per chunk, which is quadratic in track length on the whole-file
+  path (`load_and_play`, `seek`, `seek_and_resume` all pass the whole track in
+  one call): a 4-minute 44.1 kHz track moved ~110 GB of samples before the first
+  sound. It now consumes by cursor and compacts once (**measured 330 ms → 36 µs**
+  for 30 s of audio).
+- Rendition selection degrades instead of failing when yt-dlp's
+  `--dump-single-json` output is unusable (older yt-dlp, a proxy, any shape
+  change): it falls back to the classic `-f bestaudio[abr<=N]/bestaudio --
+  print` pair, so a JSON-format regression costs quality reporting rather than
+  playback.
+- `ensure_stream()` now records a backend failure the way a writer does
+  (buffer `backend_error` + `Stopped`) instead of only logging it. Without this a
+  failed restart left the buffer filling with no writer to drain it, which read
+  as `Playing` forever rather than a visible stop.
+- `get_status` builds `PlayerStatus` once instead of in two hand-mirrored
+  literals, so a field cannot land in one branch and not the other.
 - **The download was never verified**, so a truncated or corrupted transfer could
   be installed silently as a valid-looking (still ELF-headed) binary. Every
   release now publishes a per-asset checksum block (`md5`, `crc32`, `size`) in
