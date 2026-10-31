@@ -449,8 +449,13 @@ EOF
     run_as_user "$real_user" -- systemctl --user enable l337-audio-server.service || true
     run_as_user "$real_user" -- systemctl --user start l337-audio-server.service || true
 
-    sleep 1
-    if run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null; then
+    # Verify it actually came up (the unit can take seconds after `exec start`).
+    # wait_until_ok is a function of this shell, so it must poll locally and let
+    # each check go through run_as_user to reach the user's systemd session.
+    unit_active() {
+        run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null
+    }
+    if wait_until_ok 15 unit_active; then
         ok "Systemd user service installed and started for $real_user"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
@@ -466,8 +471,7 @@ EOF
             chmod 0755 "$INSTALL_DIR/l337-audio-server"
             run_as_user "$real_user" -- systemctl --user daemon-reload || true
             run_as_user "$real_user" -- systemctl --user start l337-audio-server.service 2>/dev/null || true
-            sleep 1
-            if run_as_user "$real_user" -- systemctl --user is-active --quiet l337-audio-server.service 2>/dev/null; then
+            if wait_until_ok 15 unit_active; then
                 warn "Rollback successful — old binary restored and running for $real_user"
                 rm -f "$INSTALL_DIR/l337-audio-server.bak"
                 rm -rf "$INSTALL_DIR/.tmp"
@@ -588,6 +592,13 @@ if [ "$UNINSTALL" = true ]; then
     check_command "systemctl"
     uninstall_user_service
     exit 0
+fi
+
+if [ ! -f "${BINARY_INPUT}" ]; then
+    fail "No binary given. This installer does not download one: run install.sh, or
+pass the path yourself:
+    bash $0 --binary <path-to-l337-audio-server>
+(uninstall always works:  bash $0 --uninstall)"
 fi
 
 require_root

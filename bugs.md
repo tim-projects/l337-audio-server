@@ -567,3 +567,73 @@ PulseAudio (OpenSL ES) sink. Full details + live traces: the update section of
   here (no resolvable YouTube target on this device).
 
 
+
+---
+
+# Installer hardening round — 2026-10-31 (Termux/aarch64, device-validated)
+
+A review of the 404-skip / version-check work found **2 CRITICAL** and several WARNING defects,
+and the user redirected the architecture: **all GitHub work belongs in `install.sh`**, which should
+download the binary itself and hand the path to the platform installer. Everything below is
+implemented and verified on the device against the live GitHub API.
+
+## Completed
+
+| # | Item | Verified |
+|---|------|----------|
+| 1 | **`install.sh` owns all GitHub work.** Resolves the platform's asset name, walks releases newest-first, verifies each candidate against that release's own `release-info.json`, compares the recorded glibc against the running libc, checks the installed version, downloads the binary into `TMPDIR`, then `exec`s the platform installer with `--binary <path> --release <tag>`. | Live: picked `2026.10.29-5` over the partial `2026.10.29-6/-7`. |
+| 2 | **Platform installers contain no release/version/download logic.** `install-android-termux.sh`, `install-linux-alsa.sh`, `install-linux-pipewire.sh`, `install-macos.sh` lost their release walks, version comparisons and download code (five drifting copies → one). Running one without `--binary` fails with an actionable message; `--uninstall` still works standalone. (Fetching `lib-distro.sh` remains — it is a helper library, not a release check.) | Suite: 58 checks. |
+| 3 | **CRITICAL — stale `.tmp` accepted as a good binary.** `curl -f` never truncates its `-o` target, so a partial file left by an interrupted run passed the "non-empty?" test and was installed as a complete binary. Success is now decided by the transfer status, and the destination is removed before each attempt. | Suite: stale content never handed over. |
+| 4 | **CRITICAL — local installer executed as root from the caller's CWD.** `curl … install.sh \| sudo bash` feeds the script over stdin (`$0=bash`), so a bare `scripts/install-*.sh` resolved wherever the user ran it, executing an attacker-placeable file as root. Only a real checkout (a directory containing `.git`) is trusted now. | Suite: installpath resolution checked. |
+| 5 | **Regression — `--binary` was clobbered.** `install-android-termux.sh` re-read `L337_BINARY_PATH` *after* argument parsing, overwriting the path `install.sh` had passed; every install died with "No binary given" *after* a successful download. The env fallback is now resolved before parsing in all four installers. | Fixed; real install runs end-to-end. |
+| 6 | **glibc is detected on termux-glibc.** The system `ldd`/`getconf` are Bionic and silent, so a glibc Termux device reported "cannot determine" and the glibc filter silently accepted any release. The loader in `$PREFIX/glibc/lib` is asked instead (reports `2.44` on this device), the package revision is ignored (`2.44-0` compares as `2.44`), and a Bionic-only device says so instead of warning. | Live: `System glibc: 2.44 (termux-glibc; …)`. |
+| 7 | **`--force` re-downloads** — it always did; the output now says so (`… — re-downloading`). | Live: two consecutive `--force` runs each downloaded. |
+| 8 | **Services are enabled, started and verified.** Termux `sv-enable`s at boot (previously only printed); verification checks the service is supervised **and** that the server actually created its listening endpoint. Linux ALSA/PipeWire and the local systemd installer poll (`wait_until_ok`, new in `scripts/lib-distro.sh`) instead of a fixed `sleep`; macOS loads via `launchctl bootstrap gui/<uid>` (fallback `load`) and verifies the job registered. | Live: `enabled` → `running (pid)` → `Verified: Unix socket …`. |
+| 9 | **Verification used the wrong transport.** The install probed TCP `127.0.0.1:1337`, but the Termux build runs `--transport=socket` and never opens that port, so a working install always reported "not answering". It now verifies the Unix socket the server actually binds. | Live: socket verified, service `run`. |
+| 10 | **macOS asset selection** now matches `install-macos.sh`, which installs the x86_64 build under Rosetta 2 on Apple Silicon — `install.sh` required the aarch64 asset, so the two disagreed about which release to use. | Static (no macOS host). |
+
+## Remaining gaps / device-only verification
+
+- **The Linux and macOS paths are structure- and syntax-verified only** — no Linux or macOS host
+  available on this device. `wait_until_ok`, the systemd enable/start/verify polls, and the
+  `launchctl bootstrap` path have not been executed. First run on a real host should confirm:
+  unit reaches `active` within the 15 s poll, `is-enabled` reports enabled, and a slow-start unit is
+  no longer rolled back by the old fixed `sleep`.
+- **`install-systemd.sh` writes `/etc/l337-audio-server/config.toml`**, which `load_settings()` never
+  reads — still open (carried from §7 above; needs a decision on the authoritative config file).
+- **The committed `scripts/opus-stubs/libopus.so` blob** is still not regenerated/validated in CI.
+- **device-only playback checks** in the sections above are unchanged: `position_sec` advancing on a
+  real sink, RSS reclaim on the streaming path, forced-backend-error recovery, and the real YouTube
+  bandwidth ceiling. The engine fixes from the 2026-10-30 session (BUG-1/BUG-2/BUG-3) are still not
+  in a published release, so a release-binary run cannot yet show them.
+- **The installer's own `--binary` handover on non-Termux platforms** is exercised structurally only
+  (a full install needs a running PulseAudio daemon, which `pulseaudio --check` cannot satisfy under a
+  redirected `HOME`); the functional path was verified on this device instead.
+
+## Installer round 2 — download verification (2026-10-31)
+
+Closed the integrity gap found while adding MD5 verification:
+
+- **Every release now publishes per-asset checksums** (`md5`, `crc32`, `size`) in
+  `release-info.json`, generated in `build.yml` from the built artifacts.
+- **`install.sh` verifies the download before installing**, in layers, and never
+  hard-fails because a hash tool is missing:
+  1. **size** — always, needs no tool (`curl` reports what it transferred);
+  2. **md5** — via `md5sum` when present (strongest);
+  3. **crc32** — via POSIX `cksum`, shipped by **both coreutils and busybox**, so a
+     host without md5sum is still covered;
+  4. neither tool → size only, with the applied check stated explicitly.
+  A release published before checksums existed says so instead of silently
+  skipping. A real mismatch refuses the install, prints expected vs actual, and
+  leaves nothing behind.
+- **A pure-bash hash is not viable**, and is documented as such in the code:
+  bash variables cannot hold NUL bytes (so it cannot be byte-faithful), and a
+  per-byte loop measures ~4 KB/s on this device — about an hour for the 15 MB
+  binary. Measured, not assumed.
+- Bug found while testing: the `cksum` byte count was read from the wrong output
+  field (`CRC SIZE FILENAME`), so the length cross-check always failed for hosts
+  without `md5sum`. Fixed; covered by the suite's `C1 bad-crc` / `C1 no-md5` paths.
+
+Verified: 66-check suite green, covering all five verification outcomes
+(md5 path, crc32 path, size-only path, wrong crc32 → refuse, wrong size →
+refuse), plus the live install path.

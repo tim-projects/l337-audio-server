@@ -137,7 +137,8 @@ version_gt() {
 # a binary may have been built on to still run here. Empty when undetectable
 # (non-glibc platforms, where it is never consulted).
 system_glibc_version() {
-    local v=""
+    local v="" loader prefix
+    # 1. Native glibc systems (Debian, Fedora, ...)
     if command -v ldd >/dev/null 2>&1; then
         v=$(ldd --version 2>/dev/null | head -1 \
             | sed -n 's/.*[[:space:]]\([0-9][0-9]*\.[0-9][0-9.]*\)[[:space:]]*$/\1/p')
@@ -145,6 +146,19 @@ system_glibc_version() {
     if [ -z "$v" ] && command -v getconf >/dev/null 2>&1; then
         v=$(getconf GNU_LIBC_VERSION 2>/dev/null \
             | sed -n 's/.*glibc[[:space:]]*\([0-9][0-9]*\.[0-9][0-9.]*\).*/\1/p')
+    fi
+    # 2. Termux with the termux-glibc package. The system `ldd`/`getconf` are
+    #    Bionic and report nothing here, so glibc would look absent and the
+    #    glibc filter would silently accept any release. The glibc dynamic
+    #    loader shipped in $PREFIX/glibc answers for itself.
+    prefix="${PREFIX:-}"
+    if [ -z "$v" ] && [ -n "$prefix" ] && [ -d "$prefix/glibc/lib" ]; then
+        for loader in "$prefix"/glibc/lib/ld-linux-*.so.1; do
+            [ -f "$loader" ] || continue
+            v=$("$loader" --version 2>/dev/null | head -1 \
+                | sed -n 's/.*version[[:space:]]\([0-9][0-9.]*\).*/\1/p')
+            [ -n "$v" ] && break
+        done
     fi
     printf '%s' "$v"
 }
@@ -159,7 +173,15 @@ SYSTEM_GLIBC=""
 if [ "$OS_TYPE" = "linux" ]; then
     SYSTEM_GLIBC=$(system_glibc_version)
     if [ -n "$SYSTEM_GLIBC" ]; then
-        info "System glibc: $SYSTEM_GLIBC (releases record the glibc each binary needs in release-info.json)"
+        if [ "$OS_VARIANT" = "termux" ]; then
+            info "System glibc: $SYSTEM_GLIBC (termux-glibc; releases record the glibc each binary needs in release-info.json)"
+        else
+            info "System glibc: $SYSTEM_GLIBC (releases record the glibc each binary needs in release-info.json)"
+        fi
+    elif [ "$OS_VARIANT" = "termux" ]; then
+        # Bionic only (no termux-glibc package): the Android build is statically
+        # linked against Bionic, so there is no glibc to compare against.
+        info "No glibc present (Bionic-only Termux); the Android build does not use glibc."
     else
         warn "Could not determine the system glibc version; picking the newest release with any glibc requirement."
     fi
@@ -236,6 +258,26 @@ release_info_glibc() {
     printf '%s' "$value"
 }
 
+# One field ("md5", "crc32", "size") of a release-info.json "checksums" entry
+# for asset $2. Returns 1 when the manifest has no checksums for it (an older
+# release): verification is then skipped, not failed.
+release_info_checksum() {
+    local info_file="$1" asset="$2" key="$3" section block
+
+    [ -f "$info_file" ] || return 1
+    # Restrict to the "checksums" object: the same asset key also appears under
+    # "assets" and "needed_shared_libs", and the first match in the file would
+    # be the wrong one.
+    section=$(sed -n '/"checksums"[[:space:]]*:[[:space:]]*{/,/^  }/p' "$info_file" 2>/dev/null) || true
+    [ -z "$section" ] && return 1
+    block=$(printf '%s\n' "$section" \
+        | sed -n "/\"$asset\"[[:space:]]*:[[:space:]]*{/,/^    }/p")
+    [ -z "$block" ] && return 1
+
+    printf '%s\n' "$block" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[^,]*" | head -1 \
+        | sed 's/.*:[[:space:]]*//; s/^"//; s/,$//; s/"$//'
+}
+
 # Walk releases newest-first and resolve the newest one that is installable
 # here: it must publish ${BINARY_ASSET}, and on glibc platforms its own
 # release-info.json must record a glibc the running libc can satisfy. A release
@@ -249,6 +291,9 @@ resolve_installable_release() {
 
     TAG=""
     DOWNLOAD_URL=""
+    SELECTED_MD5=""
+    SELECTED_CRC32=""
+    SELECTED_SIZE=""
 
     while IFS=$'\t' read -r tag pre name url; do
         # --pre-release walks prereleases newest-first; a plain install walks
@@ -274,9 +319,15 @@ resolve_installable_release() {
         fi
 
         req=$(release_info_glibc "$info_file" "$name") || { rm -f "$info_file"; continue; }
+        # The manifest's checksums for this asset, read while the manifest is
+        # still around; releases that publish none are not rejected.
+        SELECTED_MD5=$(release_info_checksum "$info_file" "$name" md5 || true)
+        SELECTED_CRC32=$(release_info_checksum "$info_file" "$name" crc32 || true)
+        SELECTED_SIZE=$(release_info_checksum "$info_file" "$name" size || true)
         rm -f "$info_file"
 
-        if [ "$req" != "none" ] && [ -n "$SYSTEM_GLIBC" ] && version_lt "$SYSTEM_GLIBC" "$req"; then
+        if [ "$req" != "none" ] && [ -n "$SYSTEM_GLIBC" ] \
+           && version_lt "${SYSTEM_GLIBC%%-*}" "${req%%-*}"; then
             info "Release ${tag} needs glibc ${req} (system has ${SYSTEM_GLIBC}) — skipping"
             continue
         fi
@@ -365,7 +416,7 @@ if [ -n "$INSTALLED_BIN" ] && [ -f "$INSTALLED_BIN" ] && [ -x "$INSTALLED_BIN" ]
         info "Installed version: $INSTALLED_VERSION"
         if [ "$INSTALLED_VERSION" = "$SCRIPT_TAG" ]; then
             if [ "$FORCE" = true ]; then
-                info "Force reinstall requested for the same version ($INSTALLED_VERSION)"
+                info "Force reinstall requested for the same version ($INSTALLED_VERSION) — re-downloading"
             else
                 ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
                 echo
@@ -377,7 +428,7 @@ if [ -n "$INSTALLED_BIN" ] && [ -f "$INSTALLED_BIN" ] && [ -x "$INSTALLED_BIN" ]
             info "Update available ($INSTALLED_VERSION -> $SCRIPT_TAG)"
         else
             if [ "$FORCE" = true ]; then
-                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($SCRIPT_TAG)"
+                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($SCRIPT_TAG) — re-downloading"
             else
                 ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($SCRIPT_TAG)"
                 echo
@@ -413,6 +464,68 @@ case "$HTTP_CODE" in
 The release was verified to publish this asset moments ago; if this repeats the
 asset may have been removed. Re-run the installer." ;;
 esac
+
+# Verify the download before anything is installed.
+#
+# Layered on purpose, because the verification tools are not equally portable:
+#   1. SIZE   — needs no tool at all (curl reports what it transferred), so a
+#               truncated transfer is caught everywhere.
+#   2. MD5    — strongest, via md5sum (coreutils).
+#   3. CRC32  — POSIX `cksum`, which both coreutils and busybox ship, so it
+#               covers a host without md5sum.
+# A missing hash tool is never a hard failure: the size check plus the install
+# verification the platform installer already does are the fallback, and the
+# user is told precisely which check was applied.
+# (A pure-bash hash is not an option: bash cannot hold NUL bytes, and a per-byte
+# loop in bash measures ~4 KB/s, i.e. about an hour for a 15 MB binary.)
+DOWNLOAD_SIZE=$(wc -c < "$BINARY_FILE" 2>/dev/null | tr -d '[:space:]')
+VERIFY_METHOD=""
+if [ -n "$SELECTED_SIZE" ] && [ -n "$DOWNLOAD_SIZE" ]; then
+    if [ "$DOWNLOAD_SIZE" != "$SELECTED_SIZE" ]; then
+        rm -f "$BINARY_FILE"
+        fail "Downloaded ${BINARY_ASSET} is ${DOWNLOAD_SIZE} bytes but release ${TAG} publishes ${SELECTED_SIZE}.
+The download was truncated; nothing was installed. Re-run."
+    fi
+    VERIFY_METHOD="size"
+    ok "Verified ${BINARY_ASSET} (size ${DOWNLOAD_SIZE} bytes)"
+fi
+
+if [ -n "$SELECTED_MD5" ] && command -v md5sum >/dev/null 2>&1; then
+    DOWNLOAD_MD5=$(md5sum "$BINARY_FILE" | awk '{print $1}')
+    if [ -n "$DOWNLOAD_MD5" ] && [ "$DOWNLOAD_MD5" != "$SELECTED_MD5" ]; then
+        rm -f "$BINARY_FILE"
+        fail "Downloaded ${BINARY_ASSET} does not match the published checksum.
+  expected md5: ${SELECTED_MD5}
+  actual md5:   ${DOWNLOAD_MD5}
+The download was corrupted; nothing was installed. Re-run."
+    fi
+    VERIFY_METHOD="size+md5"
+    ok "Verified ${BINARY_ASSET} (md5 ${DOWNLOAD_MD5})"
+elif [ -n "$SELECTED_CRC32" ] && command -v cksum >/dev/null 2>&1; then
+    # cksum prints "<crc32> <bytes> <filename>", so it also re-checks the length.
+    CKSUM_OUT=$(cksum "$BINARY_FILE" 2>/dev/null) || CKSUM_OUT=""
+    read -r CK_CRC CK_LEN _ <<<"$CKSUM_OUT"
+    if [ -n "$CK_CRC" ] && [ "$CK_CRC" != "$SELECTED_CRC32" ]; then
+        rm -f "$BINARY_FILE"
+        fail "Downloaded ${BINARY_ASSET} does not match the published checksum.
+  expected crc32: ${SELECTED_CRC32}
+  actual crc32:   ${CK_CRC}
+The download was corrupted; nothing was installed. Re-run."
+    fi
+    if [ -n "$SELECTED_SIZE" ] && [ -n "$CK_LEN" ] && [ "$CK_LEN" != "$SELECTED_SIZE" ]; then
+        rm -f "$BINARY_FILE"
+        fail "Downloaded ${BINARY_ASSET} is ${CK_LEN} bytes but release ${TAG} publishes ${SELECTED_SIZE}.
+The download was truncated; nothing was installed. Re-run."
+    fi
+    VERIFY_METHOD="size+crc32"
+    ok "Verified ${BINARY_ASSET} (crc32 ${CK_CRC})"
+elif [ -n "$SELECTED_MD5" ]; then
+    # The manifest has a checksum but no tool on this host can compute it.
+    info "No md5sum/cksum on PATH; verified ${BINARY_ASSET} by size only (${DOWNLOAD_SIZE:-?} bytes)"
+else
+    # A release published before checksums were recorded: nothing to check against.
+    info "Release ${TAG} publishes no checksum for ${BINARY_ASSET}; nothing to verify against"
+fi
 
 ok "Downloaded ${BINARY_ASSET} (release ${TAG}) -> ${BINARY_FILE}"
 

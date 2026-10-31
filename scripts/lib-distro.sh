@@ -408,6 +408,28 @@ ensure_audio_libs() {
 }
 
 # ---------------------------------------------------------------------------
+# wait_until_ok() — poll a predicate until it succeeds.
+#
+#   wait_until_ok <seconds> <command> [args...]
+#
+# Returns 0 as soon as the command succeeds, 1 after the timeout. A single
+# `sleep 1` is a guess: systemd can need several seconds to bring a unit up after
+# exec start, and a too-short wait turns a healthy service into a false failure
+# (and a needless binary rollback).
+# ---------------------------------------------------------------------------
+wait_until_ok() {
+    local timeout="$1"; shift
+    local deadline=$(( SECONDS + timeout ))
+    while ! "$@" >/dev/null 2>&1; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Auto-detect distro when the library is sourced (silent on success).
 # Re-detection happens if the vars are unset (e.g. function called in a subshell).
 # ---------------------------------------------------------------------------

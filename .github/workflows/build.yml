@@ -460,7 +460,7 @@ jobs:
         REL_VERSION: ${{ needs.determine-version.outputs.version }}
       run: |
         python3 - <<'PY'
-        import json, subprocess, pathlib, datetime, os
+        import hashlib, json, subprocess, pathlib, datetime, os
 
         # Always provided by the loader / libc itself; not an install dependency.
         BASE_LIBS = {"ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
@@ -473,11 +473,25 @@ jobs:
         # resolved by the loader before main(), so a host missing one cannot
         # exec the binary in ANY mode (dummy = true included). Recording them
         # per asset also documents which builds carry Opus (armv7/riscv64 do).
-        needed = {}
+        # MD5 of every released asset, so an installer can verify what it
+        # downloaded byte-for-byte before installing it. A truncated or corrupted
+        # transfer (curl -f can still deliver a short body) is otherwise
+        # installed silently. Recorded per asset, keyed by the final filename.
+        # crc32 (from POSIX `cksum`, present in coreutils AND busybox) and the
+        # byte size go with it, so a host without md5sum can still verify.
+        md5s = {}
+        crc32s = {}
+        sizes = {}
 
         for f in sorted(p for p in root.rglob("*") if p.is_file()):
             if f.name.endswith(".d") or f.name == "release-info.json":
                 continue
+            data = f.read_bytes()
+            sizes[f.name] = len(data)
+            md5s[f.name] = hashlib.md5(data).hexdigest()
+            crc32s[f.name] = subprocess.run(
+                ["cksum", str(f)], capture_output=True, text=True
+            ).stdout.split()[0]
             ver = subprocess.run(["readelf", "-V", str(f)],
                                  capture_output=True, text=True).stdout
             versions = set()
@@ -519,6 +533,14 @@ jobs:
                      if linux_glibc else None,
             "assets": assets,
             "needed_shared_libs": needed,
+            "checksums": {
+                name: {
+                    "md5": md5s[name],
+                    "crc32": crc32s[name],
+                    "size": sizes[name],
+                }
+                for name in sorted(md5s)
+            },
         }
         pathlib.Path("release-info.json").write_text(
             json.dumps(info, indent=2) + "\n")

@@ -487,8 +487,9 @@ EOF
     systemctl enable l337-audio-server.service
     systemctl start l337-audio-server.service || true
 
-    sleep 1
-    if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
+    # Verify it actually came up: the unit can take several seconds after
+    # `exec start`, so poll rather than assume a single second is enough.
+    if wait_until_ok 15 systemctl is-active --quiet l337-audio-server.service; then
         ok "Systemd service installed and started"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
@@ -520,8 +521,7 @@ EOF
             chown "$USER_NAME:$GROUP_NAME" "$INSTALL_DIR/l337-audio-server"
             systemctl daemon-reload
             systemctl start l337-audio-server.service 2>/dev/null || true
-            sleep 1
-            if systemctl is-active --quiet l337-audio-server.service 2>/dev/null; then
+            if wait_until_ok 15 systemctl is-active --quiet l337-audio-server.service; then
                 warn "Rollback successful — old binary restored and running"
                 rm -f "$INSTALL_DIR/l337-audio-server.bak"
                 rm -rf "$INSTALL_DIR/.tmp"
@@ -640,6 +640,13 @@ if [ "$UNINSTALL" = true ]; then
     check_command "systemctl"
     uninstall_linux
     exit 0
+fi
+
+if [ ! -f "${BINARY_INPUT}" ]; then
+    fail "No binary given. This installer does not download one: run install.sh, or
+pass the path yourself:
+    bash $0 --binary <path-to-l337-audio-server>
+(uninstall always works:  bash $0 --uninstall)"
 fi
 
 require_root

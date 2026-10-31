@@ -258,8 +258,10 @@ remove_dependency_if_confirmed() {
 UNINSTALL=false
 REMOVE_DATA=false
 AUTO_INSTALL_DEPS=true
-BINARY_INPUT=""
-RELEASE_TAG=""
+# Binary handed over by install.sh (which owns release lookup and the download).
+# Read here so the command line can still override it below.
+BINARY_INPUT="${L337_BINARY_PATH:-}"
+RELEASE_TAG="${L337_RELEASE_TAG:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --binary)                  BINARY_INPUT="$2"; shift 2 ;;
@@ -449,12 +451,10 @@ ok "pulseaudio: $(command -v pulseaudio)"
 # --- Binary: resolved and downloaded by install.sh, handed over as a path ---
 # All GitHub work (which release is newest with our binary, glibc checks, the
 # version comparison and the download itself) lives in install.sh, so this
-# installer never contacts GitHub. Accepting a path on the command line is how
-# the binary arrives; there is deliberately no download fallback here, so a
-# standalone run of this script fails loudly instead of duplicating the walk.
-BINARY_INPUT="${L337_BINARY_PATH:-}"
-RELEASE_TAG="${L337_RELEASE_TAG:-}"
-
+# installer never contacts GitHub. The path arrives via --binary (or the
+# L337_BINARY_PATH environment variable, resolved during argument parsing
+# above); there is deliberately no download fallback here, so a standalone run
+# of this script fails loudly instead of duplicating the walk.
 if [ ! -f "${BINARY_INPUT}" ]; then
     fail "No binary given. This installer does not download one: run install.sh, or
 pass the path yourself:
@@ -563,6 +563,17 @@ sv up "${SERVICE_NAME}" || fail "sv up failed.
 If termux-services was installed in THIS session, runit is not running yet —
 open a NEW Termux session and re-run. Otherwise: 'sv status ${SERVICE_NAME}'"
 
+# Enable so the service comes back on its own when Termux is restarted. A
+# failure here is not fatal: the service is running now, only auto-start would
+# be missing, which `sv-enable` can still fix later.
+if command -v sv-enable >/dev/null 2>&1; then
+    if sv-enable "${SERVICE_NAME}" >/dev/null 2>&1; then
+        ok "Service enabled at boot: ${SERVICE_NAME}"
+    else
+        warn "Could not enable the service at boot; run:  sv-enable ${SERVICE_NAME}"
+    fi
+fi
+
 # Give the server a moment to create its socket + token, then link it. If the
 # service is not actually running, the server exited at startup (typically an
 # audio-backend init failure) — warn instead of silently declaring success.
@@ -574,9 +585,26 @@ for _ in $(seq 1 10); do
     sleep 1
 done
 if [ "$ok" = true ]; then
-    ensure_socket_symlink || warn "Socket not found yet; check 'sv status ${SERVICE_NAME}'"
+    ok "Service running: $(sv status "${SERVICE_NAME}" 2>/dev/null | tr -s ' ')"
+    # Verify it is really serving, not just supervised: runit reports "run" for
+    # a process that can still be mid-startup (or unable to bind). The termux
+    # build runs with --transport=socket, so its Unix socket is the listening
+    # endpoint — the TCP port in server.ini is not opened by this transport.
+    socket_up=false
+    for _ in $(seq 1 15); do
+        [ -S "${SOCKET_SOURCE}" ] && { socket_up=true; break; }
+        sleep 1
+    done
+    if [ "$socket_up" = true ]; then
+        ok "Verified: Unix socket ${SOCKET_SOURCE}"
+        ensure_socket_symlink || warn "Socket not linked yet; check 'sv status ${SERVICE_NAME}'"
+    else
+        warn "VERIFICATION FAILED: the service runs but no Unix socket appeared at"
+        warn "${SOCKET_SOURCE} within 15s — the server may still be starting or"
+        warn "cannot bind. Check:  sv status ${SERVICE_NAME}"
+    fi
 else
-    warn "Service is not running: 'sv status ${SERVICE_NAME}'"
+    warn "VERIFICATION FAILED: 'sv status ${SERVICE_NAME}' does not report run:"
     if [ ! -f "${PREFIX}/lib/libopus.so" ]; then
         # DT_NEEDED libopus.so is resolved before main(); dummy = true cannot
         # help a loader failure, so say the real cause.
@@ -590,13 +618,15 @@ else
     fi
 fi
 
-ok "Service registered: ${SERVICE_NAME}"
+ok "Service registered and started: ${SERVICE_NAME}"
 echo
 echo "  Service controls:"
 echo "    sv up ${SERVICE_NAME}       # start"
 echo "    sv down ${SERVICE_NAME}     # stop"
+echo "    sv restart ${SERVICE_NAME}  # restart after editing server.ini"
 echo "    sv status ${SERVICE_NAME}   # check"
-echo "    sv-enable ${SERVICE_NAME}   # auto-start on Termux launch"
+echo "    sv-enable ${SERVICE_NAME}   # auto-start on Termux launch (already done)"
+echo "    sv-disable ${SERVICE_NAME}  # stop starting at boot"
 echo
 echo "  Token: ${HOME}/.cache/l337/l337-audio-server/server_token.txt"
 

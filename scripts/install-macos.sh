@@ -226,9 +226,29 @@ EOF
 </plist>
 EOF
 
-    if launchctl list | grep -q "$PLIST_LABEL"; then
+    # Load the LaunchAgent into the user's GUI session. `bootstrap`/`bootout` are
+    # the supported interface on current macOS; `load`/`unload` are kept as the
+    # fallback for older releases.
+    launchd_load() {
+        local uid
+        uid="$(id -u)"
+        launchctl bootstrap "gui/$uid" "$plist_path" 2>/dev/null \
+            || launchctl load "$plist_path" 2>/dev/null || true
+    }
+    launchd_unload() {
+        local uid
+        uid="$(id -u)"
+        launchctl bootout "gui/$(id -u)" "$plist_path" 2>/dev/null \
+            || launchctl unload "$plist_path" 2>/dev/null || true
+    }
+    # launchd can take a moment to register the job after loading.
+    launchd_active() {
+        launchctl list | grep -q "$PLIST_LABEL"
+    }
+
+    if launchd_active; then
         info "Stopping existing service..."
-        launchctl unload "$plist_path" 2>/dev/null || true
+        launchd_unload
     fi
 
     info "Replacing binary..."
@@ -238,8 +258,13 @@ EOF
     mv "$bin_path" "$INSTALL_DIR/l337-audio-server"
     chmod 0755 "$INSTALL_DIR/l337-audio-server"
 
-    launchctl load "$plist_path" || true
-    if launchctl list | grep -q "$PLIST_LABEL"; then
+    launchd_load
+    tries=0
+    while ! launchd_active && [ "$tries" -lt 10 ]; do
+        tries=$((tries + 1))
+        sleep 1
+    done
+    if launchd_active; then
         ok "Launchd service installed and started"
         rm -f "$INSTALL_DIR/l337-audio-server.bak"
         rm -rf "$INSTALL_DIR/.tmp"
@@ -247,14 +272,14 @@ EOF
     fi
 
     warn "New binary failed to load. Rolling back..."
-    if launchctl list | grep -q "$PLIST_LABEL"; then
-        launchctl unload "$plist_path" 2>/dev/null || true
+    if launchd_active; then
+        launchd_unload
     fi
     if [ -f "$INSTALL_DIR/l337-audio-server.bak" ]; then
         if mv "$INSTALL_DIR/l337-audio-server.bak" "$INSTALL_DIR/l337-audio-server" 2>/dev/null; then
             chmod 0755 "$INSTALL_DIR/l337-audio-server"
-            launchctl load "$plist_path" || true
-            if launchctl list | grep -q "$PLIST_LABEL"; then
+            launchd_load
+            if launchd_active; then
                 warn "Rollback successful — old binary restored"
                 rm -f "$INSTALL_DIR/l337-audio-server.bak"
                 rm -rf "$INSTALL_DIR/.tmp"
@@ -280,7 +305,8 @@ uninstall_macos() {
     local binary_path="${INSTALL_DIR}/l337-audio-server"
 
     if launchctl list | grep -q "$PLIST_LABEL"; then
-        launchctl unload "$plist_path" 2>/dev/null || true
+        launchctl bootout "gui/$(id -u)" "$plist_path" 2>/dev/null \
+            || launchctl unload "$plist_path" 2>/dev/null || true
     fi
 
     # launchd only manages the agent. A foreground instance is invisible to it,
@@ -358,6 +384,13 @@ if [ "$UNINSTALL" = true ]; then
     check_command "launchctl"
     uninstall_macos
     exit 0
+fi
+
+if [ ! -f "${BINARY_INPUT}" ]; then
+    fail "No binary given. This installer does not download one: run install.sh, or
+pass the path yourself:
+    bash $0 --binary <path-to-l337-audio-server>
+(uninstall always works:  bash $0 --uninstall)"
 fi
 
 check_dependencies

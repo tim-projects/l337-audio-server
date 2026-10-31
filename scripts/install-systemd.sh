@@ -685,12 +685,10 @@ verify_installation() {
     echo "POST-INSTALL VERIFICATION"
     echo "---------------------------------------------------------------------"
 
-    sleep 2
-
-    if systemctl is-active --quiet l337-audio-server.service; then
-        ok "Service is active"
-    else
-        local last_log
+    # Poll rather than assume two seconds is enough: systemd can need longer to
+    # bring the unit up, and a too-short wait turns a healthy service into a
+    # false failure.
+    if ! wait_until_ok 15 systemctl is-active --quiet l337-audio-server.service; then
         last_log=$(journalctl -u l337-audio-server.service -n 5 --no-pager 2>/dev/null || true)
         if echo "$last_log" | grep -qi "no audio output device\|unknown pcm default\|cannot find card"; then
             warn "Service is NOT active because no audio device is available on this machine."
@@ -700,6 +698,8 @@ verify_installation() {
         else
             fail "Service is NOT active. Check logs with: sudo journalctl -u l337-audio-server.service -f"
         fi
+    else
+        ok "Service is active"
     fi
 
     if systemctl is-enabled --quiet l337-audio-server.service; then

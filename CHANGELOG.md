@@ -49,6 +49,53 @@ with the new version heading.
   attacker-placeable file executed as root.
 
 ### Changed
+- **Platform installers now enable, start and verify the service.**
+  - Termux: `sv-enable` makes the service come back on its own when Termux is
+    restarted, and the install verifies the service is supervised *and* that the
+    server actually created its listening endpoint — the Unix socket the
+    `--transport=socket` build uses — reporting the PID and the socket path.
+  - Linux ALSA / PipeWire and the local-build systemd installer poll
+    (`wait_until_ok`, new in `scripts/lib-distro.sh`) until the unit reports
+    active instead of assuming a fixed `sleep` is enough, so a healthy service
+    is no longer misreported as failed (and rolled back) on a slow host.
+  - macOS loads the LaunchAgent with `launchctl bootstrap gui/<uid>` (falling
+    back to `launchctl load` on older releases) and verifies the job is
+    registered before declaring success; `bootout` is used on uninstall.
+- `install.sh` now reports the glibc version found on a **termux-glibc** device.
+  The dynamic loader in `$PREFIX/glibc/lib` answers for the system `ldd`/`getconf`
+  (Bionic, silent), so glibc is detected instead of reported as absent, and the
+  version comparison ignores the distro package revision (`2.44-0` compares as
+  `2.44`). A Bionic-only Termux device says so instead of warning it cannot tell.
+- A standalone run of a platform installer without `--binary` now fails with an
+  actionable message on every installer (previously only Termux had it, and the
+  others died deeper in on an empty path).
+
+### Fixed
+- **The download was never verified**, so a truncated or corrupted transfer could
+  be installed silently as a valid-looking (still ELF-headed) binary. Every
+  release now publishes a per-asset checksum block (`md5`, `crc32`, `size`) in
+  `release-info.json`, and `install.sh` verifies the download before installing.
+- **`md5sum` was a hard dependency**: a host without coreutils failed the install
+  even though the checksum was published. Verification is now layered and never
+  hard-fails on a missing tool: byte size always (needs no tool), then `md5sum`
+  when present, then POSIX `cksum` (crc32 — shipped by both coreutils **and**
+  busybox, so it covers hosts without md5sum). With neither tool it verifies size
+  only and says exactly which check was applied. A pure-bash hash is not
+  possible: bash variables cannot hold NUL bytes, and a per-byte loop measures
+  ~4 KB/s (about an hour for a 15 MB binary).
+- `cksum`'s byte count was read from the wrong output field
+  (`CRC SIZE FILENAME`), so the length cross-check always failed on hosts without
+  `md5sum`.
+- `scripts/install-android-termux.sh` re-read `L337_BINARY_PATH` **after**
+  argument parsing, so it overwrote the `--binary` path install.sh had just
+  passed and every install ended in "No binary given" after the download.
+  The environment fallback is now resolved before parsing, as in the other
+  installers.
+- The install-time verification probed TCP `127.0.0.1:<port>`, but the Termux
+  build runs with `--transport=socket` and never opens that port, so a working
+  install always reported "not answering". It now verifies the Unix socket.
+- `--force` re-downloading is now stated explicitly in the output
+  ("Force reinstall requested ... — re-downloading").
 - **All GitHub access moved out of the platform installers into `install.sh`.**
   `install-android-termux.sh`, `install-linux-alsa.sh`, `install-linux-pipewire.sh`
   and `install-macos.sh` no longer query the GitHub API, walk releases, compare
@@ -63,7 +110,6 @@ with the new version heading.
 - `install_verification_tools()` in `install-systemd.sh` refactored to use the
   shared library's per-distro dispatch instead of its own duplicated table.
 
-### Fixed
 - **Termux/macOS installers resolved the latest release unconditionally**, so a
   release that did not publish this platform's binary died with a 404. Against
   the real API the binary download 404s when the newest release only carried
