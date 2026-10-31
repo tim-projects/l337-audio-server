@@ -2,24 +2,22 @@
 # install-android-termux.sh — Termux binary installer (runit/termux-services, no systemd)
 # Requirements: Termux + aarch64 + termux-services + running pulseaudio.
 #
-# Every release ships a release-info.json beside its binaries listing the assets
-# that release actually contains. Releases are walked newest-first and the newest
-# one whose release-info.json confirms the Termux binary is in it is installed, so
-# a partial release (e.g. a targeted CI build that publishes only some targets)
-# is skipped instead of downloading into a 404.
+# This installer never talks to GitHub: install.sh resolves the newest release
+# that publishes the Termux binary (walking releases and reading each release's
+# release-info.json, so a partial release is skipped instead of downloading into
+# a 404), downloads it, and passes the path with --binary. Give the path yourself
+# or run install.sh.
 # Missing packages are installed automatically unless --no-install-deps is
 # given; anything that needs a decision is reported as a numbered instruction.
 #
 # Usage:
-#   bash scripts/install-android-termux.sh                            # install/update
-#   bash scripts/install-android-termux.sh --pre-release              # install prerelease
-#   bash scripts/install-android-termux.sh --no-install-deps          # never install packages
-#   bash scripts/install-android-termux.sh --uninstall                # remove service + binary
-#   bash scripts/install-android-termux.sh --uninstall --remove-data  # also delete data
+#   install.sh --pre-release                                        # install/update (recommended)
+#   bash scripts/install-android-termux.sh --binary <path>           # install a downloaded binary
+#   bash scripts/install-android-termux.sh --no-install-deps         # never install packages
+#   bash scripts/install-android-termux.sh --uninstall               # remove service + binary
+#   bash scripts/install-android-termux.sh --uninstall --remove-data # also delete data
 set -euo pipefail
 
-REPO="tim-projects/l337-audio-server"
-# ASSET is selected below based on the host Termux libc flavor.
 INSTALL_DIR="${HOME}/.local/share/l337-player/bin"
 BINARY_PATH="${INSTALL_DIR}/l337-audio-server"
 SERVICE_NAME="l337-audio-server"
@@ -257,18 +255,20 @@ remove_dependency_if_confirmed() {
 }
 
 # Parse arguments
-INSTALL_PRERELEASE=false
 UNINSTALL=false
 REMOVE_DATA=false
 AUTO_INSTALL_DEPS=true
+BINARY_INPUT=""
+RELEASE_TAG=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
+        --binary)                  BINARY_INPUT="$2"; shift 2 ;;
+        --release)                 RELEASE_TAG="$2"; shift 2 ;;
         --uninstall|-u)             UNINSTALL=true; shift ;;
         --remove-data)              REMOVE_DATA=true; shift ;;
         --no-install-deps)          AUTO_INSTALL_DEPS=false; shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--uninstall] [--remove-data] [--no-install-deps]"
+            echo "Usage: $0 [--binary <path>] [--release <tag>] [--uninstall] [--remove-data] [--no-install-deps]"
             echo ""
             echo "Installs l337-audio-server for Termux (android build) and"
             echo "registers it as a termux-services (runit) service."
@@ -284,10 +284,14 @@ while [ $# -gt 0 ]; do
             echo "  - libopus present when built with --features opus: pkg install libopus"
             echo ""
             echo "Options:"
-            echo "  --pre-release       Install latest prerelease instead of stable release"
-            echo "  --uninstall, -u     Remove the service and installed binary (keeps data)"
-            echo "  --remove-data       With --uninstall: also delete playlists, token and logs"
-            echo "  --no-install-deps   Do not install missing packages automatically"
+            echo "  --binary <path>        Install this downloaded binary (usually passed by install.sh)"
+            echo "  --release <tag>        Release tag the binary came from (informational)"
+            echo "  --uninstall, -u        Remove the service and installed binary (keeps data)"
+            echo "  --remove-data          With --uninstall: also delete playlists, token and logs"
+            echo "  --no-install-deps      Do not install missing packages automatically"
+            echo ""
+            echo "Release lookup, version checks and the download live in install.sh,"
+            echo "which resolves the release and passes --binary here."
             echo ""
             echo "On uninstall you are asked, one package at a time, whether to also"
             echo "remove the packages this server needed. Interactively that is a"
@@ -315,10 +319,6 @@ if [ "$UNINSTALL" = true ]; then
     uninstall_termux
     exit 0
 fi
-
-# Termux uses the bionic (NDK) android build, which is linked against
-# libpulse.so (built with `--features pulseaudio` in CI).
-ASSET="l337-audio-server-aarch64-android-termux"
 
 # --- Requirement checks ---
 # Requirements are split into two buckets so the ones that are just a missing
@@ -446,152 +446,49 @@ report_requirements
 ok "sv found: $(command -v sv) (termux-services)"
 ok "pulseaudio: $(command -v pulseaudio)"
 
-# --- Determine release tag + binary URL ---
-# A partial release can be published without this platform's binary (e.g. a
-# targeted workflow_dispatch build: 2026.10.29-6/-7 shipped only the x86_64
-# Linux assets). The newest release is therefore not always installable here,
-# so releases are walked newest-first and the first one whose release-info.json
-# confirms ${ASSET} is in it wins; a release without our binary is skipped, not
-# turned into a 404 at download time.
-RELEASE_RESPONSE=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX")
-HTTP_CODE=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-    -o "$RELEASE_RESPONSE" -w '%{http_code}' \
-    "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
-    rm -f "$RELEASE_RESPONSE"
-    fail "Failed to contact GitHub Releases API. Check network connectivity."
-}
-# curl exits 0 on a 403/5xx body (rate limits, outages), and an error body
-# flattens to zero asset rows — which would be misreported below as "no
-# release publishes our asset". Surface the API's own message instead.
-if [ "$HTTP_CODE" != "200" ]; then
-    API_MESSAGE=$(grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$RELEASE_RESPONSE" \
-        | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
-    rm -f "$RELEASE_RESPONSE"
-    fail "GitHub returned HTTP ${HTTP_CODE} while listing releases. ${API_MESSAGE:-Check network connectivity and try again later.}"
+# --- Binary: resolved and downloaded by install.sh, handed over as a path ---
+# All GitHub work (which release is newest with our binary, glibc checks, the
+# version comparison and the download itself) lives in install.sh, so this
+# installer never contacts GitHub. Accepting a path on the command line is how
+# the binary arrives; there is deliberately no download fallback here, so a
+# standalone run of this script fails loudly instead of duplicating the walk.
+BINARY_INPUT="${L337_BINARY_PATH:-}"
+RELEASE_TAG="${L337_RELEASE_TAG:-}"
+
+if [ ! -f "${BINARY_INPUT}" ]; then
+    fail "No binary given. This installer does not download one: run install.sh, or
+pass the path yourself:
+    bash $0 --binary <path-to-l337-audio-server>
+(uninstall always works:  bash $0 --uninstall)"
 fi
 
-# Flatten the release list into one line per published asset:
-#   <tag> <prerelease:0|1> <asset name> <browser download url>
-# Every name comes from the API's own "name" field, never from a URL this script
-# builds, so only an asset GitHub actually publishes in that release can be
-# selected.
-release_rows() {
-    awk '
-        /"tag_name"[[:space:]]*:/ {
-            t=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",t); sub(/".*/,"",t); tag=t; next
-        }
-        /"prerelease"[[:space:]]*:/ { pre=($0 ~ /: *true/) ? 1 : 0; next }
-        /"name"[[:space:]]*:/ {
-            n=$0; sub(/.*"name"[[:space:]]*:[[:space:]]*"/,"",n); sub(/".*/,"",n); name=n; next
-        }
-        /"browser_download_url"[[:space:]]*:/ {
-            u=$0; sub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/,"",u); sub(/".*/,"",u)
-            printf "%s\t%d\t%s\t%s\n", tag, pre, name, u
-            next
-        }
-    ' "$1"
-}
+info "Installing provided binary: ${BINARY_INPUT}"
+info "Release: ${RELEASE_TAG:-unknown}"
 
-ROWS=$(release_rows "$RELEASE_RESPONSE")
-rm -f "$RELEASE_RESPONSE"
-
-# tag -> release-info.json URL, built in one pass so the walk below never has
-# to re-scan every row (and spawn an awk) per candidate release.
-declare -A INFO_URL=()
-while IFS=$'\t' read -r r_tag r_url; do
-    [ -n "$r_tag" ] && INFO_URL["$r_tag"]="$r_url"
-done < <(printf '%s\n' "$ROWS" | awk -F'\t' \
-    '$3 == "release-info.json" { print $1 "\t" $4 }')
-
-TAG=""
-DOWNLOAD_URL=""
-SKIPPED=()
-NEWEST_TAG=""
-while IFS=$'\t' read -r r_tag r_pre r_name r_url; do
-    # --pre-release walks prereleases newest-first; a plain install walks the
-    # stable releases newest-first. Both stop at the newest one that ships our
-    # binary.
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        [ "$r_pre" = "1" ] || continue
-    else
-        [ "$r_pre" = "0" ] || continue
-    fi
-    # Newest release this mode would use if it published every asset, so the
-    # fallback below can say why an older one is installed instead.
-    [ -z "$NEWEST_TAG" ] && NEWEST_TAG="$r_tag"
-    [ "$r_name" = "$ASSET" ] || continue
-
-    # The binary must also be confirmed by that release's own release-info.json:
-    # it is generated from the artifacts that actually downloaded, so its asset
-    # map is the authoritative record of what the release contains.
-    r_info_url="${INFO_URL[$r_tag]:-}"
-    if [ -z "$r_info_url" ]; then
-        SKIPPED+=("$r_tag (no release-info.json asset)")
-        continue
-    fi
-    INFO_FILE=$(mktemp "${TMPDIR:-/tmp}/l337-revinfo.XXXXXX") || \
-        fail "Could not create a temporary file for a release manifest."
-    # -f: a 403/404/5xx body would otherwise be saved as the "manifest" and
-    # read below as "does not list the asset" — a silent skip that walks the
-    # install back to an older release. A network/API failure must fail loudly.
-    if ! curl -fsSL --connect-timeout 15 --max-time 30 \
-            -o "$INFO_FILE" "$r_info_url"; then
-        rm -f "$INFO_FILE"
-        fail "Could not download release-info.json for ${r_tag} from ${r_info_url} — the release cannot be verified. Check network connectivity and try again."
-    fi
-    # The trailing colon anchors the key so a longer asset name that merely
-    # starts with this one can never be mistaken for it.
-    if ! grep -qF "\"$ASSET\":" "$INFO_FILE"; then
-        SKIPPED+=("$r_tag (release-info.json does not list $ASSET)")
-        rm -f "$INFO_FILE"
-        continue
-    fi
-    rm -f "$INFO_FILE"
-
-    TAG="$r_tag"
-    DOWNLOAD_URL="$r_url"
-    break
-done <<<"$ROWS"
-
-if [ "${#SKIPPED[@]}" -gt 0 ]; then
-    info "Skipped releases without a Termux binary: ${SKIPPED[*]}"
-fi
-if [ -n "$TAG" ] && [ -n "$NEWEST_TAG" ] && [ "$TAG" != "$NEWEST_TAG" ]; then
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        info "Newest prerelease ${NEWEST_TAG} does not contain ${ASSET}"
-    else
-        info "Newest stable release ${NEWEST_TAG} does not contain ${ASSET}"
-    fi
-    info "Installing release ${TAG} instead, the newest one that does."
-fi
-if [ -z "$TAG" ]; then
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        fail "No prerelease for ${REPO} contains ${ASSET}. Check https://github.com/${REPO}/releases."
-    fi
-    fail "No stable release for ${REPO} contains ${ASSET}. Re-run with --pre-release to install a prerelease."
+# Validate the binary BEFORE anything is stopped or replaced.
+if ! head -c4 "${BINARY_INPUT}" | grep -q $'\x7fELF'; then
+    fail "Provided file is not a valid ELF binary (got: $(file -b "${BINARY_INPUT}" 2>/dev/null || echo unknown))"
 fi
 
-info "Latest release: $TAG"
-
-# --- Download binary ---
-mkdir -p "${INSTALL_DIR}"
-
-info "Downloading ${ASSET} (release ${TAG})..."
-if ! curl -fL --connect-timeout 15 --max-time 120 -o "${BINARY_PATH}.tmp" "${DOWNLOAD_URL}"; then
-    rm -f "${BINARY_PATH}.tmp"
-    fail "Failed to download binary from ${DOWNLOAD_URL}"
-fi
-
-# Verify ELF magic
-if ! head -c4 "${BINARY_PATH}.tmp" | grep -q $'\x7fELF'; then
-    rm -f "${BINARY_PATH}.tmp"
-    fail "Downloaded file is not a valid binary (got: $(file -b "${BINARY_PATH}.tmp"))"
-fi
-
-chmod +x "${BINARY_PATH}.tmp"
+# Stop every running instance before the binary is replaced: a survivor keeps
+# the Unix socket actively listening, and the new binary refuses to remove/rebind
+# it and exits.
 stop_existing_instances
-mv "${BINARY_PATH}.tmp" "${BINARY_PATH}"
-ok "Installed ${BINARY_PATH}"
+
+mkdir -p "${INSTALL_DIR}"
+if [ "${BINARY_INPUT}" != "${BINARY_PATH}" ]; then
+    cp "${BINARY_INPUT}" "${BINARY_PATH}"
+else
+    # Called on the already-installed file: nothing to do, just refresh it.
+    :
+fi
+chmod 0755 "${BINARY_PATH}"
+# The downloaded copy is this installer's own scratch file: remove it only after
+# it is safely in place.
+if [ "${BINARY_INPUT}" != "${BINARY_PATH}" ]; then
+    rm -f "${BINARY_INPUT}"
+fi
+ok "Installed ${BINARY_PATH} (release ${RELEASE_TAG:-unknown})"
 
 # --- Symlink socket for older player versions ---
 # The android build binds at <TMPDIR>/l337-audio-server/runtime/l337.sock.

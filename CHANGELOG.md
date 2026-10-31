@@ -32,19 +32,70 @@ with the new version heading.
   `libpulse0` on Debian, with equivalents on other distros).
 - `CHANGELOG.md` — the release workflow now uses this file's `[Unreleased]`
   section as the GitHub Release notes body.
+- `install.sh` now walks releases newest-first and picks the newest one that
+  actually publishes this platform's binary — reading each release's
+  `release-info.json` and comparing the recorded glibc against the running libc,
+  so a partial release (a targeted CI build that ships only some targets) and a
+  binary needing a newer glibc are both skipped instead of failing with
+  `curl: (22) ... 404` at download time.
+- `install.sh` downloads the binary itself into `TMPDIR` and hands the local path
+  to the platform installer with `--binary <path>` (and `--release <tag>`).
+- `--force`/`-f` flag on `install.sh`: reinstall even when the installed version
+  already matches the release being installed.
+- `install.sh` only trusts a local `scripts/install-*.sh` when it sits in a real
+  repository checkout (a directory containing `.git`); a bare directory-relative
+  path is never executed. The documented `curl ... install.sh | sudo bash` runs
+  the script from stdin, so a CWD-relative path would otherwise be an
+  attacker-placeable file executed as root.
 
 ### Changed
+- **All GitHub access moved out of the platform installers into `install.sh`.**
+  `install-android-termux.sh`, `install-linux-alsa.sh`, `install-linux-pipewire.sh`
+  and `install-macos.sh` no longer query the GitHub API, walk releases, compare
+  versions or download anything: they receive the binary path and register the
+  service. The duplicated release-walk, version-comparison and download code
+  (five copies with drifting behaviour) is gone; running a platform installer
+  without `--binary` fails with an explanatory message, and `--uninstall` still
+  works standalone.
+- macOS asset selection now matches `install-macos.sh`, which installs the
+  x86_64 build under Rosetta 2 on Apple Silicon: `install.sh` requires
+  `l337-audio-server-x86_64-apple-darwin` rather than the aarch64 asset.
 - `install_verification_tools()` in `install-systemd.sh` refactored to use the
   shared library's per-distro dispatch instead of its own duplicated table.
 
 ### Fixed
+- **Termux/macOS installers resolved the latest release unconditionally**, so a
+  release that did not publish this platform's binary died with a 404. Against
+  the real API the binary download 404s when the newest release only carried
+  other targets. `install.sh` now owns the walk and verifies the asset against
+  the release's own `release-info.json`, so only installable releases are picked.
+- A partial download left behind by an interrupted run could be mistaken for a
+  good binary: `curl -f` never truncates its `-o` target on failure, so a stale
+  non-empty file passed the "is it non-empty?" test and was installed as a
+  complete binary (it still begins with the ELF magic, so format checks miss it).
+  Success is now decided by the transfer status, and the destination is removed
+  before each attempt.
+- `curl ... install.sh | sudo bash` would prefer a `scripts/install-*.sh` from
+  the caller's working directory: the script arrives on stdin, so `$0` is `bash`
+  and a directory-relative path resolved wherever the user ran it, executing that
+  file as root. Only a real repository checkout is trusted now.
+- On Apple Silicon `install.sh` required the aarch64 asset while the macOS
+  installer installs the x86_64 build under Rosetta 2, so the two disagreed
+  about which release to use. The names now match.
+- `install.sh` called `ok()` which was never defined (a `command not found`
+  crash) on the version-check path.
+- An unparseable `--version` output (e.g. a locally built binary reporting
+  `0.0.0-dev`) compared as "newer than release" and silently blocked every
+  future update; the installed version is now only compared when it is a
+  well-formed `YYYY.MM.DD-N` release tag, and reinstalled otherwise.
+- On Termux the installed-version check never saw a version: the Android binary
+  has no `DT_RUNPATH`, so `libpulse.so` is only resolved via `LD_LIBRARY_PATH`
+  and even `--version` failed without it. Both install paths now set it for the
+  version probe, so the up-to-date check actually works.
 - Volume control makes software gain the single authoritative volume path
   (fixes a regression where hardware-volume requests were silently dropped).
 - `track_id` is now validated to prevent injection through the streaming
   endpoint.
-- `install.sh` install path now picks the newest release that actually ships a
-  binary for the caller's platform (was selecting a release that may omit certain
-  architectures).
 
 ## [2026.10.27-1] — 2026-10-27
 

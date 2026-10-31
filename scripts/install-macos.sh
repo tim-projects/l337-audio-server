@@ -1,22 +1,20 @@
 #!/bin/bash
 # install-macos.sh — macOS launchd installer
 #
-# Downloads l337-audio-server-{arch}-apple-darwin from GitHub releases and
-# installs it as a launchd user service.
+# Installs a downloaded l337-audio-server binary as a launchd user service.
 #
-# Every release ships a release-info.json beside its binaries listing the assets
-# that release actually contains. Releases are walked newest-first and the newest
-# one whose release-info.json confirms this platform's binary is in it is
-# installed, so a partial release (e.g. a targeted CI build that publishes only
-# some targets) is skipped instead of downloading into a 404.
+# This installer never talks to GitHub: install.sh resolves the newest release
+# that ships the macOS binary (walking releases and reading each release's
+# release-info.json, so a partial release is skipped instead of downloading into
+# a 404), downloads it, and passes the path with --binary. Apple Silicon installs
+# the x86_64 build, which runs under Rosetta 2.
 #
 # Usage:
-#   ./scripts/install-macos.sh
-#   ./scripts/install-macos.sh --pre-release
+#   install.sh                                              # install/update (recommended)
+#   ./scripts/install-macos.sh --binary <path>              # install a downloaded binary
 #   ./scripts/install-macos.sh --uninstall
 #   ./scripts/install-macos.sh --uninstall --remove-data
-#   ./scripts/install-macos.sh --dry-run
-#   ./scripts/install-macos.sh --force
+#   ./scripts/install-macos.sh --dry-run --binary <path>
 set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
@@ -34,9 +32,10 @@ REAL_USER="${SUDO_USER:-${USER}}"
 DRY_RUN=false
 UNINSTALL=false
 REMOVE_DATA=false
-INSTALL_PRERELEASE=false
-FORCE=false
 NO_AUDIO=false
+# Binary handed over by install.sh (which owns release lookup and the download).
+BINARY_INPUT="${L337_BINARY_PATH:-}"
+RELEASE_TAG="${L337_RELEASE_TAG:-}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,24 +64,25 @@ check_dependencies() {
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
     case "$1" in
+        --binary) BINARY_INPUT="$2"; shift 2 ;;
+        --release) RELEASE_TAG="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
-        --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
-        --force|-f) FORCE=true; shift ;;
         --no-audio) NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [OPTIONS]
+Usage: $0 [OPTIONS] --binary <path>
 
 macOS installer for L337 Audio Server.
-Downloads prebuilt binary from GitHub releases and installs as launchd user service.
+Installs a downloaded binary as a launchd user service. Release lookup, the
+version check and the download itself live in install.sh, which resolves the
+newest release that ships a macOS binary and passes --binary here.
 
 Options:
+  --binary <path>        Binary to install (required for install; passed by install.sh)
+  --release <tag>        Release tag the binary came from (informational)
   --dry-run              Show what would happen without making changes
-  --pre-release, --prerelease
-                         Install the latest prerelease instead of stable release
-  --force, -f            Force reinstall even if the same version is already installed
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
@@ -111,172 +111,6 @@ case "$ARCH" in
 esac
 
 info "Platform: $OS_TYPE / $ARCH_TYPE"
-
-# ---------------------------------------------------------------------------
-# GitHub release helpers
-# ---------------------------------------------------------------------------
-# Flatten the release list into one line per published asset:
-#   <tag> <prerelease:0|1> <asset name> <published_at> <browser download url>
-# Every name comes from the API's own "name" field, never from a URL this script
-# builds, so only an asset GitHub actually publishes in that release can be
-# selected.
-release_asset_rows() {
-    awk '
-        /"tag_name"[[:space:]]*:/ {
-            t=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",t); sub(/".*/,"",t); tag=t; next
-        }
-        /"prerelease"[[:space:]]*:/ { pre=($0 ~ /: *true/) ? 1 : 0; next }
-        /"published_at"[[:space:]]*:/ {
-            p=$0; sub(/.*"published_at"[[:space:]]*:[[:space:]]*"/,"",p); sub(/".*/,"",p); pub=p; next
-        }
-        /"name"[[:space:]]*:/ {
-            n=$0; sub(/.*"name"[[:space:]]*:[[:space:]]*"/,"",n); sub(/".*/,"",n); name=n; next
-        }
-        /"browser_download_url"[[:space:]]*:/ {
-            u=$0; sub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/,"",u); sub(/".*/,"",u)
-            printf "%s\t%d\t%s\t%s\t%s\n", tag, pre, name, pub, u
-            next
-        }
-    ' "$1"
-}
-
-# Walk releases newest-first and select the newest one that publishes $1 AND
-# confirms it in that release's own release-info.json (generated from the
-# artifacts that actually downloaded, so its asset map is authoritative). A
-# partial release — e.g. a targeted CI build that publishes only some targets —
-# is skipped instead of being downloaded into a 404. Sets SELECTED_TAG,
-# SELECTED_PUBLISHED and SELECTED_URL; returns 1 when no release qualifies.
-# shortcut: only the newest 100 releases are searched (the API page size; this
-# script does not follow pagination).
-select_release_with_asset() {
-    local want_name="$1"
-    local response rows r_tag r_pre r_name r_pub r_url
-    local r_info_url r_info_file http_code message
-
-    response=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
-        fail "Could not create a temporary file for GitHub release data."
-    http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-        -o "$response" -w '%{http_code}' \
-        "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
-        rm -f "$response"
-        fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
-    }
-    # curl exits 0 on a 403/5xx body (rate limits, outages), and an error body
-    # flattens to zero asset rows — which would be misreported below as "no
-    # release publishes our asset". Surface the API's own message instead.
-    if [ "$http_code" != "200" ]; then
-        message=$(grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$response" \
-            | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
-        rm -f "$response"
-        fail "GitHub returned HTTP ${http_code} while listing releases. ${message:-Check network connectivity or proxy settings.}"
-    fi
-    rows=$(release_asset_rows "$response")
-    rm -f "$response"
-
-    SELECTED_TAG=""
-    SELECTED_PUBLISHED=""
-    SELECTED_URL=""
-    NEWEST_TAG=""
-
-    # tag -> release-info.json URL, built in one pass so the walk below never
-    # has to re-scan every row (and spawn an awk) per candidate release.
-    declare -A INFO_URL=()
-    while IFS=$'\t' read -r r_tag r_url; do
-        [ -n "$r_tag" ] && INFO_URL["$r_tag"]="$r_url"
-    done < <(printf '%s\n' "$rows" | awk -F'\t' \
-        '$3 == "release-info.json" { print $1 "\t" $5 }')
-
-    while IFS=$'\t' read -r r_tag r_pre r_name r_pub r_url; do
-        # --pre-release walks prereleases; a plain install walks the stable
-        # releases. Both stop at the newest one that publishes our asset.
-        if [ "$INSTALL_PRERELEASE" = true ]; then
-            [ "$r_pre" = "1" ] || continue
-        else
-            [ "$r_pre" = "0" ] || continue
-        fi
-        # Newest release this mode would use if it published every asset, so the
-        # caller can say why an older one is installed instead.
-        [ -z "$NEWEST_TAG" ] && NEWEST_TAG="$r_tag"
-        [ "$r_name" = "$want_name" ] || continue
-
-        r_info_url="${INFO_URL[$r_tag]:-}"
-        if [ -z "$r_info_url" ]; then
-            continue
-        fi
-        r_info_file=$(mktemp "${TMPDIR:-/tmp}/l337-revinfo.XXXXXX") || return 1
-        # -f: a 403/404/5xx body would otherwise be saved as the "manifest" and
-        # read below as "does not list the asset" — a silent skip that walks the
-        # install back to an older release. A network/API failure must fail loudly.
-        if ! curl -fsSL --connect-timeout 15 --max-time 30 \
-                -o "$r_info_file" "$r_info_url"; then
-            rm -f "$r_info_file"
-            fail "Could not download release-info.json for ${r_tag} from ${r_info_url} — the release cannot be verified. Check network connectivity or proxy settings."
-        fi
-        # The trailing colon anchors the key so a longer asset name that merely
-        # starts with this one can never be mistaken for it.
-        if ! grep -qF "\"$want_name\":" "$r_info_file"; then
-            rm -f "$r_info_file"
-            continue
-        fi
-        rm -f "$r_info_file"
-
-        SELECTED_TAG="$r_tag"
-        SELECTED_PUBLISHED="$r_pub"
-        SELECTED_URL="$r_url"
-        break
-    done <<<"$rows"
-
-    [ -n "$SELECTED_TAG" ]
-}
-
-get_asset_name() {
-    local os="$1"
-    local arch="$2"
-    case "$os-$arch" in
-        macos-x86_64)
-            echo "l337-audio-server-x86_64-apple-darwin"
-            ;;
-        macos-aarch64)
-            warn "Apple Silicon Mac detected. Downloading x86_64 build (runs under Rosetta 2)."
-            echo "l337-audio-server-x86_64-apple-darwin"
-            ;;
-        *)
-            fail "Unsupported platform: $os/$arch"
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-download_binary() {
-    local url="$1"
-    local dest="$2"
-    local tmp="${dest}.tmp.$$"
-
-    info "Downloading: $url"
-    if ! curl -fL --connect-timeout 15 --retry 2 --retry-delay 2 -o "$tmp" "$url"; then
-        rm -f "$tmp"
-        fail "Failed to download binary from $url"
-    fi
-
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"
-        fail "Downloaded file is empty. Check the release URL."
-    fi
-
-    if ! file "$tmp" | grep -qE "ELF|Mach-O"; then
-        rm -f "$tmp"
-        fail "Downloaded file is not a valid binary (got: $(file -b "$tmp")). Check the release URL."
-    fi
-
-    chmod +x "$tmp"
-    mv "$tmp" "$dest"
-    local size
-    size=$(du -h "$dest" | cut -f1)
-    ok "Downloaded: $dest ($size)"
-}
-
 # ---------------------------------------------------------------------------
 # macOS: launchd setup
 # ---------------------------------------------------------------------------
@@ -433,46 +267,6 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Version helpers
-# ---------------------------------------------------------------------------
-get_installed_version() {
-    if [ -x "$INSTALL_DIR/l337-audio-server" ]; then
-        "$INSTALL_DIR/l337-audio-server" --version 2>/dev/null | awk '{print $NF}'
-    else
-        echo ""
-    fi
-}
-
-version_gt() {
-    local a="$1"
-    local b="$2"
-
-    if [ -z "$a" ] || [ -z "$b" ]; then
-        return 1
-    fi
-
-    local a_date="${a%-*}"
-    local a_build="${a##*-}"
-    local b_date="${b%-*}"
-    local b_build="${b##*-}"
-
-    if [ "$a_date" != "$b_date" ]; then
-        [ "$a_date" \> "$b_date" ]
-        return $?
-    fi
-
-    if [ "$a_build" = "$a" ] || [ "$b_build" = "$b" ]; then
-        return 1
-    fi
-
-    [ "$a_build" -gt "$b_build" ] 2>/dev/null
-}
-
-version_eq() {
-    [ "$1" = "$2" ]
-}
-
-# ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
 uninstall_macos() {
@@ -517,7 +311,8 @@ Stop it and re-run:  kill ${pids}"
     done
 
     # A download that fell back to /tmp leaves the whole binary there.
-    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
+    # The binary install.sh downloads lands in TMPDIR; tidy it on uninstall.
+    rm -f "${L337_BINARY_PATH:-}" "/tmp/l337-audio-server-download"
 
     if [ "$REMOVE_DATA" = true ]; then
         info "Removing user data directories..."
@@ -567,83 +362,14 @@ fi
 
 check_dependencies
 
-info "Checking for latest release..."
-ASSET_NAME=$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")
-info "Selected asset: $ASSET_NAME"
+info "Installing ${BINARY_INPUT} (release ${RELEASE_TAG:-unknown})"
 
-if ! select_release_with_asset "$ASSET_NAME"; then
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        fail "No prerelease for ${REPO} publishes ${ASSET_NAME}. Check https://github.com/${REPO}/releases."
-    fi
-    fail "No stable release for ${REPO} publishes ${ASSET_NAME}. Re-run with --pre-release to install a prerelease."
-fi
-LATEST_TAG="$SELECTED_TAG"
-PUBLISHED_AT="$SELECTED_PUBLISHED"
+setup_launchd "$BINARY_INPUT"
 
-if [ -n "$NEWEST_TAG" ] && [ "$LATEST_TAG" != "$NEWEST_TAG" ]; then
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        info "Newest prerelease ${NEWEST_TAG} does not publish ${ASSET_NAME}"
-    else
-        info "Newest stable release ${NEWEST_TAG} does not publish ${ASSET_NAME}"
-    fi
-    info "Installing release ${LATEST_TAG} instead, the newest one that does."
-fi
+# The binary was downloaded into TMPDIR by install.sh: drop it once it is
+# safely deployed.
+[ "$BINARY_INPUT" != "$INSTALL_DIR/l337-audio-server" ] && rm -f "$BINARY_INPUT"
 
-info "Latest release: $LATEST_TAG (published: $PUBLISHED_AT)"
-
-INSTALLED_VERSION=""
-if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
-    info "Existing installation found at: $INSTALL_DIR/l337-audio-server"
-    INSTALLED_VERSION=$(get_installed_version)
-
-    if [ -n "$INSTALLED_VERSION" ]; then
-        info "Installed version: $INSTALLED_VERSION"
-        if version_eq "$INSTALLED_VERSION" "$LATEST_TAG"; then
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested for the same version ($INSTALLED_VERSION)"
-            else
-                ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
-                echo
-                echo "To reinstall anyway, run with --force:"
-                echo "  $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
-                exit 0
-            fi
-        elif version_gt "$LATEST_TAG" "$INSTALLED_VERSION"; then
-            info "Update available ($INSTALLED_VERSION -> $LATEST_TAG)"
-        else
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($LATEST_TAG)"
-            else
-                ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($LATEST_TAG)"
-                echo
-                echo "To reinstall anyway, run with --force:"
-                echo "  $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
-                exit 0
-            fi
-        fi
-    else
-        warn "Could not determine installed version; will reinstall"
-    fi
-fi
-
-# The download URL comes from the selected release's own asset (matched by the
-# API's asset name, never constructed here), so a release that publishes our
-# binary can never 404 at download time.
-DOWNLOAD_URL="$SELECTED_URL"
-NEW_BIN=""
-if mkdir -p "$INSTALL_DIR/.tmp" 2>/dev/null && [ -w "$INSTALL_DIR/.tmp" ]; then
-    NEW_BIN="$INSTALL_DIR/.tmp/l337-audio-server.new"
-else
-    warn "Cannot write to $INSTALL_DIR/.tmp; falling back to /tmp (non-atomic copy)"
-    NEW_BIN="/tmp/${ASSET_NAME}.tmp"
-fi
-
-download_binary "$DOWNLOAD_URL" "$NEW_BIN"
-
-setup_launchd "$NEW_BIN"
-
-rm -f "$NEW_BIN"
-rm -rf "$INSTALL_DIR/.tmp"
 ok "Installation complete"
 echo
 echo "Next steps:"

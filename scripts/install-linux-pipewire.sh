@@ -37,11 +37,12 @@ GROUP_NAME="l337"
 DRY_RUN=false
 UNINSTALL=false
 REMOVE_DATA=false
-INSTALL_PRERELEASE=false
-FORCE=false
 NO_AUDIO=false
 TARGET_USER=""
 AUTO_INSTALL_DEPS=true
+# Binary handed over by install.sh (which owns release lookup and the download).
+BINARY_INPUT="${L337_BINARY_PATH:-}"
+RELEASE_TAG="${L337_RELEASE_TAG:-}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -220,9 +221,9 @@ run_as_user() {
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
     case "$1" in
+        --binary) BINARY_INPUT="$2"; shift 2 ;;
+        --release) RELEASE_TAG="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
-        --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
-        --force|-f) FORCE=true; shift ;;
         --no-install-deps) AUTO_INSTALL_DEPS=false; shift ;;
         --user) TARGET_USER="$2"; shift 2 ;;
         --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
@@ -231,17 +232,18 @@ while [ $# -gt 0 ]; do
         --remove-data) REMOVE_DATA=true; shift ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [OPTIONS]
+Usage: $0 [OPTIONS] --binary <path>
 
 Linux PipeWire installer for L337 Audio Server.
-Downloads prebuilt PipeWire binary from GitHub releases and installs as
-systemd user services for every user with an active PipeWire session.
+Installs a downloaded binary as systemd user services for every user with an
+active PipeWire session. Release lookup, the version check and the download
+itself live in install.sh, which resolves the newest release that ships a
+PipeWire binary for this platform and passes --binary here.
 
 Options:
+  --binary <path>        Binary to install (required for install; passed by install.sh)
+  --release <tag>        Release tag the binary came from (informational)
   --dry-run              Show what would happen without making changes
-  --pre-release, --prerelease
-                         Install the latest prerelease instead of stable release
-  --force, -f            Force reinstall even if the same version is already installed
   --no-install-deps      Do not auto-install missing base tools and audio libraries
   --user <username>      Install for a specific user only (default: all PipeWire users)
   --prefix <path>        Install base path (default: /opt/l337-audio-server)
@@ -275,251 +277,6 @@ case "$ARCH" in
 esac
 
 info "Platform: $OS_TYPE / $ARCH_TYPE"
-
-# ---------------------------------------------------------------------------
-# GitHub release helpers
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# GitHub release helpers
-# ---------------------------------------------------------------------------
-# Every release ships a release-info.json beside its binaries recording the glibc
-# each asset was measured to require. Releases are walked newest-first and the
-# first one whose release-info.json says the wanted asset runs on this system's
-# glibc wins, so a newer release needing a newer glibc never shadows an older
-# release that still works here.
-fetch_release_data() {
-    local endpoint
-    local url
-    local response_file
-    local http_code
-    local message
-
-    if [ "$INSTALL_PRERELEASE" = true ]; then
-        endpoint="releases?per_page=100"
-    else
-        endpoint="releases/latest"
-    fi
-
-    url="https://api.github.com/repos/${REPO}/${endpoint}"
-    response_file=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
-        fail "Could not create a temporary file for GitHub release data."
-
-    if ! http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
-        -o "$response_file" -w '%{http_code}' "$url"); then
-        rm -f "$response_file"
-        fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
-    fi
-
-    if [ "$http_code" != "200" ]; then
-        message=$(parse_json_field "$(cat "$response_file")" "message" 2>/dev/null || true)
-        rm -f "$response_file"
-        if [ "$INSTALL_PRERELEASE" = true ]; then
-            fail "GitHub returned HTTP $http_code while querying prereleases. ${message:-}"
-        fi
-        fail "GitHub returned HTTP $http_code while querying stable releases. ${message:-} Re-run with --pre-release to install a prerelease."
-    fi
-
-    cat "$response_file"
-    rm -f "$response_file"
-}
-
-# Flatten release JSON into one line per published asset:
-#   <tag> <prerelease:0|1> <asset filename> <published_at> <download url>
-# The filename comes from the asset's own "name" field, never from the URL, so a
-# download URL that differs from the asset name cannot confuse the match.
-# Rows come out newest release first, exactly as the GitHub API orders them.
-release_assets() {
-    awk '
-        /"tag_name"[[:space:]]*:/ {
-            t=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",t); sub(/".*/,"",t); tag=t; next
-        }
-        /"prerelease"[[:space:]]*:/ { pre=($0 ~ /: *true/) ? 1 : 0; next }
-        /"published_at"[[:space:]]*:/ {
-            p=$0; sub(/.*"published_at"[[:space:]]*:[[:space:]]*"/,"",p); sub(/".*/,"",p); pub=p; next
-        }
-        /"name"[[:space:]]*:/ {
-            n=$0; sub(/.*"name"[[:space:]]*:[[:space:]]*"/,"",n); sub(/".*/,"",n); name=n; next
-        }
-        /"browser_download_url"[[:space:]]*:/ {
-            u=$0; sub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/,"",u); sub(/".*/,"",u)
-            printf "%s\t%d\t%s\t%s\t%s\n", tag, pre, name, pub, u
-            next
-        }
-    '
-}
-
-# The glibc a release-info.json requires for asset $1. Prints the version, or
-# "none" when the asset is listed with no glibc requirement at all. Returns 1
-# when the asset is not described in it (release predates the manifest, or the
-# asset name is unknown): an unverifiable binary is never installed.
-release_info_glibc() {
-    local info_file="$1" asset="$2" line value
-
-    [ -f "$info_file" ] || return 1
-    # The trailing colon anchors the key so a longer asset name that starts with
-    # this one can never be mistaken for it.
-    line=$(grep -F "\"$asset\":" "$info_file" 2>/dev/null | head -1) || true
-    [ -z "$line" ] && return 1
-
-    case "$line" in
-        *null*) echo "none"; return 0 ;;
-    esac
-
-    value=$(printf '%s' "$line" \
-        | sed -n 's/.*:[[:space:]]*"\{0,1\}\([0-9][0-9.]*\)"\{0,1\}.*/\1/p')
-    [ -z "$value" ] && return 1
-    printf '%s' "$value"
-}
-
-# Walk releases newest-first and pick the newest one whose release-info.json
-# says the wanted asset runs on this system's glibc. The glibc requirement is
-# read from the manifest shipped in the release, so asset filenames are plain
-# and the installer depends on no GitHub-specific release metadata.
-# Sets SELECTED_TAG, SELECTED_ASSET, SELECTED_URL, SELECTED_PUBLISHED,
-# SELECTED_REQUIRED (glibc the chosen asset needs, or "none"); returns 1 when
-# no release is runnable here.
-# shortcut: only the newest 100 releases are searched (the API page size and
-# this script does not follow pagination); an old-glibc system older than that
-# window has to build from source.
-select_compatible_release() {
-    local base="$1"
-    local r_tag r_pre r_name r_pub r_url r_req
-    local data rows info_dir info_url info_file
-
-    data=$(fetch_release_data)
-    rows=$(printf '%s\n' "$data" | release_assets)
-    info_dir=$(mktemp -d "${TMPDIR:-/tmp}/l337-revinfo.XXXXXX") || return 1
-
-    SELECTED_TAG=""
-    SELECTED_ASSET=""
-    SELECTED_URL=""
-    SELECTED_PUBLISHED=""
-    SELECTED_REQUIRED=""
-
-    while IFS=$'\t' read -r r_tag r_pre r_name r_pub r_url; do
-        if [ "$INSTALL_PRERELEASE" = true ]; then
-            if [ "$r_pre" != "1" ]; then
-                continue
-            fi
-        fi
-
-        if [ "$r_name" != "$base" ]; then
-            continue
-        fi
-
-        info_url=$(printf '%s\n' "$rows" | awk -F'\t' \
-            -v want_tag="$r_tag" -v want_name="release-info.json" \
-            '$1 == want_tag && $3 == want_name { print $5; exit }')
-        if [ -z "$info_url" ]; then
-            continue
-        fi
-
-        # One fetch per release: the newest release almost always matches, so
-        # this normally downloads a single small JSON file.
-        info_file="$info_dir/$r_tag.json"
-        if [ ! -s "$info_file" ]; then
-            if ! curl -sS -L --connect-timeout 15 --max-time 30 \
-                    -o "$info_file" "$info_url" 2>/dev/null; then
-                rm -f "$info_file"
-                continue
-            fi
-        fi
-
-        r_req=$(release_info_glibc "$info_file" "$r_name") || continue
-
-        if [ "$r_req" != "none" ] && [ -n "$SYSTEM_GLIBC" ]; then
-            if version_lt "$SYSTEM_GLIBC" "$r_req"; then
-                continue
-            fi
-        fi
-
-        SELECTED_TAG="$r_tag"
-        SELECTED_ASSET="$r_name"
-        SELECTED_URL="$r_url"
-        SELECTED_PUBLISHED="$r_pub"
-        SELECTED_REQUIRED="$r_req"
-        break
-    done <<<"$rows"
-
-    rm -rf "$info_dir"
-    [ -n "$SELECTED_TAG" ]
-}
-
-# Highest glibc symbol version the running libc exports, i.e. the oldest glibc
-# a binary may have been built on to still run here. Empty when undetectable.
-system_glibc_version() {
-    local v=""
-
-    v=$(ldd --version 2>/dev/null | head -1 \
-        | sed -n 's/.*[[:space:]]\([0-9][0-9]*\.[0-9][0-9.]*\)[[:space:]]*$/\1/p')
-    if [ -z "$v" ]; then
-        v=$(getconf GNU_LIBC_VERSION 2>/dev/null \
-            | sed -n 's/.*glibc[[:space:]]*\([0-9][0-9]*\.[0-9][0-9.]*\).*/\1/p')
-    fi
-
-    printf '%s' "$v"
-}
-
-# version_lt: true when $1 sorts before $2. Equal versions are not "less than".
-version_lt() {
-    if [ "$1" = "$2" ]; then
-        return 1
-    fi
-    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
-}
-
-parse_json_field() {
-    local json="$1"
-    local field="$2"
-    echo "$json" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true
-}
-
-get_asset_name() {
-    local os="$1"
-    local arch="$2"
-    case "$os-$arch" in
-        linux-x86_64)
-            echo "l337-audio-server-x86_64-linux-pipewire"
-            ;;
-        linux-aarch64)
-            echo "l337-audio-server-aarch64-linux-pipewire"
-            ;;
-        *)
-            fail "Unsupported platform: $os/$arch"
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-download_binary() {
-    local url="$1"
-    local dest="$2"
-    local tmp="${dest}.tmp.$$"
-
-    info "Downloading: $url"
-    if ! curl -fL --connect-timeout 15 --retry 2 --retry-delay 2 -o "$tmp" "$url"; then
-        rm -f "$tmp"
-        fail "Failed to download binary from $url"
-    fi
-
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"
-        fail "Downloaded file is empty. Check the release URL."
-    fi
-
-    if ! file "$tmp" | grep -qE "ELF|Mach-O"; then
-        rm -f "$tmp"
-        fail "Downloaded file is not a valid binary (got: $(file -b "$tmp")). Check the release URL."
-    fi
-
-    chmod +x "$tmp"
-    mv "$tmp" "$dest"
-    local size
-    size=$(du -h "$dest" | cut -f1)
-    ok "Downloaded: $dest ($size)"
-}
 
 # ---------------------------------------------------------------------------
 # User detection
@@ -722,47 +479,6 @@ EOF
     fail "Installation aborted: new binary failed validation for $real_user"
 }
 
-# ---------------------------------------------------------------------------
-# Version helpers
-# ---------------------------------------------------------------------------
-get_installed_version() {
-    if [ -x "$INSTALL_DIR/l337-audio-server" ]; then
-        "$INSTALL_DIR/l337-audio-server" --version 2>/dev/null | awk '{print $NF}'
-    else
-        echo ""
-    fi
-}
-
-version_gt() {
-    local a="$1"
-    local b="$2"
-
-    if [ -z "$a" ] || [ -z "$b" ]; then
-        return 1
-    fi
-
-    local a_date="${a%-*}"
-    local a_build="${a##*-}"
-    local b_date="${b%-*}"
-    local b_build="${b##*-}"
-
-    if [ "$a_date" != "$b_date" ]; then
-        [ "$a_date" \> "$b_date" ]
-        return $?
-    fi
-
-    if [ "$a_build" = "$a" ] || [ "$b_build" = "$b" ]; then
-        return 1
-    fi
-
-    [ "$a_build" -gt "$b_build" ] 2>/dev/null
-}
-
-version_eq() {
-    [ "$1" = "$2" ]
-}
-
-# ---------------------------------------------------------------------------
 # Uninstall (multi-user)
 # ---------------------------------------------------------------------------
 uninstall_user_service() {
@@ -833,7 +549,8 @@ Stop it and re-run:  kill ${pids}"
 
     # A download that fell back to /tmp leaves the whole binary there.
     # A download that fell back to /tmp leaves the whole binary there.
-    rm -f "/tmp/$(get_asset_name "$OS_TYPE" "$ARCH_TYPE").tmp"
+    # The binary install.sh downloads lands in TMPDIR; tidy it on uninstall.
+    rm -f "${L337_BINARY_PATH:-}" "/tmp/l337-audio-server-download"
 
     ok "User service uninstallation complete"
 }
@@ -876,88 +593,13 @@ fi
 require_root
 check_dependencies
 
-info "Checking for latest release..."
-
-SYSTEM_GLIBC=$(system_glibc_version)
-if [ -n "$SYSTEM_GLIBC" ]; then
-    info "System glibc: $SYSTEM_GLIBC (releases record the glibc each binary needs in release-info.json)"
-else
-    warn "Could not determine the system glibc version; picking the newest release with any glibc requirement."
-fi
-
-if ! select_compatible_release "$(get_asset_name "$OS_TYPE" "$ARCH_TYPE")"; then
-    fail "No release of ${REPO} provides a PipeWire binary for ${OS_TYPE}/${ARCH_TYPE} that runs on glibc ${SYSTEM_GLIBC:-unknown}.
-
-The oldest published release needs a newer glibc. This system must build from source."
-fi
-
-LATEST_TAG="$SELECTED_TAG"
-PUBLISHED_AT="$SELECTED_PUBLISHED"
-ASSET_NAME="$SELECTED_ASSET"
-DOWNLOAD_URL="$SELECTED_URL"
-
-info "Latest compatible release: $LATEST_TAG (published: $PUBLISHED_AT)"
-if [ "$SELECTED_REQUIRED" = "none" ]; then
-    info "Selected asset: $ASSET_NAME (no glibc requirement)"
-else
-    info "Selected asset: $ASSET_NAME (needs glibc $SELECTED_REQUIRED, system has ${SYSTEM_GLIBC:-unknown})"
-fi
-
-INSTALLED_VERSION=""
-if [ -f "$INSTALL_DIR/l337-audio-server" ]; then
-    info "Existing installation found at: $INSTALL_DIR/l337-audio-server"
-    INSTALLED_VERSION=$(get_installed_version)
-
-    if [ -n "$INSTALLED_VERSION" ]; then
-        info "Installed version: $INSTALLED_VERSION"
-        if version_eq "$INSTALLED_VERSION" "$LATEST_TAG"; then
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested for the same version ($INSTALLED_VERSION)"
-            else
-                ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
-                echo
-                echo "To reinstall anyway, run with --force:"
-                echo "  sudo ./install.sh --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
-                exit 0
-            fi
-        elif version_gt "$LATEST_TAG" "$INSTALLED_VERSION"; then
-            info "Update available ($INSTALLED_VERSION -> $LATEST_TAG)"
-        else
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($LATEST_TAG)"
-            else
-                ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($LATEST_TAG)"
-                echo
-                echo "To reinstall anyway, run with --force:"
-                echo "  sudo $0 --force $([ "$INSTALL_PRERELEASE" = true ] && echo '--pre-release ')$([ "$DRY_RUN" = true ] && echo '--dry-run ')"
-                exit 0
-            fi
-        fi
-    else
-        warn "Could not determine installed version; will reinstall"
-    fi
-fi
-
-# DOWNLOAD_URL and ASSET_NAME were resolved above by select_compatible_release.
-NEW_BIN=""
-if mkdir -p "$INSTALL_DIR/.tmp" 2>/dev/null && [ -w "$INSTALL_DIR/.tmp" ]; then
-    NEW_BIN="$INSTALL_DIR/.tmp/l337-audio-server.new"
-else
-    warn "Cannot write to $INSTALL_DIR/.tmp; falling back to /tmp (non-atomic copy)"
-    NEW_BIN="/tmp/${ASSET_NAME}.tmp"
-fi
-
-download_binary "$DOWNLOAD_URL" "$NEW_BIN"
-
-# Ensure the audio backend libraries are present before checking DT_NEEDED
-# entries — the binary may be statically linked against some libs and thus
-# not list them, yet still need them at runtime.
-ensure_audio_libs pipewire
+info "Installing ${BINARY_INPUT} (release ${RELEASE_TAG:-unknown})"
 
 # A missing DT_NEEDED library is resolved by the loader before main(), so the
-# binary cannot exec in ANY mode (dummy = true included). Check the binary we
-# just downloaded and install the runtime packages before first boot.
-ensure_runtime_dependencies "$NEW_BIN"
+# binary cannot exec in ANY mode (dummy = true included). Check the provided
+# binary and install the runtime packages before first boot.
+ensure_audio_libs pipewire
+ensure_runtime_dependencies "$BINARY_INPUT"
 
 if [ -n "$TARGET_USER" ]; then
     if ! id "$TARGET_USER" &>/dev/null; then
@@ -966,7 +608,7 @@ if [ -n "$TARGET_USER" ]; then
     if ! user_has_pipewire "$TARGET_USER"; then
         fail "User $TARGET_USER does not have an active PipeWire session"
     fi
-    setup_systemd_user "$NEW_BIN" "$TARGET_USER"
+    setup_systemd_user "$BINARY_INPUT" "$TARGET_USER"
 else
     info "Scanning for PipeWire users..."
     pw_users=()
@@ -982,13 +624,14 @@ else
 
     info "Found ${#pw_users[@]} PipeWire user(s): ${pw_users[*]}"
     for user in "${pw_users[@]}"; do
-        setup_systemd_user "$NEW_BIN" "$user"
+        setup_systemd_user "$BINARY_INPUT" "$user"
     done
 fi
 
-rm -f "$NEW_BIN"
-rm -rf "$INSTALL_DIR/.tmp"
-ok "Installation complete"
+# The binary was downloaded into TMPDIR by install.sh: drop it once it is
+# safely deployed.
+[ "$BINARY_INPUT" != "$INSTALL_DIR/l337-audio-server" ] && rm -f "$BINARY_INPUT"
+
 echo
 if [ -n "$TARGET_USER" ]; then
     echo "Next steps for $TARGET_USER:"

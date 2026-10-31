@@ -132,10 +132,36 @@ other software uses, so the default is to keep them). Piped through
 is printed instead.
 
 Flags are shared where the platforms overlap: `--pre-release`, `--uninstall`,
-`--remove-data` and `--help` work on all of them; `--force`, `--no-audio`,
-`--dry-run` and `--group-access` are ALSA/systemd only; `--no-install-deps`
-works on Linux and Termux — it skips the automatic installation of missing
-system packages and prints what to install manually instead.
+`--remove-data` and `--help` work on all of them; `--force` is handled by
+`install.sh` (it is not forwarded); `--no-audio`, `--dry-run` and
+`--group-access` are ALSA/systemd only; `--no-install-deps` works on Linux and
+Termux — it skips the automatic installation of missing system packages and
+prints what to install manually instead.
+
+### Who does what
+
+`install.sh` does **all** of the GitHub work: it picks the newest release that
+actually publishes this platform's binary — walking releases and reading each
+release's `release-info.json`, so a partial release (one that only carries some
+targets) and a binary needing a newer glibc are both skipped instead of failing
+with a 404 — checks the installed version, downloads the binary into `TMPDIR`,
+and then hands the local path to the platform installer. A partial release is
+therefore skipped, not turned into a failed install.
+
+When the installed version already matches the release being installed, the
+install stops and prints how to override with `--force`:
+
+```
+[OK]   Installed binary is up-to-date (2026.10.29-5)
+
+To reinstall anyway, run with --force:
+  install.sh --force --pre-release
+```
+
+The platform installers (`scripts/install-*.sh`) never contact GitHub: they
+receive `--binary <path>` (and `--release <tag>`) and do the service
+registration, permissions and configuration. Running one of them directly
+without `--binary` fails with that message, and `--uninstall` works standalone.
 
 ## Runtime Dependencies
 
@@ -187,18 +213,28 @@ The server does not bundle `yt-dlp`. If it is missing, YouTube URLs will return 
 
 ### Installer falls back to the wrong backend or won’t run
 
-If `install.sh` auto-detection picks the wrong installer, or the downloaded
-script fails immediately, install the platform script directly instead:
+If `install.sh` auto-detection picks the wrong installer, force the platform
+installer explicitly — `install.sh` still does the release lookup, the version
+check and the download, and then hands the binary to the named installer:
 
 ```bash
 # Linux PipeWire
-curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/scripts/install-linux-pipewire.sh | sudo bash
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --pre-release
 
 # Linux ALSA
-curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/scripts/install-linux-alsa.sh | sudo bash
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | sudo bash -s -- --pre-release
 
 # macOS
-curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/scripts/install-macos.sh | bash
+curl -fsSL https://github.com/tim-projects/l337-audio-server/raw/main/install.sh | bash -s -- --pre-release
+```
+
+The platform installers no longer download anything themselves, so they need the
+binary path `install.sh` hands them. If you already have a binary (for example
+because `install.sh` downloaded it), pass it directly:
+
+```bash
+# from a checkout, using a binary you already have
+bash scripts/install-linux-alsa.sh --binary /tmp/l337-audio-server-download --release 2026.10.29-5
 ```
 
 ### Service fails to start after install
