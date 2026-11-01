@@ -65,7 +65,7 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 **Checklist**
 - [x] `handlers.rs::cache_next` + `cache_previous`: resolve via `engine.current_default_target_kbps()`.
 - [x] (Optional, preferred) add `PlayerEngine::resolve_track_ceiling(&Track)` and route `play_track`, both cache handlers, and `set_target` through it so the precedence lives in one place.
-- [ ] Test: set runtime `target_kbps=64`, then cache next/prev, then assert the persisted/next slice uses a ≤64 selector.
+- [x] Test: set runtime `target_kbps=64`, then cache next/prev, then assert the persisted/next slice uses a ≤64 selector. — `tests/endpoints.rs::test_cache_next_honors_runtime_target_ceiling` (fake `yt-dlp` on the spawned server's PATH records the selection: with ceiling 64 the download is `-f 249` (51 kbps), never `-f 251` (158 kbps); pre-fix it picked the config default's `bestaudio`).
 - [x] Verify: no remaining `resolve_ceiling(...default_target_kbps())` in `src/api/handlers.rs`.
 
 ---
@@ -79,7 +79,7 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 **Checklist**
 - [x] `models.rs`: add a `deserialize_with` helper for `quality` (Track + TargetPayload) that maps unknown/malformed strings to `None`.
 - [x] Unit test: `quality: "ultra"` (and casing variants) deserializes to `None` → ceiling = server default.
-- [ ] Integration check: `POST /player/play {"quality":"ultra"}` returns 200 and plays at `default_target_kbps`/best.
+- [x] Integration check: `POST /player/play {"quality":"ultra"}` returns 200 and plays at `default_target_kbps`/best. — `tests/endpoints.rs::test_play_unknown_quality_falls_back_to_server_default` (200, not 422; status falls back to the server default).
 - [x] Keep the `resolve_ceiling` doc accurate.
 
 ---
@@ -266,7 +266,7 @@ local controllable HTTP origin were on `PATH`.
 | 4 | WARNING | A failed YouTube resolve ran **yt-dlp twice** (resolve, then the downloader re-resolving it) — ~2× latency per failure and 2× the chance of a rate-limit block. | `StreamStartError::Resolve`/`Playback`; only a post-resolution failure falls back to a plain download. Verified: an unresolvable YouTube URL now returns `Failed to resolve stream for …` once, and `duration_sec` no longer reports the previous track's timeline. |
 | 5 | SUGGESTION | `seek` past the end silently re-buffered the whole track from 0 while reporting `position_sec > duration_sec` (observed `99999` vs `100`). | Clamp to the decoded length; observed `100`/`0` at the end instead of `99999`/`100`. |
 | 6 | WARNING | **Regression introduced by this round's own recovery fix, caught before shipping it.** Writing the software gain in `try_recover` while `set_volume` only wrote it when `pactl` failed meant that, after a recovery, a successful `pactl` set attenuated on top of the software gain (0.8 hardware × 0.5 software = 0.4 effective). | Software gain is now the single authoritative volume path: every backend already multiplies dequeued samples by it, so it works on PipeWire/ALSA/AAudio/CoreAudio/WASAPI and needs no external tool; and it lives in the `Arc` shared with the backend, so it survives stream recreation by construction. Removes the 47-line `set_pipewire_sink_input_volume` pactl helper and the recovery workaround. Unit test asserts the gain tracks `volume_val`. |
-| 7 | SUGGESTION | `install-systemd.sh` writes `/etc/l337-audio-server/config.toml`, which `load_settings()` never reads (it reads `…/config` and `…/server.ini`), so the systemd installer's host/port/token are silently ignored. | **Not fixed — needs a decision on which file is authoritative.** Flagged in §7 of the hand-off. |
+| 7 | SUGGESTION | `install-systemd.sh` writes `/etc/l337-audio-server/config.toml`, which `load_settings()` never reads (it reads `…/config` and `…/server.ini`), so the systemd installer's host/port/token are silently ignored. | **FIXED 2026-11-01** — the installer writes `server.ini` (the file `load_settings` actually reads, explicitly as INI) and migrates a legacy `config.toml` on update; integrity/health checks read `server.ini`. The authoritative file is `server.ini` (`--help` and the README already documented it). |
 
 ---
 
@@ -515,12 +515,13 @@ link.
   degradation flag. `PlayerStatus.codec` is the only signal.
 - **finding #7** — `CHUNK_FRAMES = 4096` in `src/platform/pulseaudio.rs` is
   unverified on device (audio still 1×, no underrun, lower wakeups).
-- **finding #9** — the committed `scripts/opus-stubs/libopus.so` blob is still
-  not regenerated/validated in CI.
-- `install-systemd.sh` writes `/etc/l337-audio-server/config.toml`, which
-  `load_settings()` never reads (it reads `…/config` and `…/server.ini`) — the
-  systemd installer's host/port/token are silently ignored. **Not fixed; needs a
-  decision on which file is authoritative.**
+- **finding #9** — the committed `scripts/opus-stubs/libopus.so` blob is
+  validated in CI (AArch64 + SONAME `libopus.so` + the 4 exported symbols,
+  `build.yml` termux job) but still not *regenerated* in CI with a diff gate
+  (optional; a compiled ELF is not byte-reproducible across toolchains).
+- `install-systemd.sh`'s `config.toml` mismatch — **FIXED 2026-11-01**: it now
+  writes `/etc/l337-audio-server/server.ini` (the file `load_settings()` reads,
+  explicitly as INI) and migrates a legacy `config.toml` on update.
 
 ## What is already green (do not redo)
 
@@ -599,9 +600,15 @@ implemented and verified on the device against the live GitHub API.
   `launchctl bootstrap` path have not been executed. First run on a real host should confirm:
   unit reaches `active` within the 15 s poll, `is-enabled` reports enabled, and a slow-start unit is
   no longer rolled back by the old fixed `sleep`.
-- **`install-systemd.sh` writes `/etc/l337-audio-server/config.toml`**, which `load_settings()` never
-  reads — still open (carried from §7 above; needs a decision on the authoritative config file).
-- **The committed `scripts/opus-stubs/libopus.so` blob** is still not regenerated/validated in CI.
+- ~~**`install-systemd.sh` writes `/etc/l337-audio-server/config.toml`**, which `load_settings()` never
+  reads~~ — **FIXED 2026-11-01**: it writes `server.ini` and migrates the legacy file.
+- ~~**The committed `scripts/opus-stubs/libopus.so` blob** is still not regenerated/validated in CI.~~
+  — validation step is in CI; only the optional regeneration-with-diff remains.
+- **NEW — Linux installer false failures on a stock Debian host** (`bug.md` §12: `libopus0`
+  installed yet "libopus.so.0 still missing"; "no known package provides libm.so.6"):
+  **fixed in code** (loader-provided SONAMEs skipped; `ldconfig` refreshed before the check;
+  presence probe falls back to the standard library dirs) and verified by simulation on this
+  device — the real-host run on `pipelinepro` is still pending.
 - **device-only playback checks** in the sections above are unchanged: `position_sec` advancing on a
   real sink, RSS reclaim on the streaming path, forced-backend-error recovery, and the real YouTube
   bandwidth ceiling. The engine fixes from the 2026-10-30 session (BUG-1/BUG-2/BUG-3) are still not
@@ -637,3 +644,37 @@ Closed the integrity gap found while adding MD5 verification:
 Verified: 66-check suite green, covering all five verification outcomes
 (md5 path, crc32 path, size-only path, wrong crc32 → refuse, wrong size →
 refuse), plus the live install path.
+
+---
+
+# Session — 2026-11-01 (Termux device): configuration, installers, streaming stall
+
+Continued the open items from `bugs.md` / `bugs2.md` / `bug.md`. Everything below is
+implemented in the working tree and executed **on this device** (no Linux/macOS host here),
+with the suite green: **57/57 unit + 24/24 endpoints** (`cargo test --no-default-features
+--features pulseaudio,opus`; `LD_LIBRARY_PATH=$PREFIX/lib`). Feature matrix: `--features opus`
+(default backend) compiles; `alsa,opus` is a Linux-host combo (alsa is `target_os = "linux"`
+only, so it selects no backend for the Android host triple — not a regression).
+
+## Closed on-device
+
+| # | Item | Outcome |
+|---|------|---------|
+| 1 | **`loglevel` from `server.ini`** (`bug.md` §11) | `[server] loglevel` loaded by `load_settings`; `init_tracing` runs after the config read; precedence **`RUST_LOG` > `loglevel` > crate default (`debug`, unchanged)**. Empty/unparsable `RUST_LOG` no longer silences everything; an unknown `loglevel` warns + default. Verified live: info/debug/off/absent/bogus/`RUST_LOG`-override/empty-`RUST_LOG` matrix. Unit tests `main.rs::tests::loglevel_*`; README config table + `DEFAULT_CONFIG` document the key. |
+| 2 | **`install-systemd.sh` `config.toml` mismatch** (finding #7 in the host-run table) | Now writes `/etc/l337-audio-server/server.ini` — the file `load_settings()` actually reads (INI) — and migrates a legacy `config.toml` on update; integrity + health checks read `server.ini`. `bash -n` clean. |
+| 3 | **Linux installer false failures on Debian** (`bug.md` §12) | All three installers: loader-provided SONAMEs (`libm.so.6`, `libc.so.6`, …) are skipped instead of "no known package"; `ldconfig` refreshed before the missing-check; presence probe (`lib_present`) falls back to the standard library dirs, so a lib installed earlier in the same run is found. Genuinely absent libs still abort the install (rc=42 in simulation). Real-host run on `pipelinepro` pending. |
+| 4 | **Streaming stall follow-up** (`bugs2.md` U7 "remaining stall") | The uncommitted tolerance raise is kept and completed: the Symphonia *decoder* `IoError` arm no longer has its own 4 s tolerance (it ended tracks mid-playback on a trickling download) and shares `wait_for_progress` (10 min, rate-limited warnings every ~20 s so a permanently wedged download is visible). Unit test `wait_for_progress_tolerates_a_slow_download_and_counts_growth`. |
+| 5 | **Finding #4's missing test** | `tests/endpoints.rs::test_cache_next_honors_runtime_target_ceiling`: fake `yt-dlp` on the spawned server's PATH records the selection — with runtime ceiling 64 the download is `-f 249` (≤64 kbps), never `-f 251`. Pre-fix it resolved with the config default (`bestaudio`). |
+| 6 | **Finding #5's missing integration check** | `tests/endpoints.rs::test_play_unknown_quality_falls_back_to_server_default`: `{"quality":"ultra"}` returns **200** (not 422) through the real `Json` extractor and falls back to the server default. |
+| 7 | **Wall-clock calibration** | `test_resample_whole_track_buffer_stays_linear`'s budget 20 s → 120 s: on this aarch64 device the *linear* path takes ~8 s alone and ~23 s under the suite's parallel load in the debug profile, while the quadratic drain it guards against takes minutes — detector margin unchanged. |
+
+## Still device/host-only (unchanged, need a real sink or a Linux/macOS host)
+
+- `position_sec` advancing on a real PipeWire/ALSA sink; RSS reclaim on the streaming path;
+  forced-backend-error recovery + volume-after-recovery; the real YouTube bandwidth ceiling
+  (`bugs.md` hand-off §1–§4).
+- Finding #1's stock-host install + start, and finding #7's `CHUNK_FRAMES = 4096` device check.
+- `bug.md` §12's real-host rerun on `pipelinepro`, and the Linux/macOS installer paths
+  (systemd enable/start/verify poll, `launchctl bootstrap`).
+- Finding #3's whole-track file decode peak (upgrade path: incremental file decode into the
+  throttled producer) and finding #6's lossless-format preference remain as documented shortcuts.

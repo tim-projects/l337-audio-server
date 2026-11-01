@@ -421,3 +421,85 @@ best→highest (Opus) on a current build.
   than garbage — the planar-append bug in the current tree is a second, separate defect, so the fix
   should be validated by the 44100→48000 sine test, not by reading the code alone.
 
+
+---
+
+# Update 4 — 2026-10-31: client AAC path verified audible
+
+User confirmed hearing audio via the player client. The client's YouTube AAC/m4a materialization
+(`_download_youtube_audio` → `/player/play/stream`) bypasses the broken 44100→48000 resample path,
+so playback is audible end-to-end despite BUG-A (resample zeros) remaining in the direct path.
+BUG-4 (best quality still selects AAC 129 k) and BUG-B (stop() not tearing down) remain open.
+
+---
+
+# Update 5 — 2026-10-31: post-work re-check (installed server)
+
+Health now advertises `codecs` + `quality` (not just `yt_dlp`). Direct play starts with
+`codec=opus`, `actual_kbps=132`, but still stops within ~6s with `audio_available=false`,
+`position_sec=0`. BUG-4 best→AAC appears improved (now Opus 132 k). Resample/direct-path
+playback still needs verification; client AAC path remains the audible workaround.
+
+---
+
+# Update 6 — 2026-10-31: service logging enabled + U2 premature EOS reproduced
+
+`runit/run` now exports `RUST_LOG=debug` and redirects to `$TMPDIR/l337-server.log`, so the
+server has real logs again. Reproduced the reported U2 symptom on the installed binary:
+
+- `play_track: YouTube streaming for .../ujNeHIo7oTE`
+- `position_sec` advances 1..7 with `audio_available=true`
+- then `INFO engine: end of track reached: state = stopped` at ~7 s (track is 281 s)
+- afterwards `state=stopped`, `position_sec=0`, `audio_available=false`
+
+So the streaming Opus path ends the track early (~7 s), not a pause/stop problem. Pause itself
+worked in isolation (`POST /player/pause` → `state=paused`). Also note `current_track.duration=281`
+but status `duration_sec=292` (~+11 s), so the derived duration differs from the client's.
+
+Suspect: the WebM/Opus streaming reader treats a decode gap/seek or the download prebuffer end as
+EOS. Needs a continuous-pass check over the whole Opus stream.
+
+---
+
+# Update 7 — 2026-10-31: streaming Opus no longer aborts early
+
+Root cause of the U2 stall: `streaming_decode_sync` (Opus branch) treated a
+`DecodeError("mkv: attempt to read element data past master element")` as a
+terminal error and `break`ed, ending decode after ~8 s. Patched the branch to
+call `wait_for_progress` on that error (retry while the download grows) instead
+of breaking. Rebuilt on-device and re-tested: position now advances to ~9 s
+and stays `playing` (no premature `end of track reached`); download keeps
+growing. Further investigation needed for the remaining stall, but the early-EOS
+regression is fixed.
+
+---
+
+# Update 8 — 2026-11-01: config, installers, streaming stall (full suite green on-device)
+
+No playback semantics changed; the open items from the earlier updates were worked:
+
+- **BUG-1/2/3 remain fixed as verified on 2026-10-30** (`consumed_total` playhead, bounded
+  window, `playing → stopped` at EOS); nothing here regressed them.
+- **U7's "remaining stall"** — the Symphonia decoder's `IoError` arm had its own ~4 s
+  tolerance that ended tracks mid-playback on a trickling download; it now shares the Opus
+  arm's `wait_for_progress` policy (10 min of no growth, with a warning every ~20 s so a
+  wedged download is visible instead of a frozen playhead). If a device run still freezes,
+  the log now says whether the download stopped growing (download-starved) or keeps growing
+  while the demuxer keeps erroring (reader wedged — the case that needs a seek/restart of
+  the demuxer).
+- **`loglevel` in `server.ini`** (`bug.md` §11) so playback diagnostics no longer need an
+  accidental `RUST_LOG` in the runit `run` script: precedence `RUST_LOG` > `loglevel` >
+  crate default (`debug`, unchanged); verified live for every branch of that matrix.
+- **`install-systemd.sh` now writes `server.ini`** (the file `load_settings()` reads), so the
+  systemd installer's host/port/token are no longer silently ignored.
+- **Linux installer false failures fixed** (Debian: `libopus0` installed yet "still missing";
+  "no known package provides libm.so.6"): loader-provided SONAMEs skipped, `ldconfig`
+  refreshed before the check, presence probe falls back to the standard library dirs.
+- **New regression tests**: cache honors the runtime ceiling (fake `yt-dlp`, `-f 249` not
+  `-f 251`), `quality:"ultra"` → 200 not 422, and `wait_for_progress` tolerance semantics.
+- **Suite on this device**: 57/57 unit + 24/24 endpoints
+  (`cargo test --no-default-features --features pulseaudio,opus`,
+  `LD_LIBRARY_PATH=$PREFIX/lib`).
+- Still open/unverified: BUG-4 on a live target, the device-only playback checks
+  (`position_sec` on a real sink, RSS reclaim, forced sink error), finding #3's whole-track
+  file-decode peak, and the `pipelinepro` (Debian) installer rerun.

@@ -401,3 +401,109 @@ fixed CI binary (dummy mode, `XDG_RUNTIME_DIR=/tmp/l337-test/rt6`, token `test-t
    `--no-default-features` (dummy/decode-validation only). Consider a CI matrix so the default
    feature build doesn't silently break on minimal hosts.
 5. Optionally fix §7 (single-instance lock path) so unprivileged dummy runs are silent.
+
+---
+
+## 11. Enable Rust logging from `server.ini` (`loglevel=debug`)
+
+**Request.** Let the operator set the server's Rust log level from `server.ini` via a
+`loglevel=debug` setting, so server-side playback diagnostics can be turned on without editing
+the runit/`run` script and restarting with an accidental `RUST_LOG` export.
+
+**Why.** On Termux the supervised service sends stdout/stderr to `/dev/null`, so there are no
+server logs unless `RUST_LOG` is exported in the service `run` script (that is how the current
+`$TMPDIR/l337-server.log` was produced). A first-class `loglevel` key in `server.ini` is the
+documented, platform-independent way to get `tracing` output for bug hunting.
+
+**Fix.** Load `loglevel` from the existing `server.ini` loader (alongside the other settings),
+map it to the `tracing_subscriber` filter / `RUST_LOG`-equivalent default when
+`RUST_LOG` is unset, and document precedence: explicit `RUST_LOG` wins, else `loglevel`, else
+`info`.
+
+**Status: IMPLEMENTED + verified on-device (2026-11-01).**
+- `src/main.rs`: `[server] loglevel` (`error|warn|info|debug|trace|off`, case-insensitive)
+  is loaded by `load_settings()`; `init_tracing` runs after the config read and builds the
+  filter with precedence `RUST_LOG` > `loglevel` > crate default (`debug`, unchanged).
+  An empty/blank `RUST_LOG` is treated as unset (it used to silence everything), an
+  unparsable `RUST_LOG` falls back rather than disabling logging, and an unknown
+  `loglevel` warns and keeps the default. Startup reports the effective level and its
+  source, e.g. `Log level: info (from [server] loglevel; ...)`.
+- Unit tests: `main.rs::tests::loglevel_*` (absent/empty → default; known values;
+  unknown → warn + default).
+- Live smoke (isolated instance, `--dummy --transport=http`): `loglevel=info` emits
+  INFO only, `loglevel=debug` emits DEBUG, absent → DEBUG (unchanged default),
+  `loglevel=bogus` warns + DEBUG, `loglevel=off` is silent, `RUST_LOG=warn` beats
+  `loglevel=debug`, and `RUST_LOG=` (empty) falls through to `loglevel`.
+- Docs: README configuration table lists `loglevel`; the written default config
+  carries `loglevel = "debug"` so a fresh install keeps the previous verbosity.
+- Known limit: changing `loglevel` needs a restart (the SIGHUP reload only rotates
+  the token); `RUST_LOG` remains the no-restart escape hatch.
+
+**Verify.** `server.ini` with `loglevel=debug` produces `DEBUG` lines in the server log; without
+it the default verbosity is unchanged. — confirmed by the smoke matrix above.
+
+---
+
+## 12. Failed install on pipelinepro (Debian x86_64) — runtime libs "missing" after a successful apt install
+
+**Environment.** `pipelinepro` runs Debian (x86_64). Agent has SSH access, so the exact
+package can be sourced there.
+
+**Log**
+
+```
+Installing: libasound2 libopus0
+Installed: libasound2 libopus0
+Missing runtime libraries: libopus.so.0 libm.so.6. The server cannot start until these are installed.
+Installing libopus0 (runtime dependency for libopus.so.0)...
+Installed libopus0
+No known package provides libm.so.6 on this distribution.
+Install it manually; the server will not start without it.
+Runtime library libopus.so.0 is still missing. Install it manually, then re-run this installer.
+```
+
+**Analysis**
+
+- `libopus.so.0` is shipped by `libopus0`, which this log shows as installed, yet the installer
+  still reports it missing. The check is therefore almost certainly reading a loader cache /
+  search path that has not picked the new library up (no `ldconfig`, wrong `LD_LIBRARY_PATH`,
+  or a check against the Termux-style paths only). Confirm on pipelinepro with
+  `ldconfig -p | grep opus`, `dpkg -L libopus0 | grep '\.so'`, and `ldd` on the binary.
+- `libm.so.6` is **not** a standalone Debian package; it is part of `libc6`
+  (glibc's math library). Debian x86_64 always has it once `libc6` is installed, so
+  "No known package provides libm.so.6" is expected and should not be treated as a failure;
+  the installer's package-name lookup needs a special case (`libm.so.6 -> libc6`).
+
+**Fix**
+
+- Map `libm.so.6` to `libc6` (never fail on it: glibc always provides it).
+- After installing `libopus0`, run `ldconfig` (or re-check via `ldconfig -p`) before declaring
+  the runtime library missing, and verify with `ldd` against the actual install path.
+
+**Status: FIXED (2026-11-01, verified by simulation; a real Debian host run is still pending).**
+- All three Linux installers (`install-linux-alsa.sh`, `install-linux-pipewire.sh`,
+  `install-systemd.sh` — byte-identical copies of `ensure_runtime_dependencies`) now:
+  1. **skip SONAMEs the C runtime always provides** (`libc.so.6`, `libm.so.6`,
+     `libpthread.so.0`, `libdl.so.2`, `librt.so.1`, `libresolv.so.2`, `libnss_*.so.2`),
+     so the "No known package provides libm.so.6" failure cannot fire (glibc 2.34+
+     folds pthread/dl/rt into libc);
+  2. **refresh the loader cache (`ldconfig`) before deciding anything is missing**, because
+     packages installed earlier in the same run (`ensure_audio_libs`) are not in the cache
+     yet — this is the "libopus0 installed but still reported missing" half;
+  3. **probe presence via `lib_present()`** — the `ldconfig -p` cache first, then the
+     standard library dirs (`/lib`, `/usr/lib`, `/lib64`, `/usr/lib64`,
+     `*-linux-gnu` multiarch dirs) — so a stale cache cannot fail a library that is
+     on disk; the final gate uses the same probe.
+- The safety gate is unchanged: a genuinely absent library still aborts the install
+  before the service is written (verified: rc=42 in the absent-library simulation).
+- Simulation (this device): helper unit checks (`libm.so.6`/`libc.so.6`/… skipped;
+  `libopus.so.0`/`libpulse.so.0`/… not skipped) plus two end-to-end runs of the patched
+  function with a simulated Debian host — stale-cache-then-install → exit 0 with
+  `ok "Installed libopus0"`; library-never-appears → `FAIL: Runtime library libopus.so.0
+  is still missing`, rc=42. `bash -n` clean on all three scripts.
+
+**Still to verify on pipelinepro (real Debian host).** Re-run the installer end to end: it must
+not report `libopus.so.0`/`libm.so.6` missing, `ok "Runtime libraries present: …"` (or an
+install + recheck) must be printed, and the server must start. If it still fails there, capture
+`ldconfig -p | grep opus`, `dpkg -L libopus0 | grep '\.so'` and `ldd` on the installed binary
+to see which of the two probes (cache vs. directory) disagrees.
