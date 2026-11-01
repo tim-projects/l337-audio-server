@@ -281,6 +281,14 @@ ensure_runtime_dependencies() {
         return 0
     fi
     if ! command -v ldconfig &>/dev/null; then
+        for c in /usr/sbin/ldconfig /sbin/ldconfig; do
+            if [ -x "$c" ]; then
+                ldconfig() { "$c" "$@"; }
+                break
+            fi
+        done
+    fi
+    if ! command -v ldconfig &>/dev/null; then
         warn "ldconfig not available; cannot verify runtime libraries for $bin"
         return 0
     fi
@@ -335,6 +343,7 @@ ensure_runtime_dependencies() {
         # shellcheck disable=SC2086
         if $install_cmd $pkgs >/dev/null 2>&1; then
             ok "Installed $pkgs"
+            command -v ldconfig >/dev/null 2>&1 && ldconfig
         else
             warn "Could not install $pkgs. Install $lib ($pkgs) manually or the server will not start."
         fi
@@ -445,7 +454,7 @@ with wave.open('$file', 'w') as w:
 test_audio_playback() {
     local test_file="/tmp/l337-test-tone.wav"
     local token_file="/var/lib/l337-audio-server/server_token.txt"
-    local config_file="/etc/l337-audio-server/config.toml"
+    local config_file="/etc/l337-audio-server/server.ini"
     local server_url=""
 
     # Read auth token
@@ -595,10 +604,10 @@ verify_installed_files() {
         errors=$((errors + 1))
     fi
 
-    if [ -f "$CONFIG_DIR/config.toml" ]; then
-        ok "Config present: $CONFIG_DIR/config.toml"
+    if [ -f "$CONFIG_DIR/server.ini" ]; then
+        ok "Config present: $CONFIG_DIR/server.ini"
     else
-        fail "Config missing: $CONFIG_DIR/config.toml"
+        fail "Config missing: $CONFIG_DIR/server.ini"
     fi
 
     if [ -d "$STATE_DIR" ]; then
@@ -639,7 +648,7 @@ verify_installed_files() {
 
 check_server_health() {
     local configured_host="localhost"
-    local config_file="$CONFIG_DIR/config.toml"
+    local config_file="$CONFIG_DIR/server.ini"
     if [ -f "$config_file" ]; then
         configured_host=$(grep -E '^host\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/')
         configured_host=${configured_host:-localhost}
@@ -969,7 +978,20 @@ update_system_service() {
 }
 
 setup_config() {
-    local config_dest="$CONFIG_DIR/config.toml"
+    # The server reads /etc/l337-audio-server/server.ini (INI) and the
+    # extensionless /etc/l337-audio-server/config (probed by extension, which an
+    # extensionless file can never match), never config.toml — so config.toml
+    # silently ignored the systemd installer's host/port/token.
+    local config_dest="$CONFIG_DIR/server.ini"
+
+    # Migrate an install written by an older installer, whose values the server
+    # never read: adopt the file it actually loads instead of re-asking.
+    if [ ! -f "$config_dest" ] && [ -f "$CONFIG_DIR/config.toml" ]; then
+        if mv "$CONFIG_DIR/config.toml" "$config_dest" 2>/dev/null; then
+            ok "Migrated legacy config.toml to server.ini (now actually read by the server)"
+        fi
+    fi
+
     local existing_host=""
     local existing_port="1337"
     local existing_token=""

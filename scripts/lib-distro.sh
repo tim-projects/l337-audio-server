@@ -151,6 +151,7 @@ pkg_for_lib() {
             libasound.so*)        echo "libasound2" ;;
             libpipewire-0.3.so*)  echo "libpipewire-0.3-0" ;;
             libpulse.so*)         echo "libpulse0" ;;
+            libm.so*)             echo "libc6" ;;
             *) return 1 ;;
         esac
     elif command -v dnf &>/dev/null; then
@@ -159,6 +160,7 @@ pkg_for_lib() {
             libasound.so*)        echo "alsa-lib" ;;
             libpipewire-0.3.so*)  echo "pipewire-libs" ;;
             libpulse.so*)         echo "pulseaudio-libs" ;;
+            libm.so*)             echo "glibc" ;;
             *) return 1 ;;
         esac
     elif command -v pacman &>/dev/null; then
@@ -167,6 +169,7 @@ pkg_for_lib() {
             libasound.so*)        echo "alsa-lib" ;;
             libpipewire-0.3.so*)  echo "pipewire" ;;
             libpulse.so*)         echo "libpulse" ;;
+            libm.so*)             echo "glibc" ;;
             *) return 1 ;;
         esac
     elif command -v zypper &>/dev/null; then
@@ -175,6 +178,7 @@ pkg_for_lib() {
             libasound.so*)        echo "libasound2" ;;
             libpipewire-0.3.so*)  echo "libpipewire-0-3" ;;
             libpulse.so*)         echo "libpulse0" ;;
+            libm.so*)             echo "libc6" ;;
             *) return 1 ;;
         esac
     elif command -v apk &>/dev/null; then
@@ -183,6 +187,7 @@ pkg_for_lib() {
             libasound.so*)        echo "alsa-lib" ;;
             libpipewire-0.3.so*)  echo "pipewire" ;;
             libpulse.so*)         echo "pulseaudio" ;;
+            libm.so*)             echo "musl" ;;
             *) return 1 ;;
         esac
     else

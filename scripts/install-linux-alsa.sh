@@ -131,6 +131,14 @@ ensure_runtime_dependencies() {
         return 0
     fi
     if ! command -v ldconfig &>/dev/null; then
+        for c in /usr/sbin/ldconfig /sbin/ldconfig; do
+            if [ -x "$c" ]; then
+                ldconfig() { "$c" "$@"; }
+                break
+            fi
+        done
+    fi
+    if ! command -v ldconfig &>/dev/null; then
         warn "ldconfig not available; cannot verify runtime libraries for $bin"
         return 0
     fi
@@ -185,6 +193,7 @@ ensure_runtime_dependencies() {
         # shellcheck disable=SC2086
         if $install_cmd $pkgs >/dev/null 2>&1; then
             ok "Installed $pkgs"
+            command -v ldconfig >/dev/null 2>&1 && ldconfig
         else
             warn "Could not install $pkgs. Install $lib ($pkgs) manually or the server will not start."
         fi
