@@ -112,6 +112,39 @@ pkg_install_prefix() {
 }
 
 # ---------------------------------------------------------------------------
+# Runtime shared-library presence checks
+# ---------------------------------------------------------------------------
+
+# is_loader_provided: SONAMEs the C runtime always provides. A dynamically
+# linked glibc host always has libc/libm/libpthread/libdl/librt/libresolv
+# (glibc 2.34+ folds pthread/dl/rt into libc), so reporting one "missing" — or
+# trying to install a package for it — is a false failure that aborted a correct
+# Debian install ("No known package provides libm.so.6"). Used by every Linux
+# installer's ensure_runtime_dependencies, so it lives here with the other
+# shared distro logic instead of being copied into each installer.
+is_loader_provided() {
+    case "$1" in
+        libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libresolv.so.2) return 0 ;;
+        libnss_*.so.2) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# lib_present: is SONAME $1 resolvable on this host? The (refreshed) ldconfig
+# cache first, then the standard library dirs: a cache that has not been
+# regenerated after an earlier package install in this same run reported
+# libraries that were present, and the install then failed on its own success
+# (libopus0 installed, yet "Runtime library libopus.so.0 is still missing").
+lib_present() {
+    local soname="$1" d
+    ldconfig -p 2>/dev/null | grep -q -F "$soname" && return 0
+    for d in /lib /usr/lib /lib64 /usr/lib64 /lib/*-linux-gnu /usr/lib/*-linux-gnu; do
+        [ -e "$d/$soname" ] && return 0
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Package search
 # ---------------------------------------------------------------------------
 

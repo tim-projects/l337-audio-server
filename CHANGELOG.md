@@ -14,6 +14,69 @@ with the new version heading.
 ## [Unreleased]
 
 ### Added
+- `[server] loglevel` config key (`error`/`warn`/`info`/`debug`/`trace`):
+  the documented, platform-independent way to turn on server-side `tracing`
+  diagnostics without exporting `RUST_LOG` in a service `run` script.
+  Precedence: an explicit, parsable `RUST_LOG` wins, then `loglevel`, then the
+  crate default **`warn`** (errors and warnings only — the previous always-on
+  `debug` verbosity is now opt-in). An empty/blank `RUST_LOG` no longer silences
+  all logging — it falls through to `loglevel` — an unparsable `RUST_LOG` falls
+  back instead of disabling logging, and an unrecognized `loglevel` warns and
+  keeps the default instead of failing the boot. `off` is deliberately refused
+  from `server.ini` (only `RUST_LOG=off`, environment-controlled, can silence
+  the server), so a config edit cannot leave an install with no diagnostics and
+  no record of it. Startup logs the effective level and where it came from.
+
+### Fixed
+- `install-systemd.sh` wrote `/etc/l337-audio-server/config.toml`, which
+  `load_settings()` never reads (it reads `.../config`, probed by file
+  extension so an extensionless file can never match, and `.../server.ini`), so
+  the systemd installer's host/port/token were silently ignored. It now writes
+  `server.ini` and migrates a legacy `config.toml` on update.
+- Linux installers' runtime-library check no longer reports false failures on a
+  stock Debian host: SONAMEs the C runtime always provides (`libc.so.6`,
+  `libm.so.6`, `libpthread.so.0`, `libdl.so.2`, `librt.so.1`,
+  `libresolv.so.2`, `libnss_*.so.2`) are skipped instead of failing the install
+  with "no known package provides libm.so.6"; the loader cache is refreshed
+  before the check and the presence probe also scans the standard library dirs,
+  so a library installed earlier in the same run (before `ldconfig` was
+  re-run) is found instead of reporting "still missing" after a successful
+  install. A genuinely absent library still aborts the install before the
+  service is written.
+- Streaming decode no longer gives up after ~4 s of a slow download: the
+  Symphonia packet-decode `IoError` arm had its own short 20-cycle tolerance,
+  ending tracks mid-playback on a trickling WebM connection. It now shares the
+  Opus arm's `wait_for_progress` policy (10 min of no growth, with a warning
+  every ~20 s so a permanently wedged download is visible instead of a frozen
+  playhead with no explanation). The Opus demux-error arm's own log line was
+  also rate-limited (it used to log once per error for the whole buffering
+  phase) and now fires on the first cycle of a no-growth spell and every ~20 s
+  after that.
+- BUG-4: `best` (`target_kbps = 0`) now selects the **highest-bitrate**
+  available audio rendition instead of deferring to yt-dlp's own
+  `bestaudio` ranking, which resolved "best" to a ~129 kbps AAC m4a even when a
+  higher-bitrate Opus (itag 251) existed. The selection is made server-side from
+  yt-dlp's full format list, so it is observable via
+  `PlayerStatus.actual_kbps`/`codec`, and a ceiling that admits nothing falls
+  back to the lowest available rendition rather than failing playback.
+
+### Changed
+- `select_audio_format` (G2) now picks the **highest-bitrate** audio rendition
+  at or below the ceiling (`0` = best) from yt-dlp's full format list, instead
+  of leaving the choice to yt-dlp's own `bestaudio` ranking — which resolved
+  "best" to a ~129 kbps AAC m4a even when a higher-bitrate Opus (itag 251) was
+  available (BUG-4). The selection is made server-side so it is observable via
+  `PlayerStatus.actual_kbps`/`codec`, and a ceiling that admits nothing falls
+  back to the lowest available rendition rather than failing playback.
+- The whole-track resample timing test's budget is 120 s (was 20 s): on the
+  project's aarch64 device the linear path takes ~8 s alone and ~23 s under the
+  suite's parallel load in the debug profile, while the quadratic drain it
+  guards against takes minutes — the detector margin is unchanged.
+- The Linux installers' new `is_loader_provided` / `lib_present` helpers moved
+  into `scripts/lib-distro.sh` (which all three installers already source), so
+  the loader-provided-SONAME skip and the presence probe exist once instead of
+  in three byte-identical copies that could drift apart.
+
 - Linux installers now detect the distribution from `/etc/os-release`
   (Debian/Ubuntu, Fedora/RHEL, Arch, Alpine) and cross to the matching package
   manager (`apt-get`, `dnf`, `pacman`, `zypper`, `apk`).

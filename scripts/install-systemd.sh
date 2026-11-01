@@ -299,8 +299,15 @@ ensure_runtime_dependencies() {
         return 0
     fi
 
+    # Packages installed earlier in this run (ensure_audio_libs) are not in the
+    # loader cache yet, so refresh it before deciding anything is missing.
+    command -v ldconfig >/dev/null 2>&1 && ldconfig >/dev/null 2>&1
+
     for lib in $needed; do
-        if ldconfig -p 2>/dev/null | grep -q -F "$lib"; then
+        if is_loader_provided "$lib"; then
+            continue
+        fi
+        if lib_present "$lib"; then
             continue
         fi
         missing+=("$lib")
@@ -352,7 +359,7 @@ ensure_runtime_dependencies() {
     # Final gate: fail before the service is written so the operator never gets
     # a "successful" install whose server cannot exec.
     for lib in "${missing[@]}"; do
-        if ! ldconfig -p 2>/dev/null | grep -q -F "$lib"; then
+        if ! lib_present "$lib"; then
             fail "Runtime library $lib is still missing. Install it manually, then re-run this installer."
         fi
     done

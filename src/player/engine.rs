@@ -1954,15 +1954,37 @@ fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &Ato
 /// past tolerance and the caller should stop; `true` to retry. Shares one stall
 /// policy between the Opus and Symphonia streaming loops (G4). Sleeps while
 /// holding no buffer lock.
+///
+/// The tolerance is deliberately generous (STALL_TOLERANCE × 200 ms): a
+/// trickling WebM download routinely goes seconds without appending, and the
+/// demuxer keeps hitting element-past-master errors until the cluster completes,
+/// so an early give-up ended tracks mid-playback (the device U2/EOS report).
+/// Each no-growth spell is logged so a *permanent* wedge (the download finished
+/// or died while the demuxer keeps erroring) is visible instead of a frozen
+/// playhead with no explanation.
 fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cycles: &mut u32) -> bool {
+    const STALL_TOLERANCE: u32 = 3000;
+    const STALL_LOG_EVERY: u32 = 100; // ~20 s between progress reports
     let current_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if current_size > *last_file_size {
         *last_file_size = current_size;
         *stall_cycles = 0;
-    } else if *stall_cycles > 20 {
+    } else if *stall_cycles >= STALL_TOLERANCE {
+        tracing::warn!(
+            "stream stalled: no download growth for ~{}s at {} bytes; ending decode",
+            STALL_TOLERANCE * 200 / 1000,
+            current_size
+        );
         return false;
     } else {
         *stall_cycles += 1;
+        if *stall_cycles % STALL_LOG_EVERY == 0 {
+            tracing::warn!(
+                "stream waiting on download: no growth for ~{}s at {} bytes",
+                *stall_cycles * 200 / 1000,
+                current_size
+            );
+        }
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
     true
@@ -2084,7 +2106,21 @@ fn streaming_decode_sync(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    // Rate-limited on the *no-growth* episode, not the error
+                    // count: `wait_for_progress` resets `stall_cycles` to 0 on
+                    // every append, so guarding on `stall_cycles == 0` logged
+                    // once per error for the whole buffering phase (~5 lines/s
+                    // on a trickling download). `stall_cycles == 1` is the first
+                    // cycle of a no-growth spell, so this logs its start and
+                    // then every ~20 s (100 cycles) it continues.
+                    if stall_cycles == 1 || stall_cycles % 100 == 0 {
+                        tracing::warn!(error = ?e, ?stall_cycles, "streaming opus: demux error, waiting for download");
+                    }
+                    if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                        break;
+                    }
+                }
             }
         }
         return Ok(());
@@ -2221,11 +2257,13 @@ fn streaming_decode_sync(
                         stall_cycles = 0;
                     }
                     Err(symphonia::core::errors::Error::IoError(_)) => {
-                        stall_cycles += 1;
-                        if stall_cycles > 20 {
+                        // A truncated packet (the download hasn't reached it yet)
+                        // uses the shared stall policy, not its own short one:
+                        // giving up after ~4 s of no download growth ended tracks
+                        // mid-playback on a trickling connection.
+                        if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     Err(symphonia::core::errors::Error::ResetRequired) => {
                         let decoder_opts = Default::default();
@@ -2381,6 +2419,44 @@ mod tests {
         })];
         assert!(select_audio_format(&silent, 0).is_none());
         assert!(select_audio_format(&[], 0).is_none());
+    }
+
+    // BUG-4: `best` (ceiling 0) must deliver the highest available tier, not
+    // whatever yt-dlp's own `bestaudio` ranking happens to pick (yt-dlp resolves
+    // `bestaudio` to a ~129 kbps AAC m4a even when a higher Opus exists). The
+    // ladder here is deliberately out of order and includes a non-audio-only
+    // rendition that carries audio, to prove the ordering is ours, not yt-dlp's.
+    #[test]
+    fn test_select_audio_format_best_picks_highest_available() {
+        // Audio-only ladder, out of order: the 158 k Opus must win over the 129 k
+        // AAC that yt-dlp's own `bestaudio` ranking would have delivered.
+        let formats = vec![
+            fmt("140", Some(129.0), "mp4a.40.2"),   // the wrong pick under yt-dlp's ranking
+            fmt("251", Some(158.0), "opus"),        // highest available
+            fmt("250", Some(74.0), "opus"),
+            fmt("249", Some(51.0), "opus"),
+        ];
+        let best = select_audio_format(&formats, 0).expect("some format must be chosen");
+        assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"));
+        assert_eq!(
+            best.get("abr").and_then(|v| v.as_f64()),
+            Some(158.0),
+            "best must report the delivered bitrate of the rendition actually chosen"
+        );
+
+        // The fallback contract: when no audio-only rendition exists, any
+        // rendition carrying audio is playable, and the highest of those wins —
+        // so a 700 kbps video+audio rendition beats the 158 k Opus. This is the
+        // same guarantee `test_select_audio_format_prefers_audio_only_then_any_carrying_audio`
+        // exercises; pinned here so BUG-4's "highest" rule is not narrowed to
+        // audio-only sources by accident.
+        let with_video = vec![
+            fmt_video("22", 700.0, "mp4a.40.2"),
+            fmt("251", Some(158.0), "opus"),
+        ];
+        let best = select_audio_format(&with_video, 0).expect("some format must be chosen");
+        assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"),
+            "audio-only renditions win over higher-bitrate video+audio renditions");
     }
 
     #[test]
@@ -2694,5 +2770,45 @@ exit 1
             !DOWNLOAD_STREAM_INVOKED.load(Ordering::SeqCst),
             "download_stream should not be called when start_streaming_playback returns a block"
         );
+    }
+
+    // The streaming stall policy (shared by the Opus and Symphonia loops, G4).
+    // A trickling WebM download routinely goes seconds without appending while
+    // the demuxer reports element-past-master errors, so the tolerance must be
+    // far larger than the old 20-cycle (~4 s) one, which ended tracks
+    // mid-playback on the device. 50 cycles == 10 s of no growth must still be
+    // "retry" (the policy is 3000 cycles), and a growing file must reset the
+    // counter. shortcut: each cycle sleeps 200 ms, so this costs ~10 s of wall
+    // time; make the sleep injectable if the suite ever needs it faster.
+    #[test]
+    fn wait_for_progress_tolerates_a_slow_download_and_counts_growth() {
+        let dir = std::env::temp_dir().join("l337-stall-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("growing.webm");
+        let mut last_size = 0u64;
+        let mut stall_cycles = 0u32;
+
+        // A static file must not give up early: 50 cycles is 10 s without a
+        // single byte, and decode must still be waiting, not over.
+        for _ in 0..50 {
+            assert!(
+                wait_for_progress(&path, &mut last_size, &mut stall_cycles),
+                "wait_for_progress gave up after {} no-growth cycles",
+                stall_cycles
+            );
+        }
+        assert_eq!(stall_cycles, 50);
+
+        // Growth resets the episode counter.
+        std::fs::write(&path, vec![0u8; 8]).unwrap();
+        assert!(wait_for_progress(&path, &mut last_size, &mut stall_cycles));
+        assert_eq!(stall_cycles, 0, "a growing file must reset the stall counter");
+        assert_eq!(last_size, 8);
+
+        // A second no-growth spell starts from zero again, not from the old high.
+        assert!(wait_for_progress(&path, &mut last_size, &mut stall_cycles));
+        assert_eq!(stall_cycles, 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

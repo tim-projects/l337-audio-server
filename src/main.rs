@@ -55,6 +55,14 @@ struct ServerSettings {
     buffer_max_bytes: Option<u64>,
     #[serde(default)]
     default_target_kbps: Option<u32>,
+    /// Rust log level for `tracing` (`error`/`warn`/`info`/`debug`/`trace`).
+    /// An explicit `RUST_LOG` env var wins over this; an unset/invalid value
+    /// keeps the crate default (`warn`). `off` is deliberately NOT accepted
+    /// here: only the unit file owner can silence the server entirely, via
+    /// `RUST_LOG=off`, so a config edit cannot leave a running install with no
+    /// diagnostics and no record that logging was turned off.
+    #[serde(default)]
+    loglevel: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -124,8 +132,8 @@ fn parse_transport_cli() -> Option<String> {
 /// `buffer_max_bytes` is the *rebuffer window* (a few seconds of decoded PCM),
 /// not a whole track: consumed samples are reclaimed as playback advances (G4),
 /// so a generous window never OOMs a long track. `default_target_kbps = 0` means
-/// `best` (no ceiling; bit-exact pass-through for lossless sources) — see G2.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n# Rebuffer window (~24 MiB), not a whole-track buffer (see G4).\nbuffer_max_bytes = 25165824\n# Bandwidth ceiling in kbps; 0 = best / no ceiling (see G2).\ndefault_target_kbps = 0\n";
+/// `best` (no ceiling) — see G2.
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n# Rebuffer window (~24 MiB), not a whole-track buffer (see G4).\nbuffer_max_bytes = 25165824\n# Bandwidth ceiling in kbps; 0 = best / no ceiling (see G2).\ndefault_target_kbps = 0\n# Rust log level: error | warn | info | debug | trace. Default verbosity is\n# warn (errors and warnings only); set debug while hunting bugs. An explicit\n# RUST_LOG environment variable overrides this (RUST_LOG wins, see init_tracing).\nloglevel = \"warn\"\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
     let mut builder = config::Config::builder();
@@ -146,6 +154,114 @@ fn load_settings() -> Result<Settings, config::ConfigError> {
         .add_source(config::Environment::with_prefix("L337").separator("__"));
 
     builder.build()?.try_deserialize::<Settings>()
+}
+
+/// The tracing levels accepted for the `loglevel` config key (case-insensitive).
+/// `off` is intentionally absent: silencing the server from a config file the
+/// service principal can write would leave a running install with no
+/// diagnostics and no record of it. `RUST_LOG=off` (owned by whoever controls
+/// the environment) remains the way to silence it.
+fn is_tracing_level(level: &str) -> bool {
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "error" | "warn" | "info" | "debug" | "trace"
+    )
+}
+
+/// The `[server] loglevel` key resolved: the level to use, whether the value
+/// was unrecognized (warn after the subscriber exists), and whether the key was
+/// meaningfully set (drives the startup line's source attribution). Pure and
+/// env-independent, so the precedence rules are unit-testable.
+struct ResolvedLogLevel {
+    level: &'static str,
+    invalid: bool,
+    configured: bool,
+}
+
+/// Resolve the `[server] loglevel` key into a tracing level string. Absent,
+/// blank or unrecognized values keep the crate default (`warn` — errors and
+/// warnings only; set `debug` while hunting bugs).
+fn resolve_log_level(loglevel: Option<&str>) -> ResolvedLogLevel {
+    const DEFAULT_LEVEL: &str = "warn";
+    let requested = loglevel.map(str::trim).filter(|s| !s.is_empty());
+    let Some(level) = requested else {
+        return ResolvedLogLevel {
+            level: DEFAULT_LEVEL,
+            invalid: false,
+            configured: false,
+        };
+    };
+    match level.to_ascii_lowercase().as_str() {
+        "error" => ResolvedLogLevel { level: "error", invalid: false, configured: true },
+        "warn" => ResolvedLogLevel { level: "warn", invalid: false, configured: true },
+        "info" => ResolvedLogLevel { level: "info", invalid: false, configured: true },
+        "debug" => ResolvedLogLevel { level: "debug", invalid: false, configured: true },
+        "trace" => ResolvedLogLevel { level: "trace", invalid: false, configured: true },
+        _ => ResolvedLogLevel {
+            level: DEFAULT_LEVEL,
+            invalid: true,
+            configured: true,
+        },
+    }
+}
+
+/// The default per-crate filter for a level: this crate plus the HTTP layer.
+fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new(format!(
+        "{crate}={level},tower_http={level}",
+        crate = env!("CARGO_CRATE_NAME")
+    ))
+}
+
+/// Initialize `tracing` from the loaded settings.
+///
+/// Precedence: an explicit, parsable `RUST_LOG` env var wins (so a one-off debug
+/// session needs no config edit); else `[server] loglevel`; else the crate
+/// default (`warn`). This runs *after* `load_settings`, so anything logged
+/// before it (the instance-lock failure, `ensure_config_file`) reports on
+/// stderr instead of through a subscriber that does not exist yet.
+fn init_tracing(loglevel: Option<&str>) {
+    let resolved = resolve_log_level(loglevel);
+    // An empty/blank RUST_LOG would filter everything out, so treat it as unset.
+    let rust_log_set = std::env::var("RUST_LOG")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let (source, filter) = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        // RUST_LOG wins: report it, so the logged filter is the effective one.
+        Ok(from_env) if rust_log_set => ("RUST_LOG", from_env),
+        // An unparsable RUST_LOG must not silently disable all logging.
+        _ if rust_log_set => (
+            if resolved.configured {
+                "[server] loglevel (RUST_LOG was invalid)"
+            } else {
+                "default (RUST_LOG was invalid)"
+            },
+            default_log_filter(resolved.level),
+        ),
+        _ => (
+            if resolved.configured {
+                "[server] loglevel"
+            } else {
+                "default"
+            },
+            default_log_filter(resolved.level),
+        ),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    if resolved.invalid {
+        tracing::warn!(
+            requested = loglevel.unwrap_or(""),
+            "unknown server.ini loglevel; using {}",
+            resolved.level
+        );
+    }
+    tracing::info!(
+        "Log level: {} (from {source}; set [server] loglevel or RUST_LOG to change)",
+        resolved.level
+    );
 }
 
 #[tokio::main]
@@ -178,15 +294,6 @@ async fn main() {
         return;
     }
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
-            }),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     // Ensure a rustls crypto provider is selected (required before building TLS).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -195,11 +302,12 @@ async fn main() {
 
     // Acquire the single-instance lock before loading config or opening audio.
     // The guard is held for the lifetime of the process; dropping it on exit
-    // removes the lock file.
+    // removes the lock file. `init_tracing` runs after `load_settings`, so this
+    // fatal path reports on stderr rather than through (not yet installed) tracing.
     let _instance_guard = match platform::single_instance::InstanceLock::acquire() {
         Ok(lock) => lock,
         Err(e) => {
-            tracing::error!("{}", e);
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
@@ -218,6 +326,10 @@ async fn main() {
     // (systemd ConfigurationDirectory), with CWD ./server.ini as a local/dev
     // fallback. Environment vars (L337__*) win last.
     let mut settings = load_settings().expect("Failed to load config");
+
+    // Logging is configured from the loaded settings (`[server] loglevel`),
+    // so the subscriber can only be initialized here — after the config read.
+    init_tracing(settings.server.loglevel.as_deref());
 
     let max_pool = settings
         .storage
@@ -506,6 +618,11 @@ async fn main() {
 /// configuration on first run instead of panicking on a missing section. When
 /// that directory is not present (local/dev runs) it falls back to
 /// `server.ini` next to the binary (CWD).
+///
+/// Runs before `init_tracing` (it must write the file `load_settings` then
+/// reads), so its diagnostics go to stderr — the tracing subscriber does not
+/// exist yet, and these lines are the only record of the server having written
+/// a config to a fixed system path.
 fn ensure_config_file() {
     let etc_path = std::path::Path::new("/etc/l337-audio-server/server.ini");
     if etc_path.exists() {
@@ -519,12 +636,16 @@ fn ensure_config_file() {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
                 }
-                tracing::info!(
-                    "No server.ini found; created a default at {}",
+                eprintln!(
+                    "INFO: No server.ini found; created a default at {}",
                     etc_path.display()
-                )
+                );
             }
-            Err(e) => tracing::debug!("Could not create default server.ini at {}: {}", etc_path.display(), e),
+            Err(e) => eprintln!(
+                "DEBUG: Could not create default server.ini at {}: {}",
+                etc_path.display(),
+                e
+            ),
         }
         return;
     }
@@ -540,12 +661,16 @@ fn ensure_config_file() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(cwd_path, std::fs::Permissions::from_mode(0o600));
             }
-            tracing::info!(
-                "No server.ini found; created a default at {}",
+            eprintln!(
+                "INFO: No server.ini found; created a default at {}",
                 cwd_path.display()
-            )
+            );
         }
-        Err(e) => tracing::debug!("Could not create default server.ini at {}: {}", cwd_path.display(), e),
+        Err(e) => eprintln!(
+            "DEBUG: Could not create default server.ini at {}: {}",
+            cwd_path.display(),
+            e
+        ),
     }
 }
 
@@ -604,4 +729,54 @@ fn load_or_create_token() -> String {
 /// Probe whether `addr` can be bound. Returns `true` if the port is available.
 fn tcp_port_available(addr: SocketAddr) -> bool {
     std::net::TcpListener::bind(addr).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `[server] loglevel` is the documented, platform-independent way to turn on
+    // playback diagnostics without exporting RUST_LOG in a service `run` script
+    // (Termux sends the supervised stdout to /dev/null, so RUST_LOG was the only
+    // way to get logs before this key existed).
+    #[test]
+    fn loglevel_absent_keeps_crate_default() {
+        // The default is warn (errors + warnings only); debug is opt-in.
+        let r = resolve_log_level(None);
+        assert_eq!(r.level, "warn");
+        assert!(!r.invalid && !r.configured);
+        // Whitespace-only / empty means "not set", not "invalid".
+        let r = resolve_log_level(Some("  "));
+        assert_eq!(r.level, "warn");
+        assert!(!r.invalid && !r.configured);
+    }
+
+    #[test]
+    fn loglevel_known_values_pass_through_case_insensitively() {
+        for (input, expected) in [
+            ("debug", "debug"),
+            ("INFO", "info"),
+            (" warn ", "warn"),
+            ("Error", "error"),
+            ("trace", "trace"),
+        ] {
+            let r = resolve_log_level(Some(input));
+            assert_eq!(r.level, expected, "loglevel {input:?} must resolve to {expected:?}");
+            assert!(!r.invalid && r.configured);
+        }
+    }
+
+    #[test]
+    fn loglevel_unknown_value_warns_and_falls_back() {
+        // A typo must not silently kill logging (nor fail the boot): warn + default.
+        let r = resolve_log_level(Some("verbose"));
+        assert_eq!(r.level, "warn");
+        assert!(r.invalid && r.configured);
+        // "off" is rejected from the config key on purpose: only RUST_LOG
+        // (environment-controlled) may silence the server entirely, so a config
+        // edit cannot leave an install with no diagnostics and no record of it.
+        let r = resolve_log_level(Some("off"));
+        assert_eq!(r.level, "warn");
+        assert!(r.invalid, "loglevel=off must be refused from server.ini");
+    }
 }

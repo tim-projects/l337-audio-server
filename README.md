@@ -59,6 +59,28 @@ tail -f ~/Library/Logs/com.l337.audio-server.log
 - **Linux user service**: `~/.config/l337-audio-server/server.ini`
 - **macOS**: `~/Library/Application Support/l337-audio-server/server.ini`
 
+Keys (`[server]` section; every key is optional and `L337__SERVER__<KEY>` env
+vars win last, e.g. `L337__SERVER__PORT`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `host` / `port` | `127.0.0.1` / `1337` | TCP bind address (socket transport ignores it) |
+| `token` | generated + persisted | Auth token for `/player/*` |
+| `transport` | `auto` | `auto` (Unix socket on Unix), `socket`, or `http` |
+| `dummy` | `false` | Run without audio hardware (no soundcard needed) |
+| `buffer_max_bytes` | `25165824` | Rebuffer *window* — a few seconds of decoded PCM, not a whole track (G4) |
+| `default_target_kbps` | `0` | Bandwidth ceiling in kbps; `0` = best / no ceiling (G2) |
+| `loglevel` | `warn` | Rust log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+`loglevel` is the platform-independent way to get server-side playback
+diagnostics without editing a service `run` script: with `loglevel = "debug"`
+the server emits `tracing` output for bug hunting. Precedence: an explicit
+`RUST_LOG` environment variable wins, then `loglevel`, then the crate default
+(`warn` — errors and warnings only). `off` is deliberately not accepted from
+`server.ini`: only `RUST_LOG=off`, set by whoever controls the environment, can
+silence the server entirely, so a config edit cannot leave a running install
+with no diagnostics and no record of it.
+
 ## Uninstall
 
 ```bash

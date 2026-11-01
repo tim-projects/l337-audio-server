@@ -263,8 +263,12 @@ mod tests {
 
         // Generous for an unoptimized test build; the linear loop is ~1 ms there
         // and the quadratic one is seconds (measured: 165 s for 30 s of audio).
+        // The budget is 120 s, not 20: on the project's aarch64 device this test
+        // takes ~8 s alone and ~23 s under the full suite's parallel load in the
+        // debug profile, while the quadratic drain it guards against moves ~1 G
+        // elements per input — minutes, not seconds, on any machine.
         assert!(
-            elapsed.as_secs() < 20,
+            elapsed.as_secs() < 120,
             "resampling a whole track took {elapsed:?} (quadratic drain?)"
         );
         let peak: f32 = output.iter().fold(0.0, |m, s| m.max(s.abs()));

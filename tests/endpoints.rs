@@ -49,6 +49,17 @@ async fn find_available_port() -> u16 {
 /// Returns the port, a handle to the child process, and the state directory the
 /// challenge token is written to.
 async fn spawn_server() -> (u16, tokio::process::Child, PathBuf) {
+    spawn_server_inner(None).await
+}
+
+/// Like `spawn_server`, but with `extra_path` prepended to the server's PATH —
+/// the way a test puts a fake `yt-dlp` in front of a real one (the server
+/// resolves yt-dlp by name from its own environment).
+async fn spawn_server_with_path(extra_path: &PathBuf) -> (u16, tokio::process::Child, PathBuf) {
+    spawn_server_inner(Some(extra_path)).await
+}
+
+async fn spawn_server_inner(extra_path: Option<&PathBuf>) -> (u16, tokio::process::Child, PathBuf) {
     // Per-spawn isolation, not a shared config dir: the server locks fixed
     // runtime paths (its runtime dir plus a hardcoded /tmp fallback candidate)
     // and writes its challenge token to STATE_DIRECTORY, so concurrently
@@ -80,6 +91,16 @@ async fn spawn_server() -> (u16, tokio::process::Child, PathBuf) {
         .env("L337__SERVER__PORT", port.to_string())
         .env("L337__SERVER__HOST", "127.0.0.1")
         .env("TMPDIR", &base_dir)
+        .envs(extra_path.map(|dir| {
+            (
+                "PATH".to_string(),
+                format!(
+                    "{}:{}",
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+        }))
         .env("L337_RUNTIME_DIR", &base_dir)
         // The server resolves the challenge token's directory from
         // STATE_DIRECTORY (falling back to the platform cache dir), never from
@@ -909,6 +930,252 @@ async fn test_auth_redeem_is_single_use() {
         .expect("Failed to call /auth/redeem second time");
 
     assert_eq!(redeem_resp.status(), 401);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// A fake `yt-dlp` for the PATH-prefixed spawn: it serves a fixed audio-only
+/// rendition ladder to `--dump-single-json`, and for the actual download records
+/// its argv (so the test can see which rendition the server selected) before
+/// writing the fixture WAV to yt-dlp's `-o` destination.
+///
+/// `#!/bin/sh`, not bash: /bin/bash does not exist on Termux (/bin is
+/// /system/bin) and a missing interpreter makes execvp report ENOENT, which
+/// would silently fall through to a real yt-dlp further down PATH.
+fn write_fake_ytdlp(dir: &PathBuf, fixture: &PathBuf, log: &PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    // The ladder yt-dlp reports for a typical YouTube video: a high Opus tier
+    // above any test ceiling, plus AAC and two Opus tiers below it.
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in
+  *--version*)
+    echo "fake yt-dlp (test fixture)"; exit 0 ;;
+esac
+case "$*" in
+  *--dump-single-json*)
+    cat <<'JSON'
+{{"duration": 10, "formats": [
+  {{"format_id": "251", "abr": 158.0, "acodec": "opus",  "vcodec": "none", "ext": "webm", "duration": 10, "url": "https://example.invalid/251"}},
+  {{"format_id": "140", "abr": 129.0, "acodec": "mp4a.40.2", "vcodec": "none", "ext": "m4a", "duration": 10, "url": "https://example.invalid/140"}},
+  {{"format_id": "250", "abr": 74.0,  "acodec": "opus",  "vcodec": "none", "ext": "webm", "duration": 10, "url": "https://example.invalid/250"}},
+  {{"format_id": "249", "abr": 51.0,  "acodec": "opus",  "vcodec": "none", "ext": "webm", "duration": 10, "url": "https://example.invalid/249"}}
+]}}
+JSON
+    exit 0 ;;
+esac
+# The download invocation: record it, then produce the fixture.
+echo "$@" >> "{log}"
+dest=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-o" ]; then dest="$2"; fi
+  shift
+done
+if [ -n "$dest" ]; then cp "{fixture}" "$dest"; fi
+exit 0
+"#,
+        log = log.display(),
+        fixture = fixture.display()
+    );
+    std::fs::write(dir.join("yt-dlp"), script).unwrap();
+    let _ = std::fs::set_permissions(
+        dir.join("yt-dlp"),
+        std::fs::Permissions::from_mode(0o755),
+    );
+}
+
+/// G2 / finding #4: after `POST /player/target {"target_kbps":64}` the
+/// *background cache* must resolve its rendition under the runtime ceiling
+/// (not the config default). The fake yt-dlp records the format id the server
+/// asked for: the highest tier at or below 64 kbps (249, 51 kbps) — never the
+/// 158 kbps "best" tier the pre-fix code picked with the config default.
+#[tokio::test]
+async fn test_cache_next_honors_runtime_target_ceiling() {
+    let fake_dir = std::env::temp_dir().join("l337-test-fake-ytdlp");
+    let _ = std::fs::create_dir_all(&fake_dir);
+    let fixture = fake_dir.join("fixture.wav");
+    write_minimal_wav(&fixture);
+    let invocations = fake_dir.join("invocations.log");
+    let _ = std::fs::remove_file(&invocations);
+    write_fake_ytdlp(&fake_dir, &fixture, &invocations);
+
+    let (_port, mut child, config_dir) = spawn_server_with_path(&fake_dir).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    // Set the runtime ceiling, then confirm it is what the server reports.
+    let target_resp = client
+        .post(format!("https://127.0.0.1:{}/player/target", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"target_kbps": 64}))
+        .send()
+        .await
+        .expect("Failed to call /player/target");
+    assert_eq!(target_resp.status(), 200);
+    assert_eq!(target_resp.json::<serde_json::Value>().await.unwrap()["target_kbps"], 64);
+
+    // (No status check here: `PlayerStatus.target_kbps` is the *effective*
+    // per-track ceiling, which is 0 until a track actually plays under the new
+    // runtime default — the setter's own response is the echo of that default.)
+
+    // Background cache of a YouTube track under that ceiling.
+    let cache_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/next", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "track_id": "yt-ceiling-next",
+            "stream_url": "https://www.youtube.com/watch?v=ceilingtest",
+            "duration": 10
+        }))
+        .send()
+        .await
+        .expect("Failed to call /player/cache/next");
+    assert_eq!(cache_resp.status(), 202);
+
+    // The cache task runs in the background: wait for the download invocation.
+    let mut recorded = String::new();
+    for _ in 0..120 {
+        if let Ok(contents) = std::fs::read_to_string(&invocations) {
+            if contents.contains("-f ") {
+                recorded = contents;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        recorded.contains("-f 249"),
+        "cache_next downloaded a rendition above the 64 kbps runtime ceiling: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains("-f 251") && !recorded.contains("-f 140"),
+        "cache_next ignored the runtime ceiling and picked a higher tier: {recorded:?}"
+    );
+
+    // The cached slot must also reach the client-visible state.
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(
+        status_resp.json::<serde_json::Value>().await.unwrap()["next_cached"],
+        true
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_dir_all(&fake_dir);
+}
+
+/// G2 / finding #4: with no runtime ceiling (`target_kbps` unset → 0 == best),
+/// the background cache must ask yt-dlp for the **highest available** audio
+/// rendition — the 158 k Opus (251) — rather than whatever yt-dlp's own
+/// `bestaudio` ranking would have picked (a ~129 k AAC m4a, itag 140).
+#[tokio::test]
+async fn test_cache_next_best_picks_highest_available() {
+    let fake_dir = std::env::temp_dir().join("l337-test-fake-ytdlp-best");
+    let _ = std::fs::create_dir_all(&fake_dir);
+    let fixture = fake_dir.join("fixture.wav");
+    write_minimal_wav(&fixture);
+    let invocations = fake_dir.join("invocations.log");
+    let _ = std::fs::remove_file(&invocations);
+    write_fake_ytdlp(&fake_dir, &fixture, &invocations);
+
+    let (_port, mut child, config_dir) = spawn_server_with_path(&fake_dir).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    // No runtime ceiling: the default `default_target_kbps = 0` means best.
+    let cache_resp = client
+        .post(format!("https://127.0.0.1:{}/player/cache/next", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "track_id": "yt-best-next",
+            "stream_url": "https://www.youtube.com/watch?v=besttest",
+            "duration": 10
+        }))
+        .send()
+        .await
+        .expect("Failed to call /player/cache/next");
+    assert_eq!(cache_resp.status(), 202);
+
+    // The cache task runs in the background: wait for the download invocation.
+    let mut recorded = String::new();
+    for _ in 0..120 {
+        if let Ok(contents) = std::fs::read_to_string(&invocations) {
+            if contents.contains("-f ") {
+                recorded = contents;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        recorded.contains("-f 251"),
+        "best must request the highest available rendition (251): {recorded:?}"
+    );
+    assert!(
+        !recorded.contains("-f 140"),
+        "best must not fall back to yt-dlp's lower AAC ranking (140): {recorded:?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_dir_all(&fake_dir);
+}
+/// — it is skipped and the server default applies (`resolve_ceiling` doc
+/// contract). Uploaded through the real endpoint against a real file source, so
+/// this covers the axum `Json` extractor's tolerant deserializer, not just the
+/// unit test in models.rs.
+#[tokio::test]
+async fn test_play_unknown_quality_falls_back_to_server_default() {
+    let (_port, mut child, config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    let audio_path = std::env::temp_dir().join("l337-test-quality.wav");
+    write_minimal_wav(&audio_path);
+
+    let payload = serde_json::json!({
+        "track_id": "quality-ultra-track",
+        "stream_url": format!("file://{}", audio_path.display()),
+        "quality": "ultra",
+        "duration": 1
+    });
+
+    let resp = client
+        .post(format!("https://127.0.0.1:{}/player/play", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&payload)
+        .send()
+        .await
+        .expect("Failed to call /player/play");
+
+    // 200, not 422: the unknown label is skipped, falling back to the server
+    // default (here the unset default: 0 == best).
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    let status = status_resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(status["target_kbps"], 0, "unknown quality must fall back to the server default");
 
     let _ = child.kill().await;
     let _ = child.wait().await;
