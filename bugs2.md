@@ -503,3 +503,97 @@ No playback semantics changed; the open items from the earlier updates were work
 - Still open/unverified: BUG-4 on a live target, the device-only playback checks
   (`position_sec` on a real sink, RSS reclaim, forced sink error), finding #3's whole-track
   file-decode peak, and the `pipelinepro` (Debian) installer rerun.
+
+---
+
+# Session — 2026-11-02 (Termux device + Linux host): re-test of the installed build
+
+**Scope.** Re-ran the checks after the user's bug-fix work, against the **installed** server
+(`~/.local/share/l337-player/bin/l337-audio-server`, mtime `2026-11-02 01:52`, runit pid 28299) and
+the test suite on the Linux host. All live requests are exactly what the player app sends
+(dependency-free stdlib HTTP client on the Unix socket; the device Python still has no third-party
+deps).
+
+## Provenance of the running binary (important)
+
+`/version` → `2026.11.02-2`, `readelf -d` → `NEEDED libopus.so`, and the Nov-01 markers
+(`loglevel`, `wait_for_progress`, `codecs`) are all present in the binary — so the running artifact
+is a **local build of the fixed `g1-opus-decode` tree**, *not* a GitHub release:
+`git ls-remote --tags origin` shows `2026.11.01-1`, `2026.11.02-1` and `2026.11.02-2` **all pointing
+at `d5cc62a` (`main`, 2026-10-27)**, which predates the whole branch (33 commits: G1 Opus decode,
+BUG-1..BUG-4, `wait_for_progress`, `loglevel`). `origin/testing` is stale (2026-09-04). Anyone who
+installs from a GitHub release therefore gets a binary with **none** of the fixes — releasing the
+branch is still the outstanding step (see bugs.md).
+
+## Suite on the Linux host (`pipelinepro`, Debian 13 x86_64) — GREEN
+
+Rust/cargo builds are **no longer done on this device** (operator directive; two on-device builds
+this session died on disk exhaustion — see "Device build budget"). Host setup performed:
+rustup at `/home/vscode/cargo-home`, `~/lib/libopus.so` → `/usr/lib/x86_64-linux-gnu/libopus.so.0`
+(no `libopus-dev`, no passwordless sudo; passed via `LIBRARY_PATH=$HOME/lib`), clone fast-forwarded
+to `fa38573`.
+
+```
+cargo test --no-default-features --features alsa,opus -j 2      # LIBRARY_PATH=$HOME/lib
+unit:       58 passed; 0 failed; 0 ignored   (155.78s)
+endpoints:  25 passed; 0 failed; 0 ignored   (156.91s)   # both spawn with --dummy --transport=http
+exit 0
+```
+
+Feature note: `alsa,opus` is the correct Linux-host combo here (`alsa.pc` present; no pipewire/pulse
+dev headers). No CI workflow runs `cargo test` (only `build.yml` + `monthly-release.yml`), so this
+host run is currently the only execution environment for the suite.
+
+## Live playback checks — device, installed binary, tracks from the player logs
+
+Tracks used (newest first, from `~/.cache/l337/l337-events.log` `play_candidate` events):
+`Y6HH7vF37dE`, `sv1JYRY6p1A`, `7SCFWNrTxxE`, `wJkFehapkEU`, `JB-mqd08CBY` ("Dig This Vibe" — DJ
+Krush, 287 s; the player had recorded `ReadTimeout` for these alternates), `ujNeHIo7oTE` ("With Or
+Without You" — U2, 281 s), `bZiCchjRW_s` ("I Need Your Lovin'" — N-R-G, 231 s).
+
+| Check | Result | Evidence |
+|---|---|---|
+| `/health` capabilities | **PASS** | `codecs: ["opus","aac","vorbis","mp3","flac","alac","pcm_s16le"]`, `quality: true`, `yt_dlp: true` — the NOTES advertisement item is closed. `PlayerStatus` also now carries a human `time` field (`"00:00/04:54"`), closing the other NOTES item. |
+| **BUG-4** best = highest available | **PASS (verified both directions)** | `yt-dlp -F` cross-check: Y6HH7vF37dE audio = 49/113/129 kbps (251 Opus is only 113 k) → server reports `codec=aac, actual_kbps=129` (the true max); ujNeHIo7oTE audio = 49/57/74/129/144 kbps → server reports `codec=opus, actual_kbps=144` (itag 251). BUG-4 is now verifiable on this device and correct. |
+| **BUG-1** position monotonic | **PASS** | 60 s poll on Y6HH7vF37dE (AAC path): `0,1,2,…,58`, no backward jump (one repeat at t=10 s from 1 s sampling). No sawtooth. |
+| **BUG-2** bounded sink backlog | **PASS** | `pactl list sink-inputs` during playback: `count=1`, `Buffer Latency: 256231 usec` (≈0.26 s) — not the 9975 s backlog. |
+| **BUG-3** EOS → stopped | **PASS** | seek to 284 s of 294 s → 11 s later the debug log shows `end of track reached: state = stopped`, position reset, sink-input released. |
+| `stop()` teardown | **PASS** | `POST /player/stop` → `state=stopped`, `position_sec=0`, sink-inputs `count=0` (no leaked input, no silent appends). |
+| Audio is not silence | **PASS** | `parec --device=OpenSL_ES_sink.monitor` during Opus playback: 517 790 frames, peak sample 6513 (0 = the old `resample_interleaved` zeros regression). |
+
+## NEW defect — Opus/WebM streaming stalls at ~9 s (U7's "remaining stall" is still open)
+
+Playing `ujNeHIo7oTE` (Opus 251, 5.01 MB): `play` → `playing`, `position_sec` reached 9, then
+**froze at 9 for 60+ s while `state` stayed `playing`**. The isolated instance (`RUST_LOG=debug`):
+
+```
+INFO engine: play_track: YouTube streaming for https://www.youtube.com/watch?v=ujNeHIo7oTE
+INFO symphonia_format_mkv::demuxer: stream is seekable with len=163840 bytes
+WARN engine: streaming opus: demux error, waiting for download
+     error=DecodeError("mkv: attempt to read element data past master element ") stall_cycles=0
+```
+
+The download was still in progress (this connection runs ~32 KB/s, so the whole 5.01 MB takes
+~160 s) and only one warning was emitted in 72 s — the demuxer is wedged past the downloaded
+prefix and does **not** resume decoding as the file grows. This is exactly the U7 case
+`bugs.md`/Update 8 says still needs a "seek/restart of the demuxer". The AAC (isomp4) path does not
+stall: the same session streamed Y6HH7vF37dE (m4a, 4.77 MB) through 60 s of 1× playback with
+position advancing normally, so the defect is specific to the **WebM/MKV Opus reader**.
+
+Secondary observation: `duration_sec` is derived from the container (294.6 s for a 287 s track, 292
+for 281) — consistent with `n_frames` from `decode_to_pcm`; it is *more* accurate than the client's
+metadata but disagrees with it.
+
+## Device build budget (for the record — why builds stopped happening here)
+
+- **Two builds died this session.** The device target dir was 1.8 GB with 581 MB free. Running
+  `cargo test` **without** the device's `RUSTFLAGS="-C debug-assertions=off"` invalidated *every*
+  dependency fingerprint and started a full rebuild with `-C debuginfo=2`, which exhausted the
+  device disk (`rustc-LLVM ERROR: IO failure on output stream: No space left on device`) and killed
+  the run. The documented device flag set is `CARGO_HOME=$HOME/.cargo
+  CARGO_TARGET_DIR=$TMPDIR/l337-build RUSTFLAGS="-C debug-assertions=off" LD_LIBRARY_PATH=$PREFIX/lib`.
+- `CARGO_PROFILE_DEV_DEBUG=0` (used by the earlier opus-only runs in `$TMPDIR/l337-check`) shrinks
+  artifacts by roughly 10× and is the right knob for any future on-device build.
+- `rm -rf $TMPDIR/l337-build/debug/incremental` freed 516 MB of pure cache when space ran out.
+- Conclusion recorded as an operator decision: **the suite runs on the Linux host**, the device runs
+  only the installed binary and the live checks.

@@ -678,3 +678,49 @@ only, so it selects no backend for the Android host triple — not a regression)
   (systemd enable/start/verify poll, `launchctl bootstrap`).
 - Finding #3's whole-track file decode peak (upgrade path: incremental file decode into the
   throttled producer) and finding #6's lossless-format preference remain as documented shortcuts.
+
+---
+
+# Session — 2026-11-02: host suite re-run + release provenance
+
+## Suite executed on a Linux host (`pipelinepro`, Debian 13 x86_64) — GREEN at `fa38573`
+
+The user directed that **Rust/cargo builds must no longer happen on the Termux device** (two
+on-device builds this session died on disk exhaustion — full details in `bugs2.md`'s device build
+budget). The suite therefore ran on the Linux host instead:
+
+```
+cargo test --no-default-features --features alsa,opus -j 2     # LIBRARY_PATH=$HOME/lib
+unit:       58 passed; 0 failed; 0 ignored   (155.78s)
+endpoints:  25 passed; 0 failed; 0 ignored   (156.91s)
+exit 0
+```
+
+Host prerequisites recorded for the next session: rustup at `/home/vscode/cargo-home` (bin in
+`$HOME/cargo-home/bin`); `~/lib/libopus.so` → `/usr/lib/x86_64-linux-gnu/libopus.so.0` symlink,
+passed with `LIBRARY_PATH=$HOME/lib` (there is no `libopus-dev` and **no passwordless sudo**);
+clone at `~/git/l337-audio-server` on `g1-opus-decode`; `alsa.pc` is present so `alsa,opus` is the
+right feature combo (no pipewire/pulse dev headers). Note **no CI workflow runs `cargo test`**
+(`build.yml` and `monthly-release.yml` only), so the suite has never run in CI — a `cargo test` job
+is the obvious next improvement.
+
+## Release provenance — the published binaries do NOT contain this work
+
+`git ls-remote --tags origin`: `2026.11.01-1`, `2026.11.02-1` and `2026.11.02-2` all point at
+`d5cc62a` (`main`, 2026-10-27) — 33 commits *before* the G1 Opus decode, BUG-1..BUG-4,
+`wait_for_progress` and `loglevel` work on `g1-opus-decode`. `origin/testing` is stale
+(2026-09-04). The installed device binary that passes every live check is a **local build** of the
+branch, so **no released artifact currently carries the fixes**. Merging `g1-opus-decode` into
+`main` and cutting a release remains the outstanding step; until then, installs from GitHub (and
+the installer's release walk) silently regress to pre-fix behavior.
+
+## What this session verified that was previously "unverified"
+
+- **BUG-4 is now verified on-device, in both directions** (best = highest available): see the
+  `yt-dlp -F` cross-check table in `bugs2.md` (AAC 129 k where AAC is the max; Opus 144 k where
+  Opus is the max).
+- BUG-1/BUG-2/BUG-3, `stop()` teardown, non-silent output and the `/health` capability
+  advertisement re-verified against the installed binary (table in `bugs2.md`).
+- **Still open, reproduced today:** the WebM/Opus streaming stall at ~9 s (U7's remaining stall —
+  `mkv: attempt to read element data past master element` wedges the demuxer while the download
+  keeps growing; the isomp4/AAC path does not stall). Details and the debug trace in `bugs2.md`.
