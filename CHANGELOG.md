@@ -61,6 +61,17 @@ with the new version heading.
   back to the lowest available rendition rather than failing playback.
 
 ### Changed
+- The `Build Release Binaries` workflow's manual dispatch now **requires a
+  `branch` input**: a dispatch run no longer builds whichever ref the trigger
+  names by default (a bare `gh workflow run` falls back to the default branch),
+  and every job — including `publish-release` — checks out that branch. The
+  publish job also creates the release tag at the commit it actually built
+  (`gh release create --target $GITHUB_SHA`) instead of the default-branch tip,
+  so the tag, the released assets and GitHub's source links can no longer
+  disagree. This is the mismatch that shipped release `2026.11.02-3`: correct
+  binaries built from `g1-opus-decode`, tagged at the pre-fix `main` commit.
+  The monthly-release runner (official releases from `main`) is unaffected —
+  it has no branch input and keeps its own ref.
 - `select_audio_format` (G2) now picks the **highest-bitrate** audio rendition
   at or below the ceiling (`0` = best) from yt-dlp's full format list, instead
   of leaving the choice to yt-dlp's own `bestaudio` ranking — which resolved

@@ -5,6 +5,18 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
+      # REQUIRED on purpose: without an explicit branch the workflow runs on
+      # whatever ref the trigger names (bare `gh workflow run` defaults to the
+      # default branch), and the release used to be tagged at the *default*
+      # branch tip while the binaries were built from that other ref. Naming
+      # the branch here — and checking it out below, plus tagging at
+      # $GITHUB_SHA in the publish job — means the tag, the released assets and
+      # the source links can never disagree again. Official releases are cut by
+      # the monthly-release runner from main, not by dispatch.
+      branch:
+        description: 'Branch to build from (required - e.g. g1-opus-decode)'
+        required: true
+        type: string
       target:
         description: 'Build target (or "all")'
         required: false
@@ -66,6 +78,11 @@ jobs:
       version: ${{ steps.set_tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Dispatch builds the branch named in the required input; the monthly
+          # (workflow_call) and pull_request triggers have no branch input and
+          # keep their own ref. See the workflow_dispatch.branch comment.
+          ref: ${{ inputs.branch || github.ref }}
       - name: Set release tag
         id: set_tag
         env:
@@ -127,6 +144,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Install dependencies and Rust target
       run: |
         apt-get update
@@ -164,6 +186,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -188,6 +215,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -223,6 +255,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Install dependencies and Rust target
       run: |
         apt-get update
@@ -262,6 +299,11 @@ jobs:
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_AR: arm-linux-gnueabihf-ar
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Install dependencies and Rust target
       run: |
         apt-get update
@@ -297,6 +339,11 @@ jobs:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_AR: riscv64-linux-gnu-ar
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Install dependencies and Rust target
       run: |
         apt-get update
@@ -328,6 +375,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -402,6 +454,11 @@ jobs:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -428,6 +485,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
@@ -583,7 +645,13 @@ jobs:
           echo "No changelog entries - using auto-generated notes"
         fi
 
+        # --target pins the new tag to the commit this run actually built.
+        # Without it gh creates the tag at the default-branch tip, so a
+        # dispatch build from a feature branch produced binaries from one
+        # commit while its tag (and GitHub's source links) pointed at another
+        # (the mismatch that shipped release 2026.11.02-3).
         gh release create "${{ needs.determine-version.outputs.tag }}" \
+          --target "$GITHUB_SHA" \
           --title "L337 Audio Server ${{ needs.determine-version.outputs.tag }}" \
           $FLAGS \
           "${NOTES_ARGS[@]}" \
@@ -597,6 +665,11 @@ jobs:
     # CI (it was rewritten and never run anywhere).
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Dispatch builds the branch named in the required input; the monthly
+        # (workflow_call) and pull_request triggers have no branch input and
+        # keep their own ref. See the workflow_dispatch.branch comment.
+        ref: ${{ inputs.branch || github.ref }}
     - name: Syntax-check the bash installers
       run: |
         for s in install.sh scripts/install-android-termux.sh scripts/install-linux-alsa.sh \
