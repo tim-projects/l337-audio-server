@@ -1,4 +1,43 @@
-# Review findings — `g1-opus-decode` vs `origin/main`
+# bugs — consolidated defect, findings and verification log
+
+**Single source of truth for `l337-audio-server`.** `bugs2.md` was merged into this file on
+2026-11-02: its playback-defect records became [Part 5](#part-5--playback-defect-records-bug-1bug-4)
+and its dated updates became the [Session log](#part-6--session-log-chronological). No content was
+dropped in the merge; sections that referenced `bugs2.md` now reference the in-file records.
+
+## Status summary — 2026-11-02 (branch `g1-opus-decode` @ `e7834d8`, release `2026.11.02-4`)
+
+| ID | Defect / finding | State | Verified |
+|---|---|---|---|
+| **BUG-1** | Playback timeline resets/loops every ~10.9 s while streaming | **FIXED** | device 2026-10-30, re-verified 2026-11-02 (60 s monotonic `0…58`, no backward jump) |
+| **BUG-2** | Unbounded streaming to the sink (~9975 s PulseAudio backlog) | **FIXED** | device 2026-10-30, re-verified 2026-11-02 (`Buffer Latency: 256231 usec`) |
+| **BUG-3** | No end-of-track — state stayed `playing` forever | **FIXED** | device 2026-10-30, re-verified 2026-11-02 (seek→284 s of 294 s → `stopped` at EOS) |
+| **BUG-4** | `best` (`target_kbps=0`) selected a low-bitrate rendition | **FIXED** | verified on a live target 2026-11-02, **both directions** via `yt-dlp -F` (AAC 129 k when AAC is the max; Opus 144 k when Opus is the max) |
+| **BUG-A** | `resample_interleaved` emitted literal zeros for 44.1→48 kHz (all AAC/MP3 playback was silent) | **FIXED** | 2026-11-02 `parec` monitor peak **6513** during AAC playback (0 = the old regression) |
+| **BUG-B** | `stop()` never tore the stream down — leaked sink-input appending silence | **FIXED** | 2026-11-02 sink-input `count=0` after `POST /player/stop` |
+| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **PARTIAL** — premature-EOS fixed; the WebM/Opus stall is **STILL OPEN** | 2026-10-31 and 2026-11-02 (debug trace in Part 7) |
+| **C** | The installed binary was a stale release — none of the fixes were in the running artifact | **FIXED** — provenance found, runner hardened | 2026-11-02: dispatch requires a branch + tag pinned to `$GITHUB_SHA`; release `2026.11.02-4` tag == built commit |
+| **NOTES** | Client progress bar (`time` field) + `/health` capability advertisement | **CLOSED** | 2026-11-02 `codecs`/`quality` advertised; `PlayerStatus.time` = `"00:00/04:54"` |
+| **Finding #1** | Linux binaries need `libopus` at runtime; no installer provided it | **FIXED** | host 2026-10-29; re-verified per-asset in `release-info.json` for `2026.11.02-4` |
+| **Finding #2** | Reclaim + window cap on PulseAudio only (5 other backends tripped) | **FIXED** | code; raw `pcm.len() > buf.max_bytes` gone from `src/platform/` |
+| **Finding #3** | File/fMP4/cached path keeps the whole decoded track resident | **PARTIAL** — capacity bounded; incremental file decode **OPEN** | — |
+| **Finding #4** | Background cache ignored the runtime ceiling from `POST /player/target` | **FIXED** | `test_cache_next_honors_runtime_target_ceiling` |
+| **Finding #5** | Unknown `quality` string rejected (422) | **FIXED** | `test_play_unknown_quality_falls_back_to_server_default` (200) |
+| **Finding #6** | `lossless` not enforced; `needs_bitexact()` dead | **FIXED** (docs made honest) | real bit-exact enforcement remains a documented future item |
+| **Finding #7** | `CHUNK_FRAMES = 256` forced ~190 PA writes/sec | **FIXED** in code (4096); device re-check **OPEN** | — |
+| **Finding #8** | Termux libopus install/diagnostics, matrix `fail-fast`, needless `libclang` | **FIXED** | |
+| **Finding #9** | Committed `libopus.so` stub can drift; per-asset Opus capability unrecorded | **FIXED** (CI validation + recording) | optional CI regeneration-with-diff remains open |
+| **Finding #10** | Duplicated stall/retry policy (Opus vs Symphonia) | **FIXED** | `wait_for_progress` shared + unit test |
+| **Host-run extras** | `track_id` traversal write/delete (CRITICAL), bare-token 401, double yt-dlp, seek clamp, volume lost after recovery, self-inflicted volume regression, dummy-mode config passthrough | **FIXED** | host run 2026-10-29 (table in Part 3) |
+| **Installer rounds** | 404-skip release walk, stale `.tmp` install, root CWD exec, `--binary` clobber, termux glibc detection, service enable/start/verify, wrong transport, macOS asset, download checksums, Debian false failures, systemd `server.ini` | **FIXED** | device 2026-10-31/11-01 + suite |
+| **Release process** | Release tag created at the default-branch tip, not the built commit (2026.11.02-3 had correct binaries, stale source refs) | **FIXED** | 2026-11-02: dispatch requires `branch`, all jobs check it out, `gh release create --target $GITHUB_SHA`; `2026.11.02-4` verified tag == commit |
+
+Merge gate: **all CRITICAL/WARNING findings closed.** What remains open is listed in
+[Part 7](#part-7--new-findings-issues-and-mitigations--2026-11-02).
+
+---
+
+# Part 1 — Review findings (`g1-opus-decode` vs `origin/main`)
 
 Checklist of every finding from the branch review (`/review branch`). Fix top-to-bottom by
 severity; each item has the same shape: **Sev**, **Where**, **Problem**, **Suggestion**, and a
@@ -153,7 +192,7 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 
 ---
 
-**Progress:** 10 / 10 addressed.
+**Progress:** 10 / 10 addressed (see the [status summary](#status-summary--2026-11-02-branch-g1-opus-decode--e7834d8-release-20261102-4) for the current state of every item).
 
 Remaining (documented, tracked for follow-up): finding #3's scope note — decode local files incrementally so the file-path peak is eliminated (a known shortcut, correctness unaffected, and the peak is reclaimed as playback advances); and the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
 
@@ -167,7 +206,7 @@ for the remaining device-only items.
 
 ---
 
-# Linux host verification checklist
+# Part 2 — Linux host verification checklist
 
 Run on a stock Linux host (Debian/Ubuntu, Fedora, or Arch) with PipeWire **and** an
 ALSA box, newest release downloaded from GitHub. Use an **isolated instance** so the
@@ -201,7 +240,7 @@ must be on `PATH` for the YouTube steps. Socket mode keeps `/setup` for token di
 
 ---
 
-# Host verification run — Debian 13 (trixie), x86_64, dummy output
+# Part 3 — Host verification run — Debian 13 (trixie), x86_64, dummy output
 
 Executed against `2026.10.29-5` / `2026.10.29-6` (prereleases from
 `g1-opus-decode`), isolated instance (private `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY`,
@@ -270,7 +309,7 @@ local controllable HTTP origin were on `PATH`.
 
 ---
 
-# Skipped work: hand-off for a Linux host with a real PipeWire/ALSA sink
+# Part 4 — Skipped work: hand-off for a Linux host with a real PipeWire/ALSA sink
 
 Everything below was **not** executed on the Debian 13 dummy-output host, because
 the host cannot exercise it. Each item states **why** it was skipped, **exactly**
@@ -533,20 +572,250 @@ assets, the release-info `needed_shared_libs` field, and every installer's
 
 ---
 
-# Termux device session — 2026-10-30 (the device this project's Linux docs could not cover)
+# Part 5 — Playback defect records (BUG-1..BUG-4)
+
+Records from `bugs2.md` ("remaining playback defects after the Opus/pacing pass"), merged here
+2026-11-02 with their resolution. **All four are FIXED and device-verified** (see the
+[status summary](#status-summary--2026-11-02-branch-g1-opus-decode--e7834d8-release-20261102-4));
+the original symptom/root-cause detail is preserved because the failure modes still guide
+regression tests.
+
+Original baseline (2026-10-29, what already worked): Opus compiled in (`DT_NEEDED libopus.so`),
+`POST /player/play` with a YouTube page URL resolved and played, audio reached the OpenSL sink at
+1×, `PlayerStatus` reported `target_kbps`/`actual_kbps`/`codec`, `/player/stop` → `stopped`. The
+defects below were all in the **streaming → writer → sink** lifecycle and end-of-track handling in
+`src/player/engine.rs` (`start_streaming_playback`, `streaming_decode_sync`, `get_status`) and the
+platform writer loops (`pulseaudio.rs::writer_loop`, `common.rs::AudioBuffer`).
+
+## BUG-1 — Playback timeline resets/loops every ~10 s while streaming
+
+**Symptom.** `position_sec` climbed 0..~9 s then jumped back to 0 and repeated on a ~10 s cycle;
+the track never played through and interacted badly with BUG-3.
+
+**Root cause.** Not a streaming re-decode, as first hypothesised: the timeline rewound every
+**~10.9 s**, exactly the writer's `read_pos >= 1<<20` checkpoint. `AudioBuffer::reclaim_consumed()`
+drains the consumed prefix and resets `read_pos = 0`, while both position computations
+(`calculate_position`, `get_status`) derived the playhead from `read_pos` alone — so every reclaim
+jumped back to the seek base.
+
+**Fix.** `AudioBuffer::consumed_total` counts reclaimed samples; position =
+`consumed_total + read_pos`, reset at every buffer refill. Guarded by the unit test
+`test_position_survives_writer_reclaim`.
+
+**Verify (PASS).** Device 2026-10-30: live trace `0,1,2,…,8,10,11,…,29` then EOS — no sawtooth.
+Re-verified 2026-11-02 against the installed release build: 60 s of 1 Hz polling on
+`Y6HH7vF37dE` (AAC path) gave `0,1,2,…,58` with no backward jump.
+
+## BUG-2 — Unbounded streaming to the sink (~9975 s backlog; memory grows)
+
+**Symptom.** PulseAudio's `Buffer Latency` for the server's sink-input grew to ~9975 s for a 231 s
+track (the stream was appended ~43× to one open sink-input with no bound) and only drained at real
+time; server RSS grew without limit.
+
+**Root cause.** The writer loop wrote as fast as it could with no real-time pacing and
+`AudioBuffer` never reclaimed as `read_pos` advanced; combined with BUG-1's re-append path
+(plan item G4 — bounded, real-time-paced window — was not yet in effect).
+
+**Fix (plan G4).** Pace the writer to the device clock (`n / (channels * rate)`); enforce the cap
+on the *unconsumed* window (`(pcm.len() - read_pos) > max_bytes/4`); reclaim via
+`pcm.drain(..read_pos); read_pos = 0` at the writer checkpoint under the existing `Mutex`; treat
+`buffer_max_bytes` as a rebuffer window (a few seconds) rather than a whole track; never re-open /
+append on a stream that is already playing.
+
+**Verify (PASS).** Device 2026-10-30: one 30 s track → PA `Buffer Latency` ~38 s flat and the
+server window drained ~1× (the residual was the device's OpenSL sink, not the server).
+Re-verified 2026-11-02: `pactl list sink-inputs` during playback → `count=1`,
+`Buffer Latency: 256231 usec` (≈0.26 s) and 42897 usec on the second track.
+
+## BUG-3 — No end-of-track: state stays `playing` after playback finishes
+
+**Symptom.** Neither the position nor the state ever signalled completion, so the player's
+auto-advance (it watches for `playing → not playing`) never fired.
+
+**Fix.** `get_status` ends playback as `state = stopped` (position reset) once the decode task is
+finished **and** the buffer is fully drained; a drained buffer with decode still running stays
+`playing` (rebuffer, not EOS).
+
+**Verify (PASS).** Device 2026-10-30: `playing → stopped` at track end. Re-verified 2026-11-02 on
+the installed build: seek to 284 s of a 294 s track → 11 s later the debug log showed
+`end of track reached: state = stopped`, `position_sec` reset, sink-input released.
+
+## BUG-4 — "best" quality selects a low-bandwidth rendition instead of the highest available
+
+**Symptom.** At `target_kbps = 0` ("best"), the server reported `codec: aac, actual_kbps: 129`,
+while YouTube offered a higher-bitrate Opus (itag 251) — yt-dlp's own `bestaudio` ranking won.
+
+**Fix (commit `83dd28f`).** `select_audio_format` now picks the **highest-bitrate** audio rendition
+at or below the ceiling (0 = best) from yt-dlp's full format list, server-side so the choice is
+observable via `PlayerStatus.actual_kbps`/`codec`; a ceiling that admits nothing falls back to the
+lowest available rendition rather than failing playback. Regression tests at unit and endpoint
+level (a fake `yt-dlp` that records the requested format id).
+
+**Verify (PASS — 2026-11-02, this device, previously "unverifiable here").** Cross-checked against
+`yt-dlp -F` for the tracks in the player logs:
+
+| Track | yt-dlp audio formats | Reported | Verdict |
+|---|---|---|---|
+| `Y6HH7vF37dE` | 139/49k AAC, **140/129k AAC**, 251/113k Opus | `codec=aac actual_kbps=129` | ✅ highest available |
+| `ujNeHIo7oTE` | 139/49k, 249/57k, 250/74k, 140/129k AAC, **251/144k Opus** | `codec=opus actual_kbps=144` | ✅ highest available |
+
+## Cross-repo NOTES — both items CLOSED (2026-11-02)
+
+- **Status shape vs client progress bar.** The player read a human `status['time']`
+  (`"m:ss"/"m:ss"`) while the server returned `position_sec`/`duration_sec` ints, so the progress
+  bar stayed empty. `PlayerStatus` now carries `time` (`"00:00/04:54"`), so the client can render
+  the bar directly — no wire-format change needed.
+- **Capability advertisement.** `/health` now returns
+  `{"capabilities":{"codecs":["opus","aac","vorbis","mp3","flac","alac","pcm_s16le"],"quality":true,"yt_dlp":true},"status":"ok"}`
+  (was `{"yt_dlp":true}`), so the player can switch off its stopgaps and expose quality presets.
+
+## Historical evidence appendix (2026-10-29, pre-fix)
+
+Kept for provenance of the numbers quoted above:
+`POST /player/play {"track_id":"4d15b27f…","stream_url":"https://www.youtube.com/watch?v=bZiCchjRW_s",…}`
+→ `{"ok": true, "state": "playing"}`; status then showed `position_sec` sawtoothing 0→~10→0;
+`pactl list sink-inputs` showed `Buffer Latency: 9975562100 usec → 9973562417 → 9971562757`
+(draining ~2 s per 2 s wall clock); `disk_pool_utilization_bytes ≈ 17.7 MB`; status reported
+`codec: aac`, `actual_kbps: 129` at `target_kbps = 0`.
+
+---
+
+# Part 6 — Session log (chronological)
+
+## Merged `bugs2.md` updates (2026-10-30 … 2026-11-01)
+
+These dated entries were `bugs2.md`'s own update log; they are kept verbatim in substance (some
+detail already appears in the sections that follow, and is marked as such).
+
+### Update — 2026-10-30 device session (Termux/aarch64, live PulseAudio backend)
+
+Ran the released `2026.10.29-5` binary against the live OpenSL ES sink, then built and ran the
+fixed tree on-device (`cargo build --features pulseaudio,opus`, host triple
+`aarch64-linux-android`, dev profile):
+
+- **BUG-1 — ROOT-CAUSED AND FIXED (verified on-device).** The rewind period was exactly the
+  writer's `read_pos >= 1<<20` checkpoint; fixed with `AudioBuffer::consumed_total` (see BUG-1
+  above). Live trace after the fix: `0,1,2,…,8,10,11,…,29` then EOS — no sawtooth. Unit test
+  `test_position_survives_writer_reclaim` guards it.
+- **BUG-2 — fixed, verified bounded.** One 30 s track: PA `Buffer Latency` ~38 s flat, server
+  window drains ~1×; the residual was the device's OpenSL sink not rendering in real time, not a
+  server defect.
+- **BUG-3 — FIXED (verified on-device).** `playing → stopped` at track end (see BUG-3 above).
+- **BUG-4 — still open**, unverifiable here at the time (no resolvable YouTube target on this
+  device). *Closed 2026-11-02, see above.*
+
+**Other defects found and fixed in that session**
+
+1. **Installer gap (the reported 404).** `install-android-termux.sh` picked the newest prerelease
+   and 404'd when a partial release lacked our asset (`2026.10.29-6/-7` ship only the x86_64 Linux
+   assets). It now walks releases newest-first and picks the newest whose **release-info.json
+   confirms the wanted asset**, using the API's own `browser_download_url`. Same walk added to
+   `install-macos.sh`; `install.ps1` mirrors it (not executed — no pwsh on device). Verified
+   end-to-end on the device: walked `-7 → -5`, installed and registered the service, `/health` +
+   `/version` ok.
+2. **`cargo test` was never executed** (the Linux host ran `cargo check` only). The first real run
+   exposed: pitch≠1 tracks playing `1/pitch` too long (`tempo = speed / pitch` assumed a
+   length-rescaling pitch shifter; it is length-preserving — fixed in both the file and streaming
+   paths); a fake `yt-dlp` fixture with a `#!/bin/bash` shebang that cannot exec on Termux, so
+   execvp silently fell through to the real yt-dlp (→ `#!/bin/sh`); the endpoints tests guessing
+   the server binary path (→ `env!("CARGO_BIN_EXE_…)`); and 22 parallel test servers stealing each
+   other's single-instance lock/token (→ per-spawn `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY`
+   isolation). Suite: **45/45 unit + 22/22 endpoints green (parallel)**.
+3. **Dev-profile hazard (not a release blocker).** `axum-server` + tokio 1.52 `debug_assert!`
+   panics when registering the blocking Unix socket in socket mode; release builds
+   (debug-assertions off) are unaffected. On-device builds therefore need
+   `RUSTFLAGS="-C debug-assertions=off"`.
+
+### Update 3 — 2026-10-31: re-test of the *installed* server (no audio, proven root cause)
+
+Method: dependency-free stdlib HTTP client on the Unix socket, an isolated second instance with
+`RUST_LOG=debug` for logs, `pactl`/`parec` on the OpenSL monitor sink.
+
+- **A. New root cause (P0): `resample_interleaved` emitted ZEROS for `file_rate != device_rate`.**
+  Proven by isolation — two locally generated WAVs pushed through `POST /player/play/stream`,
+  identical except sample rate: a 48 000 Hz WAV played audibly (monitor peak **11002**,
+  `codec=pcm_s16le dur=4 pos=4`); a 44 100 Hz WAV (decode → `resample_interleaved` 44100→48000 →
+  writer) produced **silence** (peak exactly 0). A control experiment (a known 440 Hz tone → peak
+  11999) established that "monitor = 0" means "server wrote silence". Almost every real track
+  (AAC/MP3/Opus, 44100 Hz) hits this, so the server wrote silence to a healthy sink. Fixed in commit
+  `a3a75b6` ("rate conversion no longer writes silence"); the old release binary also assembled its
+  output planar (`output.extend_from_slice(&output_planar[ch])`) instead of interleaved — a second,
+  separate defect in the same function.
+- **B. `stop()` never tore the stream down (P1).** `stop()` called `stream.pause()`, never
+  `stream.stop()`/Drop, so the writer thread and sink-input survived the stop and the paused writer
+  kept appending silence (observed `Buffer Latency ≈ 1000 s` draining at ~0.03×). Fixed in
+  `a3a75b6`; re-verified 2026-11-02 (`count=0` sink-inputs after stop).
+- **C. The installed binary was stale → BUG-1/2/3 fixes were NOT in the running artifact** (it was
+  release `2026.10.29-5`, pre-dating the engine commits). This is the provenance problem traced
+  further on 2026-11-02 (see Part 7).
+- **D. BUG-4 is verifiable on this device after all** — a resolvable YouTube target exists
+  (`yt-dlp -F` returns itag 140/139 AAC and 251/250/249 Opus); the running binary still reported
+  `codec=aac, actual_kbps=129` at `target_kbps=0`. *Now closed, see BUG-4 above.*
+- **E. Other observations kept on file.** The device Python had lost its third-party deps
+  (`httpx`, `pytest`, `textual` — all `ModuleNotFoundError`), so the player's `./run-test.sh`
+  cannot exec on-device and the TUI cannot be imported there; device verification must use a
+  stdlib HTTP client. *(Restored by 2026-11-02 — see Part 7.)* The running `-5` binary did carry
+  G2 + Opus but advertised only `yt_dlp` in `/health`. Short-file playback showed `pos == dur`
+  then stop, i.e. the file-path EOS wiring worked even on that binary. `sv restart` fully cleared
+  leaked state (surviving sink-input, position/state).
+
+### Update 4 — 2026-10-31: client AAC path verified audible
+
+The user confirmed hearing audio via the player client: the client's YouTube AAC/m4a
+materialization (`_download_youtube_audio` → `/player/play/stream`) bypassed the broken
+44100→48000 resample path, so playback was audible end-to-end despite BUG-A remaining in the direct
+path. *(Historical: the client now sends the page URL straight to the server and the server
+resolves/streams it — see the `l337-player` changelog entry of 2026-10-29 and the fix in BUG-A.)*
+
+### Update 5 — 2026-10-31: post-work re-check (installed server)
+
+`/health` began advertising `codecs` + `quality`. Direct play started with `codec=opus`,
+`actual_kbps=132`, but still stopped within ~6 s with `audio_available=false`, `position_sec=0`.
+BUG-4 appeared improved (Opus 132 k). Resample/direct-path playback still needed verification, and
+the client AAC path remained the audible workaround.
+
+### Update 6 — 2026-10-31: service logging enabled + U2 premature EOS reproduced
+
+`runit/run` exports `RUST_LOG=debug` and redirects to `$TMPDIR/l337-server.log`. Reproduced the U2
+symptom on the installed binary: `position_sec` advanced 1..7 with `audio_available=true`, then
+`INFO engine: end of track reached: state = stopped` at ~7 s of a 281 s track; afterwards
+`state=stopped`, `position_sec=0`, `audio_available=false`. Also noted `current_track.duration=281`
+vs status `duration_sec=292` (~+11 s) — the derived duration differs from the client's.
+
+### Update 7 — 2026-10-31: streaming Opus no longer aborts early
+
+Root cause of the U2 stall: `streaming_decode_sync` (Opus branch) treated
+`DecodeError("mkv: attempt to read element data past master element")` as terminal and `break`ed,
+ending decode after ~8 s. Patched to call `wait_for_progress` on that error (retry while the
+download grows). Rebuilt and re-tested: position advanced to ~9 s and stayed `playing`, download
+kept growing. **"Further investigation needed for the remaining stall"** — that remaining stall is
+still open; see
+[Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-u7s-remaining-stall-is-still-open).
+
+### Update 8 — 2026-11-01: config, installers, streaming stall (full suite green on-device)
+
+No playback semantics changed; the open items from the earlier updates were worked and are recorded
+in the [Session — 2026-11-01](#session--2026-11-01-termux-device-configuration-installers-streaming-stall)
+section below: the Symphonia `IoError` tolerance now shares `wait_for_progress`; `loglevel` from
+`server.ini`; `install-systemd.sh` writes `server.ini`; Debian installer false failures; new
+regression tests; suite **57/57 unit + 24/24 endpoints**.
+
+---
+
+## Termux device session — 2026-10-30 (the device this project's Linux docs could not cover)
 
 Everything below was executed **on the Termux/aarch64 device** against the live
-PulseAudio (OpenSL ES) sink. Full details + live traces: the update section of
-`bugs2.md`.
+PulseAudio (OpenSL ES) sink. Full details + live traces: the 2026-10-31 update
+entries in the [Session log](#part-6--session-log-chronological).
 
 ## Closed on-device
 
 | # | Item | Outcome |
 |---|------|---------|
 | 1 | **Installer picked a release without our binary** (the reported 404: `2026.10.29-6/-7` ship only x86_64 Linux assets) | All asset-publishing installers now walk releases newest-first and select the newest whose **release-info.json confirms the wanted asset**, downloading the API's own `browser_download_url`. Verified end-to-end here: `-7 → -5` fallback with a printed reason; service registered and healthy. `install-macos.sh` mirrors it; `install.ps1` mirrors it (unexecuted — no pwsh on device). |
-| 2 | **BUG-1 timeline sawtooth** (`bugs2.md`) — rewound every ~10.9 s | Root cause: `reclaim_consumed()` resets `read_pos` and drops the prefix, but the playhead was derived from `read_pos` alone. Fixed via `AudioBuffer::consumed_total`; verified live (`0…8,10,11…29`, no reset) + unit test. |
-| 3 | **BUG-3 no end-of-track** (`bugs2.md`) | `get_status` finishes as `state=stopped` when decode is done and the buffer is drained; verified live (`playing → stopped` at track end). Rebuffer vs EOS distinguished by the decode handle. |
-| 4 | **BUG-2 sink backlog** (`bugs2.md`) | Verified bounded: one 30 s track holds ~38 s of PA latency (the SL ES queue), server window drains at ~1×. The 9975 s backlog is gone. |
+| 2 | **BUG-1 timeline sawtooth** — rewound every ~10.9 s | Root cause: `reclaim_consumed()` resets `read_pos` and drops the prefix, but the playhead was derived from `read_pos` alone. Fixed via `AudioBuffer::consumed_total`; verified live (`0…8,10,11…29`, no reset) + unit test. See [BUG-1](#bug-1--playback-timeline-resetsloops-every-10-s-while-streaming). |
+| 3 | **BUG-3 no end-of-track** | `get_status` finishes as `state=stopped` when decode is done and the buffer is drained; verified live (`playing → stopped` at track end). Rebuffer vs EOS distinguished by the decode handle. See [BUG-3](#bug-3--no-end-of-track-state-stays-playing-after-playback-finishes). |
+| 4 | **BUG-2 sink backlog** | Verified bounded: one 30 s track holds ~38 s of PA latency (the SL ES queue), server window drains at ~1×. The 9975 s backlog is gone. See [BUG-2](#bug-2--unbounded-streaming-to-the-sink-9975-s-backlog-memory-grows). |
 | 5 | **`cargo test` never executed** (see §6 above) | First real run fixed: pitch≠1 duration bug (`tempo = speed / pitch` → `speed`; the pitch shifter is length-preserving) in both file and streaming paths; Termux `#!/bin/bash` fake-script fallthrough (→ `#!/bin/sh`); endpoints binary path (`CARGO_BIN_EXE_l337-audio-server`); parallel test servers stealing the single-instance lock/token (per-spawn `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY` isolation). **45/45 unit + 22/22 endpoints green in parallel.** |
 
 ## Device-only notes for future work
@@ -561,17 +830,21 @@ PulseAudio (OpenSL ES) sink. Full details + live traces: the update section of
   The OOM kill also restarts runsvdir, so re-check `sv status` and `sv up` after a build.
 - `/tmp` is not writable by the app user on Termux — `AGENTS.md`'s `/tmp` build paths do
   not apply on-device; use `TMPDIR` (`$PREFIX/tmp`).
-- Engine fixes above are **not** in the published release yet: the device currently runs
-  `2026.10.29-5`, which predates them. They need a publish before a device run of the
-  release binary can show the BUG-1/BUG-3 fixes.
-- `bugs2.md` BUG-4 (best = highest available rendering) remains open and unverifiable
-  here (no resolvable YouTube target on this device).
+- Engine fixes above were **not** in the published release at the time: the device ran
+  `2026.10.29-5`, which predates them. They needed a publish before a device run of the
+  release binary could show the BUG-1/BUG-3 fixes. (Release provenance was traced on
+  2026-11-02 — see [Part 7](#release-provenance--what-ships-in-a-release-vs-what-is-built); a
+  prerelease containing the fixes finally shipped as `2026.11.02-4`.)
+- BUG-4 (best = highest available rendering) was open and unverifiable here at the time (no
+  resolvable YouTube target on this device). **Closed 2026-11-02**: a resolvable target exists,
+  and `best` was verified in both directions — see
+  [BUG-4](#bug-4--best-quality-selects-a-low-bandwidth-rendition-instead-of-the-highest-available).
 
 
 
 ---
 
-# Installer hardening round — 2026-10-31 (Termux/aarch64, device-validated)
+## Installer hardening round — 2026-10-31 (Termux/aarch64, device-validated)
 
 A review of the 404-skip / version-check work found **2 CRITICAL** and several WARNING defects,
 and the user redirected the architecture: **all GitHub work belongs in `install.sh`**, which should
@@ -647,9 +920,9 @@ refuse), plus the live install path.
 
 ---
 
-# Session — 2026-11-01 (Termux device): configuration, installers, streaming stall
+## Session — 2026-11-01 (Termux device): configuration, installers, streaming stall
 
-Continued the open items from `bugs.md` / `bugs2.md` / `bug.md`. Everything below is
+Continued the open items from `bugs.md` / `bug.md`. Everything below is
 implemented in the working tree and executed **on this device** (no Linux/macOS host here),
 with the suite green: **57/57 unit + 24/24 endpoints** (`cargo test --no-default-features
 --features pulseaudio,opus`; `LD_LIBRARY_PATH=$PREFIX/lib`). Feature matrix: `--features opus`
@@ -663,7 +936,7 @@ only, so it selects no backend for the Android host triple — not a regression)
 | 1 | **`loglevel` from `server.ini`** (`bug.md` §11) | `[server] loglevel` loaded by `load_settings`; `init_tracing` runs after the config read; precedence **`RUST_LOG` > `loglevel` > crate default (`debug`, unchanged)**. Empty/unparsable `RUST_LOG` no longer silences everything; an unknown `loglevel` warns + default. Verified live: info/debug/off/absent/bogus/`RUST_LOG`-override/empty-`RUST_LOG` matrix. Unit tests `main.rs::tests::loglevel_*`; README config table + `DEFAULT_CONFIG` document the key. |
 | 2 | **`install-systemd.sh` `config.toml` mismatch** (finding #7 in the host-run table) | Now writes `/etc/l337-audio-server/server.ini` — the file `load_settings()` actually reads (INI) — and migrates a legacy `config.toml` on update; integrity + health checks read `server.ini`. `bash -n` clean. |
 | 3 | **Linux installer false failures on Debian** (`bug.md` §12) | All three installers: loader-provided SONAMEs (`libm.so.6`, `libc.so.6`, …) are skipped instead of "no known package"; `ldconfig` refreshed before the missing-check; presence probe (`lib_present`) falls back to the standard library dirs, so a lib installed earlier in the same run is found. Genuinely absent libs still abort the install (rc=42 in simulation). Real-host run on `pipelinepro` pending. |
-| 4 | **Streaming stall follow-up** (`bugs2.md` U7 "remaining stall") | The uncommitted tolerance raise is kept and completed: the Symphonia *decoder* `IoError` arm no longer has its own 4 s tolerance (it ended tracks mid-playback on a trickling download) and shares `wait_for_progress` (10 min, rate-limited warnings every ~20 s so a permanently wedged download is visible). Unit test `wait_for_progress_tolerates_a_slow_download_and_counts_growth`. |
+| 4 | **Streaming stall follow-up** (U7 "remaining stall", see [Part 6](#update-7--2026-10-31-streaming-opus-no-longer-aborts-early)) | The uncommitted tolerance raise is kept and completed: the Symphonia *decoder* `IoError` arm no longer has its own 4 s tolerance (it ended tracks mid-playback on a trickling download) and shares `wait_for_progress` (10 min, rate-limited warnings every ~20 s so a permanently wedged download is visible). Unit test `wait_for_progress_tolerates_a_slow_download_and_counts_growth`. |
 | 5 | **Finding #4's missing test** | `tests/endpoints.rs::test_cache_next_honors_runtime_target_ceiling`: fake `yt-dlp` on the spawned server's PATH records the selection — with runtime ceiling 64 the download is `-f 249` (≤64 kbps), never `-f 251`. Pre-fix it resolved with the config default (`bestaudio`). |
 | 6 | **Finding #5's missing integration check** | `tests/endpoints.rs::test_play_unknown_quality_falls_back_to_server_default`: `{"quality":"ultra"}` returns **200** (not 422) through the real `Json` extractor and falls back to the server default. |
 | 7 | **Wall-clock calibration** | `test_resample_whole_track_buffer_stays_linear`'s budget 20 s → 120 s: on this aarch64 device the *linear* path takes ~8 s alone and ~23 s under the suite's parallel load in the debug profile, while the quadratic drain it guards against takes minutes — detector margin unchanged. |
@@ -681,13 +954,14 @@ only, so it selects no backend for the Android host triple — not a regression)
 
 ---
 
-# Session — 2026-11-02: host suite re-run + release provenance
+## Session — 2026-11-02: host suite re-run + release provenance + release-runner fix
 
 ## Suite executed on a Linux host (`pipelinepro`, Debian 13 x86_64) — GREEN at `fa38573`
 
 The user directed that **Rust/cargo builds must no longer happen on the Termux device** (two
-on-device builds this session died on disk exhaustion — full details in `bugs2.md`'s device build
-budget). The suite therefore ran on the Linux host instead:
+on-device builds this session died on disk exhaustion — full details in
+[Device build budget](#device-build-budget--why-builds-stopped-happening-on-the-device)). The suite
+therefore ran on the Linux host instead:
 
 ```
 cargo test --no-default-features --features alsa,opus -j 2     # LIBRARY_PATH=$HOME/lib
@@ -704,23 +978,177 @@ right feature combo (no pipewire/pulse dev headers). Note **no CI workflow runs 
 (`build.yml` and `monthly-release.yml` only), so the suite has never run in CI — a `cargo test` job
 is the obvious next improvement.
 
-## Release provenance — the published binaries do NOT contain this work
+## Release provenance finding — what was installed vs what was released
 
 `git ls-remote --tags origin`: `2026.11.01-1`, `2026.11.02-1` and `2026.11.02-2` all point at
 `d5cc62a` (`main`, 2026-10-27) — 33 commits *before* the G1 Opus decode, BUG-1..BUG-4,
 `wait_for_progress` and `loglevel` work on `g1-opus-decode`. `origin/testing` is stale
 (2026-09-04). The installed device binary that passes every live check is a **local build** of the
-branch, so **no released artifact currently carries the fixes**. Merging `g1-opus-decode` into
-`main` and cutting a release remains the outstanding step; until then, installs from GitHub (and
-the installer's release walk) silently regress to pre-fix behavior.
+branch, so at that moment **no released artifact carried the fixes**: installs from GitHub (and the
+installer's release walk) silently regressed to pre-fix behavior.
+
+The first release attempt from this session (`2026.11.02-3`, dispatched on `g1-opus-decode`)
+exposed a second defect: its binaries were built from `2b99221` (proven by `release-info.json`'s
+`commit` field and by the fix markers in the asset) but its **tag** was created at the default
+branch tip `d5cc62a`, because `gh release create` tags at the default branch unless told
+otherwise. Both defects are now fixed — see
+[Part 7](#release-provenance--what-ships-in-a-release-vs-what-is-built) and the release-runner
+change (`e7834d8`), which ships **`2026.11.02-4`: tag == built commit, release covers 6 Linux
+assets + the termux asset**.
 
 ## What this session verified that was previously "unverified"
 
-- **BUG-4 is now verified on-device, in both directions** (best = highest available): see the
-  `yt-dlp -F` cross-check table in `bugs2.md` (AAC 129 k where AAC is the max; Opus 144 k where
-  Opus is the max).
+- **BUG-4 is now verified on-device, in both directions** (best = highest available): the
+  `yt-dlp -F` cross-check for each track — AAC 129 k where AAC 140 is the max, Opus 144 k where
+  itag 251 is the max. See [BUG-4](#bug-4--best-quality-selects-a-low-bandwidth-rendition-instead-of-the-highest-available).
 - BUG-1/BUG-2/BUG-3, `stop()` teardown, non-silent output and the `/health` capability
-  advertisement re-verified against the installed binary (table in `bugs2.md`).
+  advertisement re-verified against the installed binary (evidence table in Part 5/Part 7).
 - **Still open, reproduced today:** the WebM/Opus streaming stall at ~9 s (U7's remaining stall —
   `mkv: attempt to read element data past master element` wedges the demuxer while the download
-  keeps growing; the isomp4/AAC path does not stall). Details and the debug trace in `bugs2.md`.
+  keeps growing; the isomp4/AAC path does not stall). Details and the debug trace in
+  [Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-u7s-remaining-stall-is-still-open).
+
+---
+
+# Part 7 — New findings, issues and mitigations — 2026-11-02
+
+## Release provenance — what ships in a release vs what is built (FIXED)
+
+Two distinct release-integrity defects were found on 2026-11-02, both now closed:
+
+1. **The published releases did not contain the work.** `2026.11.01-1`, `2026.11.02-1` and
+   `2026.11.02-2` all tagged `d5cc62a` on `main` (2026-10-27) — 33 commits before the G1 Opus
+   decode, BUG-1..BUG-4, `wait_for_progress` and `loglevel`. Anyone installing from GitHub got a
+   binary with none of the fixes; the device binary that passed every live check was a local build
+   of the branch. (Outstanding by design: full releases are cut by the monthly runner from `main`,
+   so the branch still needs to reach `main` for an *official* release.)
+2. **The first release from the branch shipped a tag that pointed at unrelated code.** Prerelease
+   `2026.11.02-3` was dispatched on `g1-opus-decode`; its build jobs checked out that branch (so
+   the **assets** were correct — `release-info.json` recorded `commit: 2b992217…` and the
+   `readelf`/`strings` markers confirmed it) but `gh release create` created the tag at the
+   **default-branch tip** `d5cc62a`, so GitHub's source links and `git checkout 2026.11.02-3`
+   showed pre-fix code.
+
+**Fix (commit `e7834d8`), in `.github/workflows/build.yml`:**
+
+- `workflow_dispatch` now takes a **required `branch` input** — a dispatch run can no longer build
+  whichever ref the trigger names by default (a bare `gh workflow run` defaults to the default
+  branch).
+- Every one of the 11 jobs (including `publish-release`) checks out
+  `${{ inputs.branch || github.ref }}`, so the publish job's `HEAD` is the branch it was asked to
+  build. `workflow_call` (the monthly runner) declares no `branch` input and keeps `github.ref`,
+  and `pull_request` is likewise unaffected.
+- The publish job pins the tag to the commit it actually built:
+  `gh release create … --target "$GITHUB_SHA"`.
+
+**Verified:** the follow-up run (`41435641933`, success) produced **`2026.11.02-4`**, whose tag,
+`release-info.json`'s `commit` (`e7834d8`) and the built assets all agree; it is a prerelease with
+12 assets — 6 Linux (`x86_64`/`aarch64`/`armv7`/`riscv64`, alsa + pipewire) and 2 Android
+(`aarch64-android`, `aarch64-android-termux`), the termux asset linking `libpulse.so` +
+`libopus.so` and carrying the `loglevel`/`wait_for_progress`/`codecs` markers. The
+`x86_64-linux-alsa` asset was additionally booted on a Debian host (dummy mode) and answered
+`/health` (`codecs` + `quality`) and `/version` → `2026.11.02-4`.
+
+## New issue — WebM/Opus streaming stalls at ~9 s (U7's "remaining stall" is still open)
+
+**Reproduced 2026-11-02** on the installed build, track `ujNeHIo7oTE` (Opus 251, 5.01 MB).
+`POST /player/play` → `playing`, `position_sec` reached 9, then **froze at 9 for 60+ s while
+`state` stayed `playing`**. The isolated instance (`RUST_LOG=debug`) showed:
+
+```
+INFO  engine: play_track: YouTube streaming for https://www.youtube.com/watch?v=ujNeHIo7oTE
+INFO  symphonia_format_mkv::demuxer: stream is seekable with len=163840 bytes
+WARN  engine: streaming opus: demux error, waiting for download
+      error=DecodeError("mkv: attempt to read element data past master element ") stall_cycles=0
+```
+
+The download was still growing (this connection runs ~32 KB/s, so the 5.01 MB file needs ~160 s)
+and only one warning was emitted in 72 s — i.e. the demuxer is **wedged past the downloaded
+prefix** and does not resume decoding as the file grows. The isomp4/AAC path does not stall (the
+same session streamed `Y6HH7vF37dE`, m4a, through 60 s of 1× playback with the position
+advancing), so the defect is specific to the **WebM/MKV Opus reader**. This is precisely the case
+Update 8 said the new logging was built to distinguish ("download-starved" vs "reader wedged —
+the case that needs a seek/restart of the demuxer"), and today's run is the **reader-wedged**
+case with the download still growing.
+
+**Where to look:** `src/player/engine.rs` `streaming_decode_sync` (Opus branch) — retry must
+re-seek/restart the demuxer from the file's current end-of-valid-data rather than re-reading the
+same SimpleBlock; the `stall_cycles` counter is not advancing past the first cycle, which is why
+only one warning appears.
+
+## Mitigation — player-side play/upload timeouts (shipped in the player, not the server)
+
+The server needs minutes to resolve + pre-buffer a YouTube stream before it answers
+`/player/play` (observed: **180 s** to return for a fresh 4.77 MB AAC track on a ~32 KB/s
+connection; 14 s when partially cached), and pushing a whole track plus the server-side decode can
+exceed the client's default read timeout. Fixed on the player side in `l337-player` `04517c4`
+("fix(playback): give play/upload requests a longer read timeout"): play/upload requests go
+through a short-lived client sharing transport/auth/UDS config with a longer timeout (90 s upload
+/ 30 s play), closed in a `finally` so nothing leaks. The server-side root cause — plan G3
+(whole-track pre-download before streaming) — remains open: for Opus/WebM, incremental streaming
+would cut time-to-first-sound.
+
+## Device build budget — why builds stopped happening on the device
+
+Recorded as an operator decision (2026-11-02): **`cargo` runs on the Linux host, the device runs
+only the installed binary and the live checks.** What the device cost this session:
+
+- Two builds died on disk exhaustion. The target dir sat at 1.8 GB with 581 MB free; running
+  `cargo test` **without** the device's `RUSTFLAGS="-C debug-assertions=off"` invalidated *every*
+  dependency fingerprint and started a full rebuild with `-C debuginfo=2`, ending in
+  `rustc-LLVM ERROR: IO failure on output stream: No space left on device`.
+- The working device invocation is
+  `CARGO_HOME=$HOME/.cargo CARGO_TARGET_DIR=$TMPDIR/l337-build RUSTFLAGS="-C debug-assertions=off" LD_LIBRARY_PATH=$PREFIX/lib cargo test --no-default-features --features pulseaudio,opus`
+  (the flag matters: tokio 1.52's `debug_assert!` in `check_socket_for_blocking` panics on the
+  blocking Unix socket in socket mode).
+- `CARGO_PROFILE_DEV_DEBUG=0` shrinks artifacts ~10× and is the right knob for any future
+  on-device build; `rm -rf $TMPDIR/l337-build/debug/incremental` freed 516 MB of pure cache.
+- `/tmp` is not writable by the app user on Termux — AGENTS.md's `/tmp` build paths do not apply
+  on-device; use `TMPDIR` (`$PREFIX/tmp`).
+
+## Host recipe for the suite (used, then reverted)
+
+For the next host run, the setup that worked on `pipelinepro` (Debian 13, x86_64) — the host was
+returned to its pre-session state afterwards, so this is the recipe, not a standing config:
+
+- rustup installed to `/home/vscode/cargo-home` (the pre-existing `~/.cargo` → `/tmp/.cargo`
+  symlink was dangling after a `/tmp` clean; `CARGO_HOME`/`RUSTUP_HOME` were set explicitly).
+- No `libopus-dev` and **no passwordless sudo**, but `libopus.so.0` exists: created
+  `~/lib/libopus.so` → `/usr/lib/x86_64-linux-gnu/libopus.so.0` and passed
+  `LIBRARY_PATH=$HOME/lib`. (`build.rs` emits `-l dylib=opus` with no search dir on Linux.)
+- `alsa.pc` is present, so `--no-default-features --features alsa,opus` is the right feature combo
+  (no pipewire/pulse dev headers); tests spawn with `--dummy --transport=http`, so no soundcard is
+  needed.
+- `cargo test --no-default-features --features alsa,opus -j 2` → **58/58 unit + 25/25 endpoints**
+  at `fa38573`. **No CI workflow runs `cargo test`** (`build.yml` and `monthly-release.yml` only),
+  so the suite has never run in CI — a `cargo test` job is the obvious next improvement.
+
+## Environment note — `run-test.sh` on Termux
+
+`./run-test.sh` cannot be exec'd on this device ("No such file or directory" from `timeout`):
+its `#!/usr/bin/env bash` shebang does not resolve under the glibc-runner `PATH` intercept. Invoke
+it as `bash run-test.sh …` (same class of defect as the fake-`yt-dlp` `#!/bin/bash` fixture fixed
+on 2026-10-30). The device Python has its third-party deps again, so the suite does run.
+
+## Observation — `duration_sec` is the container's duration, not the client's
+
+`duration_sec` is derived from the decoded stream's `n_frames` (e.g. `12987392 / 44100 = 294.6 s`
+for a track whose metadata says 287 s; 292 for a 281 s track) — *more* accurate than the client's
+metadata, but it disagrees with what the player shows and with `current_track.duration`. Not a
+bug, worth a decision: keep the container-derived value (and teach the client) or clamp to the
+requested `duration`.
+
+## Consolidated open items (the finish line)
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | **WebM/Opus streaming stall at ~9 s** | reader wedged past the downloaded prefix; needs a demuxer restart/seek on retry (see above) |
+| 2 | Finding #3 — whole-track file decode (file/`play/stream` path) | bounded-capacity shortcut in place; upgrade path = incremental decode into the throttled producer |
+| 3 | Finding #7 — `CHUNK_FRAMES = 4096` device re-check | audio 1×, no underrun, lower wakeups |
+| 4 | Finding #9 (optional) — regenerate `opus-stubs/libopus.so` in CI with a diff gate | validation already in CI |
+| 5 | Finding #6 (future) — real lossless preference + degradation flag | docs already honest |
+| 6 | RSS reclaim on the streaming path; forced sink-error recovery + volume-after-recovery; real bandwidth ceiling | need a live PipeWire/ALSA host |
+| 7 | Stock-host install + start (finding #1) and the Linux/macOS installer paths (systemd poll, `launchctl bootstrap`) | `pipelinepro` real-host rerun of the Debian-installer fix |
+| 8 | Plan G3 — incremental Opus/WebM streaming (time-to-first-sound) | pairs with item 1 |
+| 9 | CI `cargo test` job | the suite has never run in CI |
+| 10 | Merge `g1-opus-decode` → `main` for an official release | the monthly runner cuts official releases from `main`; prereleases now build+tag correctly from any named branch |
