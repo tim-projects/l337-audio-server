@@ -247,21 +247,27 @@ fn init_tracing(loglevel: Option<&str>) {
             default_log_filter(resolved.level),
         ),
     };
+    // The startup line goes to stderr *before* the subscriber is installed, so
+    // it is never subject to the filter it is describing: at `warn` (the crate
+    // default, and the fallback for an unknown `loglevel`) a `tracing::info!`
+    // startup line is silently dropped, leaving the operator with no record of
+    // what verbosity the server actually started with. `ensure_config_file`
+    // already uses this pattern for the same reason.
+    if resolved.invalid {
+        eprintln!(
+            "WARN: unknown server.ini loglevel {:?}; using {}",
+            loglevel.unwrap_or(""),
+            resolved.level
+        );
+    }
+    eprintln!(
+        "INFO: Log level: {} (from {source}; set [server] loglevel or RUST_LOG to change)",
+        resolved.level
+    );
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
-    if resolved.invalid {
-        tracing::warn!(
-            requested = loglevel.unwrap_or(""),
-            "unknown server.ini loglevel; using {}",
-            resolved.level
-        );
-    }
-    tracing::info!(
-        "Log level: {} (from {source}; set [server] loglevel or RUST_LOG to change)",
-        resolved.level
-    );
 }
 
 #[tokio::main]
