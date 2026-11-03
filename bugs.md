@@ -1052,6 +1052,23 @@ Two distinct release-integrity defects were found on 2026-11-02, both now closed
 `x86_64-linux-alsa` asset was additionally booted on a Debian host (dummy mode) and answered
 `/health` (`codecs` + `quality`) and `/version` → `2026.11.02-4`.
 
+**Re-verified 2026-11-03** for the streaming fixes: dispatch run `41640372692` (all 15 jobs green)
+produced prerelease **`2026.11.03-1`** from `g1-opus-decode` @ `229346a` ("fix(player): stream by
+default and rebuild a wedged MKV reader"). Tag `2026.11.03-1`, `release-info.json`'s `commit` and
+the checked-out `g1-opus-decode` tip are the same SHA. 12 assets as before, all per-asset glibc
+recorded, and `needed_shared_libs` records `libopus.so.0` on every Linux asset (`libopus.so` +
+`libpulse.so` + `libaaudio.so` on the termux asset). The `x86_64-linux-alsa` asset was downloaded
+from the release and run on the host: `--version` → `2026.11.03-1`, and the strings/symbols for
+both fixes are present in the binary — the `l337_audio_server::player::engine::reprobe_format`
+symbol with its `___CALLSITE` entries, the `demuxer wedged, rebuilding reader` /
+`reader still wedged, waiting on download` log lines, and
+`could not be probed from a partial file` / `falling back to a whole-file download`.
+
+**Still owed on a real target** (see the consolidated remaining-work table): start playback of a
+cold Opus track and confirm `/player/play` returns in seconds rather than ~3 minutes, and that a
+track which genuinely cannot be probed still falls back and plays.
+
+
 ## New issue — WebM/Opus streaming stalls at ~9 s (FIXED 2026-11-03: wedged MKV reader is rebuilt)
 
 **Reproduced 2026-11-02** on the installed build, track `ujNeHIo7oTE` (Opus 251, 5.01 MB).
