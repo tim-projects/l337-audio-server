@@ -28,6 +28,25 @@ with the new version heading.
   no record of it. Startup logs the effective level and where it came from.
 
 ### Fixed
+- Streaming playback is now the **default** instead of downloading the whole
+  track first: `POST /player/play` returns as soon as the container has been
+  probed and decoding has started, rather than after the entire file has
+  arrived. Measured on a ~32 KB/s link, a fresh 4.77 MB track used to take ~180 s
+  to start; it now starts in seconds. Containers that genuinely cannot be
+  decoded from a partial file (a `moov` at the end of a progressive MP4) fall
+  back to a whole-file download automatically, so no source is lost — the
+  fallback is reached only when it is actually needed. Choosing by the URL's
+  extension, which made every YouTube DASH `m4a` pay the whole-track download,
+  is gone: the probe decides.
+- WebM/Opus streaming no longer freezes a few seconds into a track (reported:
+  `position_sec` stuck at 9 s with `state=playing` while the download kept
+  growing). symphonia's MKV reader has no resync, so once it hit
+  `attempt to read element data past master element` it stayed wedged for the
+  life of the reader and every retry failed identically. The streaming loops now
+  rebuild the format reader when it is wedged and skip the packets already
+  pushed, so playback resumes instead of rewinding. Rebuilds are bounded (10
+  consecutive no-progress rebuilds fall back to waiting on the download) and the
+  reader is rebuilt for the Symphonia path as well as the Opus path.
 - `install-systemd.sh` wrote `/etc/l337-audio-server/config.toml`, which
   `load_settings()` never reads (it reads `.../config`, probed by file
   extension so an extensionless file can never match, and `.../server.ini`), so

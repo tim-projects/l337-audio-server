@@ -15,9 +15,10 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **BUG-4** | `best` (`target_kbps=0`) selected a low-bitrate rendition | **FIXED** | verified on a live target 2026-11-02, **both directions** via `yt-dlp -F` (AAC 129 k when AAC is the max; Opus 144 k when Opus is the max) |
 | **BUG-A** | `resample_interleaved` emitted literal zeros for 44.1→48 kHz (all AAC/MP3 playback was silent) | **FIXED** | 2026-11-02 `parec` monitor peak **6513** during AAC playback (0 = the old regression) |
 | **BUG-B** | `stop()` never tore the stream down — leaked sink-input appending silence | **FIXED** | 2026-11-02 sink-input `count=0` after `POST /player/stop` |
-| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **PARTIAL** — premature-EOS fixed; the WebM/Opus stall is **STILL OPEN** | 2026-10-31 and 2026-11-02 (debug trace in Part 7) |
+| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **FIXED** — premature-EOS fixed, then the wedged-MKV root cause fixed by rebuilding the reader | 2026-10-31, 2026-11-02 (trace) and 2026-11-03 (fix, Part 7) |
 | **C** | The installed binary was a stale release — none of the fixes were in the running artifact | **FIXED** — provenance found, runner hardened | 2026-11-02: dispatch requires a branch + tag pinned to `$GITHUB_SHA`; release `2026.11.02-4` tag == built commit |
 | **NOTES** | Client progress bar (`time` field) + `/health` capability advertisement | **CLOSED** | 2026-11-02 `codecs`/`quality` advertised; `PlayerStatus.time` = `"00:00/04:54"` |
+| **G3** | Whole-track pre-download was the default before playback | **FIXED** | 2026-11-03: streaming is the default, whole-file download is the fallback for containers that cannot be probed from a partial file (Part 7) |
 | **Finding #1** | Linux binaries need `libopus` at runtime; no installer provided it | **FIXED** | host 2026-10-29; re-verified per-asset in `release-info.json` for `2026.11.02-4` |
 | **Finding #2** | Reclaim + window cap on PulseAudio only (5 other backends tripped) | **FIXED** | code; raw `pcm.len() > buf.max_bytes` gone from `src/platform/` |
 | **Finding #3** | File/fMP4/cached path keeps the whole decoded track resident | **PARTIAL** — capacity bounded; incremental file decode **OPEN** | — |
@@ -788,9 +789,9 @@ Root cause of the U2 stall: `streaming_decode_sync` (Opus branch) treated
 `DecodeError("mkv: attempt to read element data past master element")` as terminal and `break`ed,
 ending decode after ~8 s. Patched to call `wait_for_progress` on that error (retry while the
 download grows). Rebuilt and re-tested: position advanced to ~9 s and stayed `playing`, download
-kept growing. **"Further investigation needed for the remaining stall"** — that remaining stall is
-still open; see
-[Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-u7s-remaining-stall-is-still-open).
+kept growing. **"Further investigation needed for the remaining stall"** — closed 2026-11-03: the
+MKV reader was **wedged**, not starved; see
+[Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-fixed-2026-11-03-wedged-mkv-reader-is-rebuilt).
 
 ### Update 8 — 2026-11-01: config, installers, streaming stall (full suite green on-device)
 
@@ -1003,10 +1004,12 @@ assets + the termux asset**.
   itag 251 is the max. See [BUG-4](#bug-4--best-quality-selects-a-low-bandwidth-rendition-instead-of-the-highest-available).
 - BUG-1/BUG-2/BUG-3, `stop()` teardown, non-silent output and the `/health` capability
   advertisement re-verified against the installed binary (evidence table in Part 5/Part 7).
-- **Still open, reproduced today:** the WebM/Opus streaming stall at ~9 s (U7's remaining stall —
-  `mkv: attempt to read element data past master element` wedges the demuxer while the download
-  keeps growing; the isomp4/AAC path does not stall). Details and the debug trace in
-  [Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-u7s-remaining-stall-is-still-open).
+- **Resolved 2026-11-03 (was open, reproduced today):** the WebM/Opus streaming stall at ~9 s (U7's
+  remaining stall — `mkv: attempt to read element data past master element` wedges the demuxer
+  while the download keeps growing; the isomp4/AAC path does not stall). Root cause is a
+  non-resyncing MKV reader; the streaming loops now rebuild it and skip the packets already
+  pushed. Details, caveats and the follow-up verification checklist in
+  [Part 7](#new-issue--webmopus-streaming-stalls-at-9-s-fixed-2026-11-03-wedged-mkv-reader-is-rebuilt).
 
 ---
 
@@ -1049,7 +1052,7 @@ Two distinct release-integrity defects were found on 2026-11-02, both now closed
 `x86_64-linux-alsa` asset was additionally booted on a Debian host (dummy mode) and answered
 `/health` (`codecs` + `quality`) and `/version` → `2026.11.02-4`.
 
-## New issue — WebM/Opus streaming stalls at ~9 s (U7's "remaining stall" is still open)
+## New issue — WebM/Opus streaming stalls at ~9 s (FIXED 2026-11-03: wedged MKV reader is rebuilt)
 
 **Reproduced 2026-11-02** on the installed build, track `ujNeHIo7oTE` (Opus 251, 5.01 MB).
 `POST /player/play` → `playing`, `position_sec` reached 9, then **froze at 9 for 60+ s while
@@ -1066,17 +1069,189 @@ The download was still growing (this connection runs ~32 KB/s, so the 5.01 MB fi
 and only one warning was emitted in 72 s — i.e. the demuxer is **wedged past the downloaded
 prefix** and does not resume decoding as the file grows. The isomp4/AAC path does not stall (the
 same session streamed `Y6HH7vF37dE`, m4a, through 60 s of 1× playback with the position
-advancing), so the defect is specific to the **WebM/MKV Opus reader**. This is precisely the case
-Update 8 said the new logging was built to distinguish ("download-starved" vs "reader wedged —
-the case that needs a seek/restart of the demuxer"), and today's run is the **reader-wedged**
-case with the download still growing.
+advancing), so the defect is specific to the **WebM/MKV Opus reader**.
 
-**Where to look:** `src/player/engine.rs` `streaming_decode_sync` (Opus branch) — retry must
-re-seek/restart the demuxer from the file's current end-of-valid-data rather than re-reading the
-same SimpleBlock; the `stall_cycles` counter is not advancing past the first cycle, which is why
-only one warning appears.
+### Root cause (2026-11-03)
 
-## Mitigation — player-side play/upload timeouts (shipped in the player, not the server)
+symphonia's MKV reader has **no resync**. `MkvReader::next_element`
+(`symphonia-format-mkv-0.5.5/src/demuxer.rs:198`) propagates every error with `?`, and the
+`attempt to read element data past master element` `DecodeError` comes from
+`ebml.rs:429` — a bounds check on the element the reader is *currently positioned inside*. Once
+that fires, the read position sits at the start of the element it failed to parse, so every later
+`next_packet` re-parses garbage as an element header and fails the same way. The reader is wedged
+for its lifetime; no amount of waiting or file growth recovers it.
+
+The two error classes mean opposite things, and the old loop conflated them:
+
+- `Error::IoError` — the packet bytes are not downloaded yet. **Waiting is correct**, and this is
+  the path the isomp4/AAC reader uses (hence no AAC stall).
+- `DecodeError("…past master element")` — the reader is misaligned. **Waiting can never help.**
+
+`stall_cycles` could not tell them apart: `wait_for_progress` resets it to 0 on every append, so
+on a trickling download it never exceeds 0 and the give-up tolerance is unreachable. That is
+exactly why one warning appeared in 72 s.
+
+### Fix
+
+`reprobe_format()` in `src/player/engine.rs` rebuilds the format reader over the same
+append-only file when the reader is wedged. Both the Opus loop and the Symphonia loop call it
+from their demux/decode error arms, keyed on either the exact MKV wedge error or *any* error
+persisting for 25 consecutive cycles while the file grew (so an unknown wedge mode is still
+caught). `IoError` keeps its old wait-for-download treatment.
+
+A rebuilt reader restarts from byte 0, so the loops count the packets they have already read and
+skip exactly that many on the rebuilt reader — playback resumes instead of rewinding the audio
+already pushed to the buffer. The codec decoder is deliberately **not** reset: it never saw the
+replayed packets, so its state stays continuous.
+
+Three new counters per loop (`error_cycles`, `error_start_size`, `useless_reprobes`) replace the
+failed `stall_cycles`-based detection, because the first two survive appends. `useless_reprobes`
+bounds the rebuild loop: a rebuild only helps once the download has completed the element the
+reader was stuck inside, so after 10 consecutive rebuilds that produced no packet the loops stop
+rebuilding and fall back to the download-wait policy — which still ends the track cleanly (or
+plays on) if the download later completes that cluster.
+
+**Tests:** `wedge_is_detected_even_while_the_download_keeps_growing` drives both signals — the
+download growing every cycle (so `stall_cycles` stays pinned at 0) and the 25-error wedge
+threshold — then asserts the rebuilt reader replays only the prefix and resumes on the next
+packet. Full suite: 55 unit + 25 endpoint, all green.
+
+### Caveats
+
+- **The replay skip assumes the demuxer emits a deterministic packet sequence for the unchanged
+  file prefix.** The rebuilt reader restarts at byte 0 and the loop skips by packet count, which
+  only lands correctly if the first N packets of the new reader are byte-for-byte the packets the
+  old one produced. Two things make that true today, and neither is enforced by this change:
+  (1) the download writes sequentially — `stream_http_to_file` opens once with
+  `truncate(true)` and then only `write_all`s tail chunks (`engine.rs:1878-1891`), so the prefix a
+  live reader has already parsed is never rewritten; and (2) the download task is spawned once
+  per track with no retry/restart, while a recovery (`try_recover` → `seek_and_resume` →
+  `load_and_play`) starts a new download **and** a new `streaming_decode_sync`, so both the file
+  and the packet counters reset together. If a download were ever retried in place against the
+  same path while its decode loop continued, the skip would land in the wrong place and either
+  drop or repeat audio.
+- **The wedge trigger is keyed on an error-string match** (`contains("past master element")`).
+  A symphonia upgrade that rewords the message silently loses the immediate rebuild path; the
+  25-cycle generic threshold still catches the wedge, but only ~5 s later. There is no test that
+  would notice the reword.
+- **The generic threshold costs ~5 s of freeze per wedge** (25 cycles × 200 ms) before it rebuilds,
+  and that only starts once the file has grown during the error episode. The exact-match path is
+  immediate; every other wedge mode pays this latency.
+- **Repeated rebuilds re-read from byte 0, so each costs O(bytes downloaded so far).** Cheap for
+  the observed 5 MB track (file I/O + header parse, no decode), but for a long track that wedges
+  many times the cost is quadratic in track length. `useless_reprobes` paces this, it does not
+  eliminate it.
+- **Exhausting the rebuild budget does not fix the track.** After 10 consecutive rebuilds that
+  produced no packet, the loop stops rebuilding and waits on the download — i.e. it returns to the
+  pre-fix behaviour. It is bounded, not solved: a permanently wedged reader with an insufficient
+  download now ends the track via `wait_for_progress`'s ~10 min no-growth tolerance instead of
+  freezing forever. That is an improvement in observability, not in playback.
+- **No integration-level test exercises a real wedged MKV.** The new unit test pins the decision
+  arithmetic (which signals fire, where the replay skip lands) but parses no WebM — there is no
+  fixture that reproduces a torn cluster. The fix is verified by reading, and by the suite staying
+  green.
+- **Not re-verified against the reported reproduction.** `ujNeHIo7oTE` was not replayed after the
+  change; that needs a live YouTube session (or the device). The Part 1 Opus/timeline checklist —
+  `position_sec` advancing ~1× over 5–10 s, a >65 s track completing with no `buffer cap exceeded`
+  and one edge-triggered `over rebuffer window` diagnostic — is still open for this fix, as is
+  finding #1's stock-host install-and-start.
+- **Seek is untested through this path.** The loops fixed here are the streaming producers; a
+  wedge after a seek-in-stream goes through the same rebuild (it is the same loop) but has not
+  been exercised, and `seek_and_resume`'s own restart is unchanged.
+
+### Mitigations that keep a rebuild from being audible
+
+- The audio writer keeps consuming the already-buffered window for the whole rebuild.
+  `reprobe_format` polls for up to 40 × 150 ms = **6 s** in the worst case, and the default
+  unconsumed window (`[server] buffer_max_bytes`, 24 MiB; `server.ini.example` ships 8 MiB) is
+  **≈65 s of stereo 48 kHz PCM at the default, ≈22 s at 8 MiB** — either way far longer than a
+  rebuild takes, so a rebuild is normally invisible: only the wedge point itself is where audio
+  stops arriving, and that is the bug being fixed.
+- No buffer lock is held across the rebuild or across `wait_for_progress` (verified per call
+  site), so the writer cannot be starved by a rebuilding decoder, and `cancel` is checked on every
+  poll iteration — stop/skip/track-change stay responsive during a rebuild.
+- The codec decoder is not reset on rebuild (see Fix). For Opus that matters: a fresh libopus
+  decoder would restart its prediction state and audibly pop on the resumed packet.
+- The rebuild touches nothing in the `AudioBuffer` — `pcm`, `read_pos` and `consumed_total` are
+  left alone, so `calculate_position` (`engine.rs:278`) stays continuous across it. The user-visible
+  symptom of the bug was a frozen playhead; the playhead does not jump or rewind while the reader is
+  rebuilt, it simply resumes advancing once the first post-wedge packet is pushed.
+- `stall_cycles`/`last_file_size` are not reset as a set (only `stall_cycles` is, because the
+  reader is new), so `wait_for_progress`'s ~10 min no-growth tolerance still applies after a
+  rebuild — a rebuild cannot extend a wedged track's life indefinitely.
+
+### Follow-ups to close this properly
+
+- [ ] Replay `ujNeHIo7oTE` (or a fresh Opus 251 track) on a ~32 KB/s connection and confirm
+      `position_sec` advances continuously past the 9 s wedge point with no rewind.
+- [ ] The same for a **> 65 s** Opus track played to completion: no `buffer cap exceeded`,
+      one edge-triggered `over rebuffer window` diagnostic, RSS falling back after playback.
+- [ ] A seek mid-stream on a WebM/Opus track, then let it wedge, to exercise rebuild-after-seek.
+- [ ] A WebM fixture with a deliberately torn cluster, asserted in-repo, so a reworded
+      symphonia error message or a resequenced demuxer fails CI instead of silently losing the
+      immediate rebuild path.
+- [ ] If `useless_reprobes` exhaustion shows up in a real log, raise the bound or detect the
+      "cluster still incomplete" case directly instead of by rebuild count.
+
+## New issue — whole-track pre-download was the default (FIXED 2026-11-03: streaming is now the default, G3)
+
+**Reported as a product requirement:** playback should not have to download the whole track before
+it starts. Downloading the whole file first is a *fallback*, not the default; the default must be
+streaming with a fast time to first sound.
+
+**What it was.** `start_streaming_playback` picked its strategy from the URL's **extension**
+(`incremental_streaming_container`, engine.rs:~1616): WebM/Ogg/Opus streamed, everything else — in
+practice every YouTube DASH `m4a`/itag-140 track — was downloaded whole with
+`stream_http_to_file` and then decoded through the file path (`load_and_play`). Time to first sound
+was therefore the whole download: measured **180 s** for a 4.77 MB AAC track on a ~32 KB/s
+connection, and ~160 s for the 5.01 MB Opus track in the report above. The 90 s play timeout added
+on the player side was only enough to survive the fastest of those.
+
+**Why the extension was the wrong signal.** Whether a partial file can be probed depends on the
+stream's own cue layout, not its suffix. A DASH fMP4 with its `moov` init up front probes fine from
+a fragment; a progressive MP4 that cues `moov` at the end does not. The old function encoded a guess
+("fMP4/M4A can't be probed") that is false for the DASH case, so every track that merely *might*
+not stream paid the whole-track download.
+
+**Fix.** Strategy is no longer chosen up front. `start_streaming_playback` always starts streaming
+(spawns the download task + `streaming_decode_sync`) and then waits for one signal: the format
+probe. `streaming_decode_sync` now reports its probe outcome — and only that — through a oneshot
+(`probe_result`, engine.rs:2084):
+
+- Probe `Ok` → the container is decodable from the downloaded prefix, so the stream continues and
+  `POST /player/play` returns as soon as playback is viable instead of after the whole download.
+- Probe `Err` → this container cannot be probed from a partial file, so the loop cancels the
+  stream, downloads the file whole and decodes through `load_and_play`. Same behaviour as the old
+  default, reached only when it is actually needed.
+- Probe still pending (timeout) → the download is still trickling, not broken, so the stream keeps
+  going and the call returns.
+
+The budget is `PlayerEngine::STREAM_PROBE_BUDGET` = 35 s, deliberately just over the probe's own
+retry budget (60 × 500 ms ≈ 30 s) so a genuine "cannot be probed" is observed rather than timed out
+blind. A cancel while waiting (stop, or another track) skips the fallback rather than kicking off a
+background download behind the user's back. `incremental_streaming_container` is deleted.
+
+**Caveats / known limits**
+
+- The fallback is *not* faster than before: an unprobeable container still costs a whole-track
+  download, just after ~35 s instead of immediately. There is no way around that — the bytes simply
+  are not there yet — but it is now the exception, not the rule.
+- A container that probes but then wedges mid-stream (the MKV bug above) is a different failure and
+  is *not* covered by this fallback; the reader rebuild handles that.
+- The 35 s budget is a guess with no measurement behind it. If a real stream needs longer to deliver
+  a probeable prefix on a bad link, it falls back unnecessarily; if the probe needs less, the extra
+  wait is dead time on the play request. Worth tuning against a live log.
+- The probe itself is opened twice in the fallback case (once streaming, once whole-file), which is
+  wasted I/O on a path that is already slow. Unavoidable without restructuring the probe to be
+  resumable, which is a bigger change than this fix.
+
+**Tests:** `streaming_decode_reports_probe_outcome_for_fallback_decision` builds a minimal but valid
+WebM prefix (EBML header + `Segment{Info, Tracks{one Opus track}}` with an unknown-size Segment) and
+asserts the outcome is reported exactly once and is `Ok`. The opposite direction is deliberately not
+unit-tested: reaching it means sitting out the probe's real ~30 s retry budget. Full suite 56 + 25,
+green.
+
+
 
 The server needs minutes to resolve + pre-buffer a YouTube stream before it answers
 `/player/play` (observed: **180 s** to return for a fresh 4.77 MB AAC track on a ~32 KB/s
@@ -1085,8 +1260,10 @@ exceed the client's default read timeout. Fixed on the player side in `l337-play
 ("fix(playback): give play/upload requests a longer read timeout"): play/upload requests go
 through a short-lived client sharing transport/auth/UDS config with a longer timeout (90 s upload
 / 30 s play), closed in a `finally` so nothing leaks. The server-side root cause — plan G3
-(whole-track pre-download before streaming) — remains open: for Opus/WebM, incremental streaming
-would cut time-to-first-sound.
+(whole-track pre-download before streaming) — is **closed**: streaming is now the default and the
+whole-file download is only a fallback for containers that cannot be probed from a partial file
+(see the G3 section above). The player-side timeout increase stays useful regardless: the first play
+of a cold track still spends seconds resolving + buffering.
 
 ## Device build budget — why builds stopped happening on the device
 
@@ -1138,17 +1315,33 @@ metadata, but it disagrees with what the player shows and with `current_track.du
 bug, worth a decision: keep the container-derived value (and teach the client) or clamp to the
 requested `duration`.
 
-## Consolidated open items (the finish line)
+## Consolidated remaining work for the bugs that are resolved (as of 2026-11-03)
 
-| # | Item | Notes |
+What each resolved bug still needs. "Closed in code" means the fix is written, unit-tested and the
+suite is green; every one of them still needs **live confirmation on a real target**, because none
+of these defects are reproducible in dummy mode. Ordered by risk if left unverified.
+
+| # | Bug resolved in code | What remains |
 |---|---|---|
-| 1 | **WebM/Opus streaming stall at ~9 s** | reader wedged past the downloaded prefix; needs a demuxer restart/seek on retry (see above) |
-| 2 | Finding #3 — whole-track file decode (file/`play/stream` path) | bounded-capacity shortcut in place; upgrade path = incremental decode into the throttled producer |
-| 3 | Finding #7 — `CHUNK_FRAMES = 4096` device re-check | audio 1×, no underrun, lower wakeups |
-| 4 | Finding #9 (optional) — regenerate `opus-stubs/libopus.so` in CI with a diff gate | validation already in CI |
-| 5 | Finding #6 (future) — real lossless preference + degradation flag | docs already honest |
-| 6 | RSS reclaim on the streaming path; forced sink-error recovery + volume-after-recovery; real bandwidth ceiling | need a live PipeWire/ALSA host |
-| 7 | Stock-host install + start (finding #1) and the Linux/macOS installer paths (systemd poll, `launchctl bootstrap`) | `pipelinepro` real-host rerun of the Debian-installer fix |
-| 8 | Plan G3 — incremental Opus/WebM streaming (time-to-first-sound) | pairs with item 1 |
-| 9 | CI `cargo test` job | the suite has never run in CI |
-| 10 | Merge `g1-opus-decode` → `main` for an official release | the monthly runner cuts official releases from `main`; prereleases now build+tag correctly from any named branch |
+| 1 | Wedged MKV/WebM reader (the ~9 s Opus stall) | Replay a live Opus track across the old 9 s wedge point and confirm `position_sec` advances continuously with no rewind; a >65 s track completing; a mid-stream seek then a wedge. A torn-cluster WebM fixture asserted in CI, so a reworded symphonia error or a resequenced demuxer fails loudly instead of silently falling back to the ~5 s generic path |
+| 2 | G3 — whole-track pre-download was the default | Confirm the new fast path end-to-end: `POST /player/play` returns in seconds (not minutes) on a cold 32 KB/s link, audio starts before the download finishes, and a container that genuinely cannot be probed still falls back and plays. Tune `STREAM_PROBE_BUDGET` (35 s) against a real log |
+| 3 | BUG-1/BUG-2 window + reclaim | RSS falls back after playback on a real backend; a >65 s track completes with one edge-triggered `over rebuffer window` diagnostic and no `buffer cap exceeded` |
+| 4 | BUG-3 end-of-track | Seek to near the end on a live track, confirm `state` flips to `stopped` and the position holds |
+| 5 | BUG-4 / G2 ceiling | Live `yt-dlp -F` both directions (AAC max → AAC 129 k; Opus max → Opus 144 k) were verified 2026-11-02; still owed: a *streamed* track (not just resolved) reporting `actual_kbps` under a `target_kbps` ceiling |
+| 6 | Finding #1 libopus on stock hosts | A stock Debian/Fedora/Arch host installing + starting the release binary (dummy and real), `readelf -d`/`ldd` clean, install failing loudly rather than silently succeeding when the lib is missing |
+| 7 | Finding #7 `CHUNK_FRAMES = 4096` | Device re-check: audio at 1×, no underrun, fewer wakeups |
+| 8 | CI | `cargo test` has never run in CI — the whole suite (56 unit + 25 endpoint) is host-only |
+| 9 | Release | Merge `g1-opus-decode` → `main`; the monthly runner cuts official releases from `main`, so the Opus decode, BUG-1..4, the reader rebuild and the G3 streaming default are all invisible to users until it lands |
+| 10 | Finding #3 (shortcut, unchanged) | Whole-track file decode on the file path; upgrade path = incremental decode into the throttled producer |
+
+**Verified and needing nothing further:** BUG-A (resampler zeros), BUG-B (`stop()` leak), the
+`track_id` traversal fix, bare-token 401, the `loglevel` config key, the release-provenance fix
+(`workflow_dispatch` branch + tag pinned to `$GITHUB_SHA`), and the installer dependency check.
+
+### Merge gate
+
+All CRITICAL/WARNING findings from the original review are closed. What the merge gate above now
+blocks on is **live verification**, not code: items 1-7 all need a real PipeWire/ALSA host or a
+device, and item 9 needs the branch merged. Nothing in the table is a code defect that is known
+open.
+

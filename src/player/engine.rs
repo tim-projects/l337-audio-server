@@ -124,6 +124,14 @@ pub struct PlayerEngine {
 }
 
 impl PlayerEngine {
+    /// How long a streaming start waits for the container probe before giving up
+    /// on streaming and falling back to a whole-file download. It must outlive
+    /// the probe's own retry budget (60 × 500 ms ≈ 30 s) so a genuine
+    /// "cannot be probed from a partial file" is observed rather than timed out
+    /// blind — and it is far shorter than downloading a whole track, which is
+    /// what the fallback still costs for a 5 MB file on a 32 KB/s link (~160 s).
+    const STREAM_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
+
     pub fn new(storage: StorageManager, buffer_max_bytes: u64, default_target_kbps: u32) -> Result<Self, String> {
         let mut audio_buffer = AudioBuffer::new(48000, 0);
         audio_buffer.max_bytes = buffer_max_bytes as usize;
@@ -708,28 +716,26 @@ impl PlayerEngine {
             self.duration_sec = Some(dur);
         }
 
-        // G3: fragmented MP4/M4A (YouTube DASH audio) can't be probed from a
-        // partial file — its moov init isn't at the front. Download it whole and
-        // decode via the reliable file path. WebM/Ogg cue up-front and stream.
-        let ext_l = ext.unwrap_or_default();
-        if !ext_l.is_empty() && !incremental_streaming_container(&ext_l) {
-            let cancel = std::sync::Arc::new(AtomicBool::new(false));
-            stream_http_to_file(&direct_url, &path, cancel.clone())
-                .await
-                .map_err(StreamStartError::Playback)?;
-            {
-                let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                buf.pcm.clear();
-                buf.read_pos = 0;
-                buf.consumed_total = 0;
-            }
-            self.ensure_stream();
-            self.load_and_play("current").await;
-            return Ok(());
-        }
+        // Streaming is the default: it starts decoding while the download is
+        // still trickling, so time-to-first-sound is bounded by the container
+        // header rather than the whole track. A whole-file download is the
+        // fallback, taken only when the container cannot be *probed* — and so
+        // cannot be decoded — from the downloaded prefix.
+        //
+        // The extension is deliberately not the decision: whether a partial file
+        // probes depends on the stream's own cue layout, not its suffix, so the
+        // probe is the authority (a DASH fMP4 with its moov up front streams
+        // fine; a progressive MP4 that cues moov at the end does not, and falls
+        // back). Guessing by extension bought a whole-track download for every
+        // container that merely *might* not stream.
+        let _ = ext;
 
         let dl_path = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        // Kept outside the `StreamingPlayback` struct so the fallback below can
+        // still ask "did the user move on?" after the stream was handed off.
+        let cancel_check = cancel.clone();
+        let fallback_url = direct_url.clone();
 
         let download_cancel = cancel.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -764,8 +770,14 @@ impl PlayerEngine {
         let audio_buffer = self.audio_buffer.clone();
         let decode_path = path.clone();
         let decode_cancel = cancel.clone();
+        // The probe outcome is the only signal that this stream is actually
+        // decodable; without it the caller cannot tell a trickling download
+        // (stream on) from an unprobeable container (fall back).
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
         let decode_handle = tokio::task::spawn_blocking(move || {
-            if let Err(e) = streaming_decode_sync(decode_path, audio_buffer, decode_cancel) {
+            if let Err(e) =
+                streaming_decode_sync(decode_path, audio_buffer, decode_cancel, Some(probe_tx))
+            {
                 error!("streaming decode task failed: {}", e);
             }
         });
@@ -777,7 +789,39 @@ impl PlayerEngine {
         });
 
         self.state = PlayerStateLabel::Playing;
-        Ok(())
+
+        // Wait for the probe. A timeout means the download is still trickling,
+        // not that streaming is broken, so the stream keeps going in the
+        // background and this returns as soon as playback is viable.
+        match tokio::time::timeout(Self::STREAM_PROBE_BUDGET, probe_rx).await {
+            Ok(Ok(Err(e))) => {
+                // Never probed: this container cannot be decoded incrementally.
+                if cancel_check.load(Ordering::SeqCst) {
+                    // The user moved on (stop / another track) while we waited.
+                    return Ok(());
+                }
+                tracing::warn!(
+                    error = %e,
+                    "stream container could not be probed from a partial file; falling back to a whole-file download"
+                );
+                self.stop();
+                stream_http_to_file(&fallback_url, &path, Arc::new(AtomicBool::new(false)))
+                    .await
+                    .map_err(StreamStartError::Playback)?;
+                {
+                    let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    buf.pcm.clear();
+                    buf.read_pos = 0;
+                    buf.consumed_total = 0;
+                    buf.channels = 0;
+                    buf.file_sample_rate = 0;
+                }
+                self.ensure_stream();
+                self.load_and_play("current").await;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn set_speed(&mut self, speed: f32) {
@@ -1576,17 +1620,6 @@ async fn download_via_ytdlp(
     Ok(())
 }
 
-/// Whether a container can be decoded incrementally via `streaming_decode_sync`
-/// (WebM/Matroska, Ogg). fMP4/M4A (YouTube DASH audio) has a fragmented moov and
-/// never completes a probe on a truncated file, so it is downloaded whole then
-/// decoded through the reliable file path (G3). Unknown containers stream.
-fn incremental_streaming_container(ext: &str) -> bool {
-    matches!(
-        ext.to_lowercase().as_str(),
-        "webm" | "mkv" | "matroska" | "ogg" | "oga" | "opus"
-    )
-}
-
 /// Best-effort container extension from a direct URL's path (before `?`).
 fn guess_ext_from_url(url: &str) -> Option<String> {
     let path = url.split('?').next()?;
@@ -1978,7 +2011,7 @@ fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cyc
         return false;
     } else {
         *stall_cycles += 1;
-        if *stall_cycles % STALL_LOG_EVERY == 0 {
+        if (*stall_cycles).is_multiple_of(STALL_LOG_EVERY) {
             tracing::warn!(
                 "stream waiting on download: no growth for ~{}s at {} bytes",
                 *stall_cycles * 200 / 1000,
@@ -1990,10 +2023,62 @@ fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cyc
     true
 }
 
+/// Re-open and re-probe a growing stream file, returning a fresh format reader.
+///
+/// Why this exists: symphonia's MKV/WebM reader has no resync. Once it reports
+/// `mkv: attempt to read element data past master element` it stays wedged for
+/// the whole life of the reader — the read position is inside the element it
+/// just failed to parse, so every subsequent `next_packet` re-parses garbage and
+/// fails again. The device report (`position_sec` frozen at 9 s, `state`
+/// `playing`, one warning in 72 s of a 32 KB/s download) is exactly that: the
+/// download kept growing, the reader did not, and the loop kept "waiting for
+/// download" forever.
+///
+/// A fresh reader over the same (append-only) file recovers. The caller skips
+/// the packets it already pushed so playback does not rewind.
+fn reprobe_format(
+    path: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<symphonia::core::probe::ProbeResult> {
+    for attempt in 0..40 {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        // A fresh handle already starts at 0: the reader replays the same byte
+        // stream, and the caller skips forward to where it left off.
+        if let Ok(file) = std::fs::File::open(path) {
+            let source = FileSource { file };
+            let mss = symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
+            if let Ok(p) = symphonia::default::get_probe().format(
+                &symphonia::core::probe::Hint::new(),
+                mss,
+                &Default::default(),
+                &Default::default(),
+            ) {
+                return Some(p);
+            }
+        }
+        if attempt % 10 == 0 {
+            tracing::debug!(attempt, "reprobe: format not fully downloaded yet");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    None
+}
+
+/// Synchronous decode loop for streaming playback.
+///
+/// `probe_result` reports the format-probe outcome (and only that) back to the
+/// caller, which is the signal that decides between streaming and the
+/// whole-file fallback: streaming is the default, and a container that cannot be
+/// probed from a partial file must not cost the caller a whole-track download
+/// before it finds out. A `None` receiver means the caller already moved on, so
+/// every send is best-effort.
 fn streaming_decode_sync(
     path: PathBuf,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
     cancel: Arc<AtomicBool>,
+    mut probe_result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), String> {
     let mut file_size: u64 = 0;
     let mut stall_cycles: u32 = 0;
@@ -2012,7 +2097,11 @@ fn streaming_decode_sync(
     }
 
     if file_size == 0 {
-        return Err("stream file never received data".into());
+        let msg = "stream file never received data".to_string();
+        if let Some(tx) = probe_result.take() {
+            let _ = tx.send(Err(msg.clone()));
+        }
+        return Err(msg);
     }
 
     let mut probed = None;
@@ -2037,8 +2126,19 @@ fn streaming_decode_sync(
             Err(_) if attempt < 59 => {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            Err(e) => return Err(format!("format probe failed after retries: {e}")),
+            Err(e) => {
+                let msg = format!("format probe failed after retries: {e}");
+                if let Some(tx) = probe_result.take() {
+                    let _ = tx.send(Err(msg.clone()));
+                }
+                return Err(msg);
+            }
         }
+    }
+
+    // The container probed from the downloaded prefix: streaming is viable.
+    if let Some(tx) = probe_result.take() {
+        let _ = tx.send(Ok(()));
     }
 
     let probed = probed.unwrap();
@@ -2084,12 +2184,31 @@ fn streaming_decode_sync(
         }
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
         let mut last_file_size = file_size;
+        // Consecutive demux errors and the file size when the current error
+        // episode started. `stall_cycles` alone cannot tell a wedged reader from
+        // a starved one: it resets to 0 on every append, so a trickling download
+        // never accumulates it. These two survive appends.
+        let mut error_cycles: u32 = 0;
+        let mut error_start_size: u64 = file_size;
+        // Packets already read from the demuxer; `replay_skip` makes the rebuilt
+        // reader jump past them so playback resumes instead of rewinding.
+        let mut packets_read: u64 = 0;
+        let mut replay_skip: u64 = 0;
+        // Rebuilds that produced no packet before erroring again. A rebuild only
+        // helps once the download has completed the torn element the reader was
+        // stuck inside; without this guard a wedge that the download cannot fix
+        // yet would spend the whole track rebuilding at ~5 Hz.
+        let mut useless_reprobes: u32 = 0;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Ok(());
             }
             match format.next_packet() {
                 Ok(packet) => {
+                    packets_read += 1;
+                    if packets_read <= replay_skip {
+                        continue;
+                    }
                     if packet.track_id() != track_id {
                         continue;
                     }
@@ -2099,14 +2218,62 @@ fn streaming_decode_sync(
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                         ab.pcm.extend_from_slice(&out);
                     }
+                    error_cycles = 0;
+                    useless_reprobes = 0;
                     stall_cycles = 0;
                 }
                 Err(symphonia::core::errors::Error::IoError(_)) => {
+                    // Only a starved download produces this: the packet is not
+                    // downloaded yet, so waiting for more bytes is correct.
+                    error_cycles = 0;
                     if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                         break;
                     }
                 }
                 Err(e) => {
+                    let err_str = format!("{e}");
+                    error_cycles += 1;
+                    let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let grew_during_errors = current_size > error_start_size;
+                    // A reader that keeps failing while the download appends is
+                    // wedged, not starved (G1/device report: frozen at 9 s).
+                    if err_str.contains("past master element")
+                        || (error_cycles >= 25 && grew_during_errors)
+                    {
+                        if useless_reprobes >= 10 {
+                            // Rebuilding stops paying off: fall back to the
+                            // download-wait policy, which still ends the track
+                            // cleanly if the download dies entirely.
+                            tracing::warn!(
+                                error_cycles,
+                                useless_reprobes,
+                                "streaming opus: reader still wedged, waiting on download"
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = ?e,
+                                error_cycles,
+                                useless_reprobes,
+                                "streaming opus: demuxer wedged, rebuilding reader"
+                            );
+                            if let Some(p) = reprobe_format(&path, &cancel) {
+                                format = p.format;
+                                // The rebuilt reader replays the same byte
+                                // stream, so count from its first packet:
+                                // everything up to and including `replay_skip`
+                                // has already reached the buffer and must not be
+                                // pushed a second time.
+                                replay_skip = packets_read;
+                                packets_read = 0;
+                                error_cycles = 0;
+                                useless_reprobes += 1;
+                                error_start_size =
+                                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                stall_cycles = 0;
+                                continue;
+                            }
+                        }
+                    }
                     // Rate-limited on the *no-growth* episode, not the error
                     // count: `wait_for_progress` resets `stall_cycles` to 0 on
                     // every append, so guarding on `stall_cycles == 0` logged
@@ -2114,7 +2281,7 @@ fn streaming_decode_sync(
                     // on a trickling download). `stall_cycles == 1` is the first
                     // cycle of a no-growth spell, so this logs its start and
                     // then every ~20 s (100 cycles) it continues.
-                    if stall_cycles == 1 || stall_cycles % 100 == 0 {
+                    if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
                         tracing::warn!(error = ?e, ?stall_cycles, "streaming opus: demux error, waiting for download");
                     }
                     if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
@@ -2186,6 +2353,14 @@ fn streaming_decode_sync(
 
     let mut sample_buf = None;
     let mut last_file_size = file_size;
+    // Consecutive demux/decode errors, the file size when the current error
+    // episode started, and the replay counters that make a rebuilt reader resume
+    // instead of rewinding. See `reprobe_format`.
+    let mut error_cycles: u32 = 0;
+    let mut error_start_size: u64 = file_size;
+    let mut packets_read: u64 = 0;
+    let mut replay_skip: u64 = 0;
+    let mut useless_reprobes: u32 = 0;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -2194,6 +2369,10 @@ fn streaming_decode_sync(
 
         match format.next_packet() {
             Ok(packet) => {
+                packets_read += 1;
+                if packets_read <= replay_skip {
+                    continue;
+                }
                 if packet.track_id() != track_id {
                     continue;
                 }
@@ -2254,6 +2433,8 @@ fn streaming_decode_sync(
                             ab.pcm.extend_from_slice(&resampler.process(&output));
                         }
 
+                        error_cycles = 0;
+                        useless_reprobes = 0;
                         stall_cycles = 0;
                     }
                     Err(symphonia::core::errors::Error::IoError(_)) => {
@@ -2261,6 +2442,7 @@ fn streaming_decode_sync(
                         // uses the shared stall policy, not its own short one:
                         // giving up after ~4 s of no download growth ended tracks
                         // mid-playback on a trickling connection.
+                        error_cycles = 0;
                         if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                             break;
                         }
@@ -2272,17 +2454,120 @@ fn streaming_decode_sync(
                             .map_err(|e| format!("decoder reset: {e}"))?;
                     }
                     Err(e) => {
+                        let err_str = format!("{e}");
+                        error_cycles += 1;
+                        let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let grew_during_errors = current_size > error_start_size;
+                        // Same wedge as the Opus path: a reader that keeps
+                        // failing while the download appends is not starved.
+                        // The codec decoder is kept as-is: it never saw the
+                        // replayed packets, so its state stays continuous.
+                        if err_str.contains("past master element")
+                            || (error_cycles >= 25 && grew_during_errors)
+                        {
+                            if useless_reprobes >= 10 {
+                                // Rebuild budget spent: keep waiting on the
+                                // download instead of ending the track, so a
+                                // cluster the download has since completed still
+                                // gets played rather than abandoned.
+                                tracing::warn!(
+                                    error_cycles,
+                                    useless_reprobes,
+                                    "streaming decode: reader still wedged, waiting on download"
+                                );
+                                if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                                    tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
+                                }
+                                if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            tracing::warn!(
+                                error = ?e,
+                                error_cycles,
+                                useless_reprobes,
+                                "streaming decode: demuxer wedged, rebuilding reader"
+                            );
+                            if let Some(p) = reprobe_format(&path, &cancel) {
+                                format = p.format;
+                                // Count from the rebuilt reader's first packet;
+                                // see the Opus path for why.
+                                replay_skip = packets_read;
+                                packets_read = 0;
+                                error_cycles = 0;
+                                useless_reprobes += 1;
+                                error_start_size =
+                                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                stall_cycles = 0;
+                                continue;
+                            }
+                        }
+                        if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                            tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
+                        }
                         error!("streaming decode error: {:?}", e);
                         break;
                     }
                 }
             }
             Err(symphonia::core::errors::Error::IoError(_)) => {
+                // A truncated packet (the download hasn't reached it yet) uses
+                // the shared stall policy, not its own short one: giving up after
+                // ~4 s of no download growth ended tracks mid-playback on a
+                // trickling connection.
+                error_cycles = 0;
                 if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                     break;
                 }
             }
             Err(e) => {
+                let err_str = format!("{e}");
+                error_cycles += 1;
+                let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let grew_during_errors = current_size > error_start_size;
+                if err_str.contains("past master element")
+                    || (error_cycles >= 25 && grew_during_errors)
+                {
+                    if useless_reprobes >= 10 {
+                        // Rebuild budget spent: wait on the download rather than
+                        // ending the track (see the decode arm).
+                        tracing::warn!(
+                            error_cycles,
+                            useless_reprobes,
+                            "streaming packet: reader still wedged, waiting on download"
+                        );
+                        if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                            tracing::warn!(error = ?e, ?stall_cycles, "streaming packet error, waiting for download");
+                        }
+                        if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                            break;
+                        }
+                        continue;
+                    }
+                    tracing::warn!(
+                        error = ?e,
+                        error_cycles,
+                        useless_reprobes,
+                        "streaming packet: demuxer wedged, rebuilding reader"
+                    );
+                    if let Some(p) = reprobe_format(&path, &cancel) {
+                        format = p.format;
+                        // Count from the rebuilt reader's first packet; see
+                        // the Opus path for why.
+                        replay_skip = packets_read;
+                        packets_read = 0;
+                        error_cycles = 0;
+                        useless_reprobes += 1;
+                        error_start_size =
+                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        stall_cycles = 0;
+                        continue;
+                    }
+                }
+                if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                    tracing::warn!(error = ?e, ?stall_cycles, "streaming packet error, waiting for download");
+                }
                 error!("streaming packet error: {:?}", e);
                 break;
             }
@@ -2808,6 +3093,175 @@ exit 1
         // A second no-growth spell starts from zero again, not from the old high.
         assert!(wait_for_progress(&path, &mut last_size, &mut stall_cycles));
         assert_eq!(stall_cycles, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The wedge the device hit: the download keeps appending (so
+    /// `wait_for_progress` resets `stall_cycles` to 0 on every cycle and never
+    /// trips its tolerance) while the MKV reader keeps failing. Waiting can
+    /// never fix it, so the loop must decide to rebuild the reader. This test
+    /// pins that decision, and the skip rule that keeps the rebuilt reader from
+    /// pushing the audio it already pushed.
+    #[test]
+    fn wedge_is_detected_even_while_the_download_keeps_growing() {
+        // Same shape as the streaming loops: `stall_cycles` is reset by every
+        // append, so it stays 0; only the error-episode counters see the wedge.
+        let dir = std::env::temp_dir().join("l337-wedge-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("wedged.webm");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+
+        let mut stall_cycles = 0u32;
+        let mut error_cycles = 0u32;
+        let error_start_size = 16u64;
+        // ~9 s of Opus at 20 ms/packet: the prefix already pushed to the buffer,
+        // which the rebuilt reader must skip past instead of repeating.
+        let mut packets_read = 450u64;
+        let mut replay_skip = 0u64;
+        // `wait_for_progress`'s own view of the file, which lags behind the real
+        // size: that lag is what the download's growth looks like to it.
+        let mut last_file_size = 16u64;
+
+        // The download appends every cycle, exactly like the 32 KB/s connection
+        // in the report: `stall_cycles` must stay pinned at 0 the whole time.
+        for cycle in 0..30 {
+            let size = 16 + (cycle as u64 + 1) * 1024;
+            std::fs::write(&path, vec![0u8; size as usize]).unwrap();
+
+            // The append resets `wait_for_progress`'s counter every cycle.
+            assert!(wait_for_progress(&path, &mut last_file_size, &mut stall_cycles));
+
+            // A wedged reader answers every next_packet with this error.
+            error_cycles += 1;
+            let grew_during_errors = std::fs::metadata(&path).unwrap().len() > error_start_size;
+
+            // A starved reader (not wedged) gets IoError and resets the counter;
+            // only the persistent DecodeError accumulates.
+            if error_cycles >= 25 && grew_during_errors {
+                // Rebuild: replay everything already pushed, then count from 0.
+                replay_skip = packets_read;
+                packets_read = 0;
+                break;
+            }
+        }
+
+        assert!(
+            replay_skip > 0 || error_cycles >= 25,
+            "a wedged reader must be rebuilt after ~25 errors, got {error_cycles}"
+        );
+        assert_eq!(
+            stall_cycles, 0,
+            "the growth-reset stall counter must not be the wedge signal"
+        );
+
+        // The rebuilt reader replays the 450 packets already pushed; each is
+        // skipped, and playback resumes on the next one.
+        for _ in 0..replay_skip {
+            packets_read += 1;
+            assert!(
+                packets_read <= replay_skip,
+                "a replayed packet must be skipped, not pushed twice"
+            );
+        }
+        packets_read += 1;
+        assert!(
+            packets_read > replay_skip,
+            "playback must resume right after the replayed prefix"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The streaming-default contract: the decode loop must report its probe
+    /// outcome (and only the probe) to the caller, because that outcome is what
+    /// makes `start_streaming_playback` choose between streaming on and
+    /// downloading the whole track.
+    ///
+    /// Shortcut exercised here: a minimal but valid WebM prefix (EBML header +
+    /// Segment{Info, Tracks{one Opus track}} with an unknown-size Segment) so
+    /// the probe succeeds immediately and the reported outcome must be `Ok`.
+    /// The opposite direction — a prefix that never probes, which triggers the
+    /// whole-file fallback — is deliberately not unit-tested: reaching it means
+    /// sitting out the probe's own ~30 s retry budget, which is real product
+    /// behaviour, not a test concern (see the fallback item in bugs.md).
+    #[test]
+    fn streaming_decode_reports_probe_outcome_for_fallback_decision() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = std::env::temp_dir().join("l337-probe-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("partial.webm");
+        // EBML header, then a Segment holding the minimum the MKV probe needs:
+        // Info (timestamp scale + duration) and Tracks (one Opus audio track).
+        // A live stream declares the Segment size as unknown (0), which is what
+        // makes this prefix probeable before the download has finished.
+        fn el(id: &[u8], body: &[u8]) -> Vec<u8> {
+            [id, &[0x80 | body.len() as u8], body].concat()
+        }
+
+        // Info: TimestampScale = 1_000_000 (1 ms), Duration = 10.0
+        let info = [
+            el(&[0x2A, 0xD7, 0xB1], &[0x2F, 0x42, 0x40]), // VINT
+            el(&[0x44, 0x89], &[0x40, 0x24, 0, 0, 0, 0, 0, 0]), // f64
+        ]
+        .concat();
+        let info = el(&[0x15, 0x49, 0xA9, 0x66], &info);
+
+        // Audio: SamplingFrequency = 48000.0, Channels = 2
+        let audio = el(&[0xB5], &[0x40, 0xE7, 0x70, 0, 0, 0, 0, 0])
+            .into_iter()
+            .chain([0x9F, 0x81, 0x02])
+            .collect::<Vec<u8>>();
+        let audio = el(&[0xE1], &audio);
+
+        // TrackEntry: TrackNumber=1, TrackUID=1, CodecID="A_OPUS", Audio
+        let track = el(&[0xD7], &[0x01])
+            .into_iter()
+            .chain(el(&[0x73, 0xC5], &[0x01]))
+            .chain(el(&[0x86], b"A_OPUS"))
+            .chain(audio)
+            .collect::<Vec<u8>>();
+        let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &track));
+
+        #[rustfmt::skip]
+        let ebml_header: Vec<u8> = vec![
+            0x1A, 0x45, 0xDF, 0xA3, 0x9F,       // EBML element, size 31
+            0x42, 0x86, 0x81, 0x01,             //   EBMLVersion = 1
+            0x42, 0xF7, 0x81, 0x01,             //   EBMLReadVersion = 1
+            0x42, 0xF2, 0x81, 0x04,             //   EBMLMaxIDLength = 4
+            0x42, 0xF3, 0x81, 0x08,             //   EBMLMaxSizeLength = 8
+            0x42, 0x82, 0x84, b'w', b'e', b'b', b'm', // DocType "webm"
+            0x42, 0x87, 0x81, 0x02,             //   DocTypeVersion = 2
+            0x42, 0x85, 0x81, 0x02,             //   DocTypeReadVersion = 2
+        ];
+
+        let webm_prefix: Vec<u8> = ebml_header
+            .into_iter()
+            // Segment with an unknown (streaming) size.
+            .chain(el(&[0x18, 0x53, 0x80, 0x67], &[]))
+            .chain(info)
+            .chain(tracks)
+            .collect();
+        std::fs::write(&path, &webm_prefix).unwrap();
+
+        let audio_buffer = crate::platform::common::AudioBuffer::new(48000, 0);
+        let audio_buffer = Arc::new(Mutex::new(audio_buffer));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (probe_tx, mut probe_rx) = tokio::sync::oneshot::channel();
+
+        // The header has no TrackEntry, so decode stops right after the probe —
+        // which is exactly the point: the probe outcome is reported before any
+        // decode-time decision, and it is the *only* thing reported.
+        let _ = streaming_decode_sync(path.clone(), audio_buffer, cancel, Some(probe_tx));
+
+        match probe_rx.try_recv() {
+            Ok(outcome) => assert!(
+                outcome.is_ok(),
+                "a probed prefix must report Ok so the caller keeps streaming"
+            ),
+            Err(_) => panic!("the probe outcome must be reported exactly once"),
+        }
 
         let _ = std::fs::remove_file(&path);
     }
