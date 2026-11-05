@@ -2022,6 +2022,90 @@ fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cyc
     std::thread::sleep(std::time::Duration::from_millis(200));
     true
 }
+/// Minimum spacing between demuxer rebuilds: a rebuild costs a full re-probe
+/// plus a replay of the packets already pushed, so a wedged reader on a
+/// trickling download must not spin.
+const REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long the download must stay quiet before a wedged reader is re-probed
+/// anyway. A finished (or stalled) download never grows again by itself, and
+/// only a rebuild against the file as it now stands can lift the length bound
+/// Symphonia froze when the reader was created.
+const REBUILD_QUIET_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a persistent demuxer error means for the streaming decode loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeAction {
+    /// Not a wedge: the caller's own error handling applies (log and end).
+    NotWedge,
+    /// Wedged, but rebuilding cannot help yet — wait on the download first.
+    Wait,
+    /// Wedged, and a fresh probe is worth its cost now.
+    Rebuild,
+}
+
+/// Whether another re-probe of the stream file is due.
+///
+/// Symphonia freezes the stream length when a reader is created:
+/// `MkvReader::try_new` seeks to EOF and keeps the result, both as the bound
+/// every element must fit inside and as the source's EOF. A reader opened on a
+/// partial download therefore errors on the first element crossing that
+/// snapshot *and* stays "starved" for bytes it can never see, however much the
+/// download appends afterwards. A fresh probe is the only thing that re-reads
+/// the file's length, so re-probing pays off when
+///
+/// 1. the file grew since the last rebuild — the new bytes may complete the
+///    element the reader is stuck inside, or
+/// 2. the file has been quiet for [`REBUILD_QUIET_GRACE`] — the download has
+///    finished or stalled, so it will never grow again on its own, and only the
+///    fresh probe (which now sees the whole file) lifts the frozen bound.
+///
+/// Rebuilds are rate-limited to [`REBUILD_MIN_INTERVAL`] so a wedge the
+/// download cannot fix yet cannot spin the loop, and the shared 600s no-growth
+/// watchdog in `wait_for_progress` still ends the decode if the file is
+/// permanently stuck.
+fn rebuild_due(
+    current_size: u64,
+    size_at_last_rebuild: &mut u64,
+    last_rebuild_at: &mut Option<std::time::Instant>,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(at) = *last_rebuild_at {
+        if now.duration_since(at) < REBUILD_MIN_INTERVAL {
+            return false;
+        }
+        if current_size <= *size_at_last_rebuild && now.duration_since(at) < REBUILD_QUIET_GRACE {
+            // Quiet since the last rebuild: the download has finished or
+            // stalled. One rebuild after the grace period still pays off,
+            // because the fresh probe finally sees the file as it now stands.
+            return false;
+        }
+    }
+    *size_at_last_rebuild = current_size;
+    *last_rebuild_at = Some(now);
+    true
+}
+
+/// Decide what to do with a persistent demuxer error on a growing file:
+/// a wedged reader must be re-probed, everything else keeps the caller's
+/// own error handling. Shares the re-probe policy with the IoError arm, which
+/// needs it for the same reason (see [`rebuild_due`]).
+fn wedge_action(
+    err_str: &str,
+    error_cycles: u32,
+    grew_during_errors: bool,
+    current_size: u64,
+    size_at_last_rebuild: &mut u64,
+    last_rebuild_at: &mut Option<std::time::Instant>,
+) -> WedgeAction {
+    if !(err_str.contains("past master element") || (error_cycles >= 25 && grew_during_errors)) {
+        return WedgeAction::NotWedge;
+    }
+    if rebuild_due(current_size, size_at_last_rebuild, last_rebuild_at) {
+        WedgeAction::Rebuild
+    } else {
+        WedgeAction::Wait
+    }
+}
 
 /// Re-open and re-probe a growing stream file, returning a fresh format reader.
 ///
@@ -2194,11 +2278,10 @@ fn streaming_decode_sync(
         // reader jump past them so playback resumes instead of rewinding.
         let mut packets_read: u64 = 0;
         let mut replay_skip: u64 = 0;
-        // Rebuilds that produced no packet before erroring again. A rebuild only
-        // helps once the download has completed the torn element the reader was
-        // stuck inside; without this guard a wedge that the download cannot fix
-        // yet would spend the whole track rebuilding at ~5 Hz.
-        let mut useless_reprobes: u32 = 0;
+        // Rebuild bookkeeping for the wedge policy: the file size and time of
+        // the last re-probe, which decide when another one can help.
+        let mut size_at_last_rebuild: u64 = 0;
+        let mut last_rebuild_at: Option<std::time::Instant> = None;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Ok(());
@@ -2219,13 +2302,31 @@ fn streaming_decode_sync(
                         ab.pcm.extend_from_slice(&out);
                     }
                     error_cycles = 0;
-                    useless_reprobes = 0;
                     stall_cycles = 0;
                 }
                 Err(symphonia::core::errors::Error::IoError(_)) => {
                     // Only a starved download produces this: the packet is not
                     // downloaded yet, so waiting for more bytes is correct.
                     error_cycles = 0;
+                    // ...unless the file stopped growing. A reader built on a
+                    // partial file also reports starved forever — its EOF
+                    // snapshot is frozen — so the same re-probe policy that
+                    // clears a wedge clears this: a fresh probe re-reads the
+                    // file length and the reader can finally see the bytes it
+                    // was waiting for.
+                    if rebuild_due(
+                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                        &mut size_at_last_rebuild,
+                        &mut last_rebuild_at,
+                    ) {
+                        if let Some(p) = reprobe_format(&path, &cancel) {
+                            format = p.format;
+                            replay_skip = packets_read;
+                            packets_read = 0;
+                            stall_cycles = 0;
+                            continue;
+                        }
+                    }
                     if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                         break;
                     }
@@ -2237,55 +2338,50 @@ fn streaming_decode_sync(
                     let grew_during_errors = current_size > error_start_size;
                     // A reader that keeps failing while the download appends is
                     // wedged, not starved (G1/device report: frozen at 9 s).
-                    if err_str.contains("past master element")
-                        || (error_cycles >= 25 && grew_during_errors)
+                    let mut rebuilt = false;
+                    if wedge_action(
+                        &err_str,
+                        error_cycles,
+                        grew_during_errors,
+                        current_size,
+                        &mut size_at_last_rebuild,
+                        &mut last_rebuild_at,
+                    ) == WedgeAction::Rebuild
                     {
-                        if useless_reprobes >= 10 {
-                            // Rebuilding stops paying off: fall back to the
-                            // download-wait policy, which still ends the track
-                            // cleanly if the download dies entirely.
-                            tracing::warn!(
-                                error_cycles,
-                                useless_reprobes,
-                                "streaming opus: reader still wedged, waiting on download"
-                            );
-                        } else {
-                            tracing::warn!(
-                                error = ?e,
-                                error_cycles,
-                                useless_reprobes,
-                                "streaming opus: demuxer wedged, rebuilding reader"
-                            );
-                            if let Some(p) = reprobe_format(&path, &cancel) {
-                                format = p.format;
-                                // The rebuilt reader replays the same byte
-                                // stream, so count from its first packet:
-                                // everything up to and including `replay_skip`
-                                // has already reached the buffer and must not be
-                                // pushed a second time.
-                                replay_skip = packets_read;
-                                packets_read = 0;
-                                error_cycles = 0;
-                                useless_reprobes += 1;
-                                error_start_size =
-                                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                                stall_cycles = 0;
-                                continue;
-                            }
+                        tracing::warn!(
+                            error = ?e,
+                            error_cycles,
+                            "streaming opus: demuxer wedged, rebuilding reader"
+                        );
+                        if let Some(p) = reprobe_format(&path, &cancel) {
+                            format = p.format;
+                            // The rebuilt reader replays the same byte
+                            // stream, so count from its first packet:
+                            // everything up to and including `replay_skip`
+                            // has already reached the buffer and must not be
+                            // pushed a second time.
+                            replay_skip = packets_read;
+                            packets_read = 0;
+                            error_cycles = 0;
+                            error_start_size = current_size;
+                            stall_cycles = 0;
+                            rebuilt = true;
                         }
                     }
-                    // Rate-limited on the *no-growth* episode, not the error
-                    // count: `wait_for_progress` resets `stall_cycles` to 0 on
-                    // every append, so guarding on `stall_cycles == 0` logged
-                    // once per error for the whole buffering phase (~5 lines/s
-                    // on a trickling download). `stall_cycles == 1` is the first
-                    // cycle of a no-growth spell, so this logs its start and
-                    // then every ~20 s (100 cycles) it continues.
-                    if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
-                        tracing::warn!(error = ?e, ?stall_cycles, "streaming opus: demux error, waiting for download");
-                    }
-                    if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
-                        break;
+                    if !rebuilt {
+                        // Rate-limited on the *no-growth* episode, not the error
+                        // count: `wait_for_progress` resets `stall_cycles` to 0 on
+                        // every append, so guarding on `stall_cycles == 0` logged
+                        // once per error for the whole buffering phase (~5 lines/s
+                        // on a trickling download). `stall_cycles == 1` is the first
+                        // cycle of a no-growth spell, so this logs its start and
+                        // then every ~20 s (100 cycles) it continues.
+                        if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                            tracing::warn!(error = ?e, ?stall_cycles, "streaming opus: demux error, waiting for download");
+                        }
+                        if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                            break;
+                        }
                     }
                 }
             }
@@ -2360,7 +2456,8 @@ fn streaming_decode_sync(
     let mut error_start_size: u64 = file_size;
     let mut packets_read: u64 = 0;
     let mut replay_skip: u64 = 0;
-    let mut useless_reprobes: u32 = 0;
+    let mut size_at_last_rebuild: u64 = 0;
+    let mut last_rebuild_at: Option<std::time::Instant> = None;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -2434,15 +2531,30 @@ fn streaming_decode_sync(
                         }
 
                         error_cycles = 0;
-                        useless_reprobes = 0;
                         stall_cycles = 0;
                     }
                     Err(symphonia::core::errors::Error::IoError(_)) => {
                         // A truncated packet (the download hasn't reached it yet)
                         // uses the shared stall policy, not its own short one:
                         // giving up after ~4 s of no download growth ended tracks
-                        // mid-playback on a trickling connection.
+                        // mid-playback on a trickling connection. A reader built
+                        // on a partial file stays starved forever once the file
+                        // stops growing, so it shares the wedge's re-probe
+                        // policy (see the Opus path).
                         error_cycles = 0;
+                        if rebuild_due(
+                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                            &mut size_at_last_rebuild,
+                            &mut last_rebuild_at,
+                        ) {
+                            if let Some(p) = reprobe_format(&path, &cancel) {
+                                format = p.format;
+                                replay_skip = packets_read;
+                                packets_read = 0;
+                                stall_cycles = 0;
+                                continue;
+                            }
+                        }
                         if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                             break;
                         }
@@ -2462,52 +2574,54 @@ fn streaming_decode_sync(
                         // failing while the download appends is not starved.
                         // The codec decoder is kept as-is: it never saw the
                         // replayed packets, so its state stays continuous.
-                        if err_str.contains("past master element")
-                            || (error_cycles >= 25 && grew_during_errors)
-                        {
-                            if useless_reprobes >= 10 {
-                                // Rebuild budget spent: keep waiting on the
-                                // download instead of ending the track, so a
-                                // cluster the download has since completed still
-                                // gets played rather than abandoned.
-                                tracing::warn!(
-                                    error_cycles,
-                                    useless_reprobes,
-                                    "streaming decode: reader still wedged, waiting on download"
-                                );
+                        match wedge_action(
+                            &err_str,
+                            error_cycles,
+                            grew_during_errors,
+                            current_size,
+                            &mut size_at_last_rebuild,
+                            &mut last_rebuild_at,
+                        ) {
+                            WedgeAction::NotWedge => {
+                                if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                                    tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
+                                }
+                                error!("streaming decode error: {:?}", e);
+                                break;
+                            }
+                            WedgeAction::Wait => {
                                 if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
                                     tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
                                 }
                                 if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                                     break;
                                 }
-                                continue;
                             }
-                            tracing::warn!(
-                                error = ?e,
-                                error_cycles,
-                                useless_reprobes,
-                                "streaming decode: demuxer wedged, rebuilding reader"
-                            );
-                            if let Some(p) = reprobe_format(&path, &cancel) {
-                                format = p.format;
-                                // Count from the rebuilt reader's first packet;
-                                // see the Opus path for why.
-                                replay_skip = packets_read;
-                                packets_read = 0;
-                                error_cycles = 0;
-                                useless_reprobes += 1;
-                                error_start_size =
-                                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                                stall_cycles = 0;
-                                continue;
+                            WedgeAction::Rebuild => {
+                                tracing::warn!(
+                                    error = ?e,
+                                    error_cycles,
+                                    "streaming decode: demuxer wedged, rebuilding reader"
+                                );
+                                if let Some(p) = reprobe_format(&path, &cancel) {
+                                    format = p.format;
+                                    // Count from the rebuilt reader's first packet;
+                                    // see the Opus path for why.
+                                    replay_skip = packets_read;
+                                    packets_read = 0;
+                                    error_cycles = 0;
+                                    error_start_size = current_size;
+                                    stall_cycles = 0;
+                                } else {
+                                    // The probe could not run (file vanished or
+                                    // the user moved on): wait for the download
+                                    // rather than abandoning the track.
+                                    if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                                        break;
+                                    }
+                                }
                             }
                         }
-                        if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
-                            tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
-                        }
-                        error!("streaming decode error: {:?}", e);
-                        break;
                     }
                 }
             }
@@ -2515,8 +2629,23 @@ fn streaming_decode_sync(
                 // A truncated packet (the download hasn't reached it yet) uses
                 // the shared stall policy, not its own short one: giving up after
                 // ~4 s of no download growth ended tracks mid-playback on a
-                // trickling connection.
+                // trickling connection. A reader built on a partial file stays
+                // starved forever once the file stops growing, so it shares the
+                // wedge's re-probe policy (see the Opus path).
                 error_cycles = 0;
+                if rebuild_due(
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                    &mut size_at_last_rebuild,
+                    &mut last_rebuild_at,
+                ) {
+                    if let Some(p) = reprobe_format(&path, &cancel) {
+                        format = p.format;
+                        replay_skip = packets_read;
+                        packets_read = 0;
+                        stall_cycles = 0;
+                        continue;
+                    }
+                }
                 if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                     break;
                 }
@@ -2526,50 +2655,51 @@ fn streaming_decode_sync(
                 error_cycles += 1;
                 let current_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let grew_during_errors = current_size > error_start_size;
-                if err_str.contains("past master element")
-                    || (error_cycles >= 25 && grew_during_errors)
-                {
-                    if useless_reprobes >= 10 {
-                        // Rebuild budget spent: wait on the download rather than
-                        // ending the track (see the decode arm).
-                        tracing::warn!(
-                            error_cycles,
-                            useless_reprobes,
-                            "streaming packet: reader still wedged, waiting on download"
-                        );
+                match wedge_action(
+                    &err_str,
+                    error_cycles,
+                    grew_during_errors,
+                    current_size,
+                    &mut size_at_last_rebuild,
+                    &mut last_rebuild_at,
+                ) {
+                    WedgeAction::NotWedge => {
+                        if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
+                            tracing::warn!(error = ?e, ?stall_cycles, "streaming packet error, waiting for download");
+                        }
+                        error!("streaming packet error: {:?}", e);
+                        break;
+                    }
+                    WedgeAction::Wait => {
                         if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
                             tracing::warn!(error = ?e, ?stall_cycles, "streaming packet error, waiting for download");
                         }
                         if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
                             break;
                         }
-                        continue;
                     }
-                    tracing::warn!(
-                        error = ?e,
-                        error_cycles,
-                        useless_reprobes,
-                        "streaming packet: demuxer wedged, rebuilding reader"
-                    );
-                    if let Some(p) = reprobe_format(&path, &cancel) {
-                        format = p.format;
-                        // Count from the rebuilt reader's first packet; see
-                        // the Opus path for why.
-                        replay_skip = packets_read;
-                        packets_read = 0;
-                        error_cycles = 0;
-                        useless_reprobes += 1;
-                        error_start_size =
-                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        stall_cycles = 0;
-                        continue;
+                    WedgeAction::Rebuild => {
+                        tracing::warn!(
+                            error = ?e,
+                            error_cycles,
+                            "streaming packet: demuxer wedged, rebuilding reader"
+                        );
+                        if let Some(p) = reprobe_format(&path, &cancel) {
+                            format = p.format;
+                            // Count from the rebuilt reader's first packet; see
+                            // the Opus path for why.
+                            replay_skip = packets_read;
+                            packets_read = 0;
+                            error_cycles = 0;
+                            error_start_size = current_size;
+                            stall_cycles = 0;
+                        } else if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                            // The probe could not run: wait for the download
+                            // rather than abandoning the track.
+                            break;
+                        }
                     }
                 }
-                if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
-                    tracing::warn!(error = ?e, ?stall_cycles, "streaming packet error, waiting for download");
-                }
-                error!("streaming packet error: {:?}", e);
-                break;
             }
         }
     }
@@ -3095,6 +3225,73 @@ exit 1
         assert_eq!(stall_cycles, 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The regression the device hit on 2026-11-04: the reader is created on a
+    /// partial file (Symphonia freezes the stream length there), the download
+    /// *finishes*, and the wedge policy must still re-probe once the file goes
+    /// quiet — otherwise playback freezes at the first element that crossed the
+    /// frozen bound until the 600s no-growth watchdog gives up.
+    #[test]
+    fn wedge_policy_rebuilds_once_the_download_finishes() {
+        const PAST_MASTER: &str = "mkv: attempt to read element data past master element ";
+        let mut size_at_last_rebuild = 0u64;
+        let mut last_rebuild_at: Option<std::time::Instant> = None;
+
+        // First wedge on a growing file: rebuild.
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Rebuild,
+            "a wedged reader must be rebuilt the first time"
+        );
+        assert_eq!(size_at_last_rebuild, 100);
+
+        // Same size, within the rate limit: wait, do not spin.
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Wait,
+            "back-to-back rebuilds must be rate-limited"
+        );
+
+        // Not a wedge error: the caller's own error handling applies.
+        assert_eq!(
+            wedge_action("mkv: something else entirely", 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::NotWedge,
+            "an unrelated demux error must not trigger a rebuild"
+        );
+
+        // The download finished (no growth). Inside the quiet grace the policy
+        // waits, so a trickling download does not burn rebuilds.
+        std::thread::sleep(REBUILD_MIN_INTERVAL);
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Wait,
+            "a quiet file must not be re-probed before the grace elapses"
+        );
+
+        // Once the grace has elapsed the completed file gets its fresh probe,
+        // which is the only thing that lifts Symphonia's frozen length bound.
+        std::thread::sleep(REBUILD_QUIET_GRACE);
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Rebuild,
+            "a wedged reader on a quiet (finished) file must be rebuilt"
+        );
+
+        // New bytes after the last rebuild are always worth another probe, but
+        // never sooner than the rate limit allows.
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 4_000_000, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Wait,
+            "the rate limit applies to growth-triggered rebuilds too"
+        );
+        std::thread::sleep(REBUILD_MIN_INTERVAL);
+        assert_eq!(
+            wedge_action(PAST_MASTER, 1, true, 4_000_000, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            WedgeAction::Rebuild,
+            "growth since the last rebuild must trigger one"
+        );
+        assert_eq!(size_at_last_rebuild, 4_000_000);
     }
 
     /// The wedge the device hit: the download keeps appending (so
