@@ -403,7 +403,7 @@ and trim.
 |----|------|--------|--------|------|
 | OPT-1 | ALSA volume SIMD | M | Low | Low | DONE |
 | OPT-2 | ALSA chunk size | M | Low | Low | DONE |
-| OPT-3 | ALSA idle wake | M | Medium | Medium |
+| OPT-3 | ALSA idle wake | M | Medium | Medium | DONE |
 | OPT-4 | Resampler memmove | H | Medium | Low | DONE |
 | OPT-5 | Deinterleave alloc | M | Medium | Low | DONE |
 | OPT-6 | Opus buffer alloc | M | Low | Low | DONE |
@@ -414,13 +414,13 @@ and trim.
 | OPT-11 | Token generation | L | Low | Low | DONE |
 | OPT-12 | verify_and_consume | L | Low | Low | DONE |
 | OPT-13 | Incremental decode | H | High | Medium | DONE |
-| OPT-14 | Ring buffer | M | Medium | Low |
+| OPT-14 | Ring buffer | M | Medium | Low | SKIPPED |
 | OPT-15 | Track cache size | M | Low | Low | DONE |
 | OPT-16 | Debounce manifest | M | Low | Low | DONE |
-| OPT-17 | Eviction sorting | L | Low | Low |
+| OPT-17 | Eviction sorting | L | Low | Low | SKIPPED |
 | OPT-18 | Recovery poll interval | L | Low | Low | DONE |
-| OPT-19 | Producer notify | M | Medium | Low |
-| OPT-20 | Streaming file poll | L | Low | Low |
+| OPT-19 | Producer notify | M | Medium | Low | DONE |
+| OPT-20 | Streaming file poll | L | Low | Low | SKIPPED |
 | OPT-21 | Default features | M | Low | Low | DONE |
 | OPT-22 | Tokio features | M | Low | Low | DONE |
 ---
