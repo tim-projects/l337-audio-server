@@ -48,6 +48,11 @@ on:
         required: false
         default: false
         type: boolean
+      target:
+        description: 'Build target (or "all")'
+        required: false
+        default: 'all'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always

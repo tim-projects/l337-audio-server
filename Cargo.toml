@@ -4,7 +4,10 @@ version = "0.0.0-dev"
 edition = "2024"
 
 [features]
-default = ["backend"]
+# No default audio backend — users opt in to their platform backend
+# (`--features alsa` on Linux, `--features backend` for PipeWire/CoreAudio/WASAPI).
+# This keeps the binary small by not linking unused backends (OPT-21).
+default = []
 backend = ["pipewire", "coreaudio-rs", "wasapi"]
 alsa = []
 pulseaudio = ["backend"]
@@ -16,7 +19,7 @@ opus = []
 
 [dependencies]
 axum = "0.7.9"
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "signal"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "vorbis", "wav", "isomp4", "ogg", "alac"] }

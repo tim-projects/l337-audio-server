@@ -21,4 +21,5 @@ jobs:
     with:
       # A scheduled run has no inputs, so it falls back to official.
       official: ${{ inputs.official || true }}
+      target: all
     secrets: inherit

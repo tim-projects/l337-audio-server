@@ -386,7 +386,17 @@ async fn main() {
     tokio::spawn(async move {
         use std::time::Duration;
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let idle_interval = Duration::from_secs(5);
+            let active_interval = Duration::from_millis(500);
+            let sleep_for = {
+                let engine = recovery_state.0.lock().await;
+                if matches!(engine.state, crate::api::models::PlayerStateLabel::Stopped) {
+                    idle_interval
+                } else {
+                    active_interval
+                }
+            };
+            tokio::time::sleep(sleep_for).await;
             if recovery_cancel_clone.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }

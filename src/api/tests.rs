@@ -248,6 +248,9 @@ mod tests {
             cache_dir: cache.clone(),
             max_pool_size: 1024,
             manifest: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            total_size: 0,
+            manifest_dirty: false,
+            last_manifest_write: std::time::Instant::now(),
         };
         assert_eq!(
             storage.get_path_for_track("../escape"),

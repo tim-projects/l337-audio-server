@@ -1,5 +1,5 @@
 use crate::api::models::{AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload, TargetPayload, Track, VolumePayload};
-use crate::player::engine::{self, PlayerEngine};
+use crate::player::engine::{download_stream, PlayerEngine};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Json, State},
@@ -269,10 +269,13 @@ pub async fn cache_next(
             "Starting background cache for track {} to next.stream",
             track_id
         );
-        if let Err(e) = engine::download_stream(&track.stream_url, &dest, ceiling).await {
+        if let Err(e) = {
+            let engine = state_clone.0.lock().await;
+            download_stream(&engine.http_client, &track.stream_url, &dest, ceiling).await
+        } {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
-            let engine = state_clone.0.lock().await;
+            let mut engine = state_clone.0.lock().await;
             if let Some(persistent_path) = engine.storage.get_path_for_track(&track_id) {
                 let _ = tokio::fs::copy(&dest, &persistent_path).await;
             }
@@ -312,10 +315,13 @@ pub async fn cache_previous(
             "Starting background cache for track {} to prev.stream",
             track_id
         );
-        if let Err(e) = engine::download_stream(&track.stream_url, &dest, ceiling).await {
+        if let Err(e) = {
+            let engine = state_clone.0.lock().await;
+            download_stream(&engine.http_client, &track.stream_url, &dest, ceiling).await
+        } {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
-            let engine = state_clone.0.lock().await;
+            let mut engine = state_clone.0.lock().await;
             if let Some(persistent_path) = engine.storage.get_path_for_track(&track_id) {
                 let _ = tokio::fs::copy(&dest, &persistent_path).await;
             }
