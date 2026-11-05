@@ -15,7 +15,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **BUG-4** | `best` (`target_kbps=0`) selected a low-bitrate rendition | **FIXED** | verified on a live target 2026-11-02, **both directions** via `yt-dlp -F` (AAC 129 k when AAC is the max; Opus 144 k when Opus is the max) |
 | **BUG-A** | `resample_interleaved` emitted literal zeros for 44.1→48 kHz (all AAC/MP3 playback was silent) | **FIXED** | 2026-11-02 `parec` monitor peak **6513** during AAC playback (0 = the old regression) |
 | **BUG-B** | `stop()` never tore the stream down — leaked sink-input appending silence | **FIXED** | 2026-11-02 sink-input `count=0` after `POST /player/stop` |
-| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **FIXED** — premature-EOS fixed, then the wedged-MKV root cause fixed by rebuilding the reader | 2026-10-31, 2026-11-02 (trace) and 2026-11-03 (fix, Part 7) |
+| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **FIXED** — premature-EOS fixed, wedged-MKV root cause fixed by rebuilding the reader, then the *second* wedge (Symphonia's frozen stream length + a rebuild policy that gave up) fixed 2026-11-05 and verified on-device (0→213 s continuous, see the 2026-11-04/05 session) | 2026-10-31, 2026-11-02 (trace), 2026-11-03 (fix, Part 7), **2026-11-05 (re-fix + live verify)** |
 | **C** | The installed binary was a stale release — none of the fixes were in the running artifact | **FIXED** — provenance found, runner hardened | 2026-11-02: dispatch requires a branch + tag pinned to `$GITHUB_SHA`; release `2026.11.02-4` tag == built commit |
 | **NOTES** | Client progress bar (`time` field) + `/health` capability advertisement | **CLOSED** | 2026-11-02 `codecs`/`quality` advertised; `PlayerStatus.time` = `"00:00/04:54"` |
 | **G3** | Whole-track pre-download was the default before playback | **FIXED** | 2026-11-03: streaming is the default, whole-file download is the fallback for containers that cannot be probed from a partial file (Part 7) |
@@ -1362,3 +1362,102 @@ blocks on is **live verification**, not code: items 1-7 all need a real PipeWire
 device, and item 9 needs the branch merged. Nothing in the table is a code defect that is known
 open.
 
+
+---
+
+## Session — 2026-11-04 (Termux device): the ~9 s wedge is STILL PRESENT in `2026.11.03-1`; root cause found; engine fix written; build blocked by device disk
+
+**Verdict: the previously "FIXED" wedge (U2/U7, table item 1) is not fixed.** Release
+`2026.11.03-1` (built from `229346a`, i.e. *after* the reader-rebuild fix) reproduces the same
+frozen-playhead symptom on a real device, with a different and deeper root cause.
+
+### Reproduction (isolated instance, release artifact)
+
+Isolated instance: downloaded `l337-audio-server-aarch64-android-termux` from the
+`2026.11.03-1` prerelease (md5 identical to the installed service binary), private
+`L337_RUNTIME_DIR`, own token, `RUST_LOG=l337_audio_server=debug,symphonia_format_mkv=debug`.
+Played Rick Astley (`dQw4w9WgXcQ`, 213 s WebM/Opus, itag 251) via a fresh `yt-dlp` direct URL:
+
+- `POST /player/play` answered in ~5 s (streaming default works, time-to-first-sound fine).
+- `position_sec` advanced `0 → 9` and then **froze for the remaining 100+ s** of the test while
+  `state` stayed `playing`. No EOS, no error surfaced to the client.
+- The download itself completed: the file settled at 3,433,755 bytes and never grew again.
+
+### Evidence
+
+- Symphonia logged `stream is seekable with len=163840 bytes` on **every** probe — including all
+  ten rebuilds — then failed with
+  `SimpleBlock pos: 163555, len: 308 … parent end=163840` →
+  `mkv: attempt to read element data past master element`.
+- All ten rebuilds ran inside ~3 ms and all saw the same frozen length, so none of them recovered.
+  After the tenth the loop fell into `wait_for_progress` and sat there for the full 600 s
+  no-growth budget.
+- The downloaded file is **structurally sound** (independent EBML parse: header, Segment size
+  3,433,707 matching the file, Info/Tracks/Cues, 22 clusters, sizes all consistent).
+- The same file played from `file://…` through the same server **runs continuously** (sampled
+  `position_sec` 0→43 s over 45 s, `duration_sec` 213). The bytes are not the problem; the
+  streaming reader's state is.
+
+### Root cause
+
+Symphonia's `MkvReader::try_new` does `seek(SeekFrom::End(0))` once and keeps that value as
+`total_len`, the bound every element must fit inside (`ElementIterator.end` → the
+"past master element" check in `try_read_data`). The engine opens the reader as soon as the
+downloaded prefix probes — here at 163,840 bytes. The first element whose data crosses *that
+snapshot* (a SimpleBlock at 163,555 with data to 163,863) therefore errors permanently, on every
+reader built from a file that looked the same size at probe time.
+
+Recovery requires a re-probe against a *longer* file, and the engine's policy had two holes:
+
+1. The rebuild budget (`useless_reprobes >= 10`) was spent in the first milliseconds of the wedge —
+   i.e. while the download was still writing those 163 KiB — and once spent it was **never
+   replenished** for the life of the track.
+2. Nothing re-probed after the download went quiet, which is precisely the moment a fresh probe
+   would see the completed file and lift the frozen bound.
+
+So the reader was wedged on a bound that only a *completed* file could move, and the policy that
+could move it had already given up.
+
+### Fix (in the working tree, uncommitted: `src/player/engine.rs`)
+
+- New `wedge_action()` policy replaces the three duplicated wedge blocks (Opus, Symphonia, raw
+  packet) and the `useless_reprobes` counter. A rebuild is due when
+  (a) the file **grew** since the last rebuild — the new bytes may complete the torn element — or
+  (b) the file has been **quiet for 3 s** — the download has finished or stalled, and only the
+  fresh probe sees the file as it now stands.
+- Rebuilds are rate-limited to 250 ms per wedge so a trickling download cannot spin the loop;
+  the existing 600 s no-growth watchdog (`wait_for_progress`) still ends a permanently wedged
+  decode cleanly.
+- Regression test `wedge_policy_rebuilds_once_the_download_finishes` pins rebuild / rate-limit /
+  quiet-grace / growth / not-a-wedge decisions.
+
+### Verification — **PASSED on device 2026-11-05**
+
+Built on this Termux device (`--no-default-features --features pulseaudio,opus`, plus
+`RUSTFLAGS=--cfg tokio_allow_from_blocking_fd`, which axum-server 0.8 requires outside its
+release build path) and re-run in the isolated instance against the same live stream:
+
+- **Unit tests: 61 passed / 0 failed** (`cargo test --no-default-features --features opus`),
+  including the new `wedge_policy_rebuilds_once_the_download_finishes`. One flake observed once
+  and not reproducible in three consecutive full runs: `test_play_track_short_circuits_on_youtube_block`
+  reads the process-global `DOWNLOAD_STREAM_INVOKED` test flag, which another test can set while
+  libtest runs in parallel.
+- **Live wedge test: fixed.** `position_sec` advanced **0 → 213 s (the full track) continuously**,
+  no rewind, no stall, with **9 re-probes** across the download's snapshot crossings and **0**
+  600 s no-growth watchdog trips — the old build froze at 9 s and tripped the watchdog. A second
+  run reached 168 s and was still advancing when the googlevideo download itself slowed (the
+  remaining bytes trickle: a download-rate limit, not a reader defect).
+- The rebuild policy was extended while verifying: after a rebuild the reader can report a
+  *starved* read (`IoError`) forever rather than the wedge `DecodeError`, because its EOF snapshot
+  is frozen too. The IoError arm in all three streaming loops (Opus, Symphonia, raw packet) now
+  shares the same `rebuild_due` policy, so a quiet file is re-probed regardless of which error the
+  stuck reader reports.
+
+Observed, pre-existing and out of scope for this fix: at end-of-track the state stays `playing`
+with the position pinned at the track length (the writer goes idle with unconsumed samples still
+buffered, so BUG-3's `unconsumed == 0` EOS condition is not met on the streaming path — the file
+path is covered by `test_end_of_track_reports_stopped`).
+
+Still owed before the merge gate can close: the remaining table items (a stock-host
+PipeWire/ALSA run, RSS reclaim on a real backend, the streamed-track `actual_kbps` ceiling check,
+and the `CHUNK_FRAMES` device re-check), then the merge `g1-opus-decode` → `main`.
