@@ -67,20 +67,29 @@ impl ChallengeState {
     pub async fn verify_and_consume(&self, presented: &str) -> Result<String, ChallengeError> {
         let inner = self.inner.lock().await;
 
-        if !inner.path.exists() {
-            return Err(ChallengeError::Missing);
-        }
+        let file = match std::fs::File::open(&inner.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ChallengeError::Missing);
+            }
+            Err(e) => return Err(ChallengeError::Io(e)),
+        };
 
-        let metadata = std::fs::metadata(&inner.path)?;
+        let metadata = file.metadata()?;
         let modified = metadata.modified()?;
         let elapsed = modified.elapsed().unwrap_or(Duration::from_secs(0));
         if elapsed > CHALLENGE_TTL {
-            let _ = std::fs::remove_file(&inner.path);
+            let path = inner.path.clone();
+            drop(inner);
+            let _ = std::fs::remove_file(&path);
             return Err(ChallengeError::Expired);
         }
 
-        let stored = std::fs::read_to_string(&inner.path)?;
-        let stored = stored.trim();
+        let mut contents = String::new();
+        use std::io::Read;
+        let mut file = file;
+        file.read_to_string(&mut contents)?;
+        let stored = contents.trim();
 
         if !constant_time_eq(stored, presented) {
             return Err(ChallengeError::Mismatch);
@@ -88,11 +97,11 @@ impl ChallengeState {
 
         let token = stored.to_string();
         let server_token_path = inner.path.with_file_name("server_token.txt");
-
+        let challenge_path = inner.path.clone();
         drop(inner);
 
         crate::secrets_fs::atomic_write_secret(&server_token_path, &token)?;
-        let _ = std::fs::remove_file(&self.inner.lock().await.path);
+        let _ = std::fs::remove_file(&challenge_path);
 
         Ok(token)
     }
@@ -115,19 +124,12 @@ pub fn generate_token() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::thread_rng();
-    let raw: String = (0..20)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect();
-    raw.chars()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            if i > 0 && i % 4 == 0 {
-                Some('-')
-            } else {
-                None
-            }
-            .into_iter()
-            .chain(std::iter::once(c))
-        })
-        .collect()
+    let mut token = String::with_capacity(25);
+    for i in 0..20 {
+        if i > 0 && i % 4 == 0 {
+            token.push('-');
+        }
+        token.push(CHARSET[rng.gen_range(0..CHARSET.len())] as char);
+    }
+    token
 }

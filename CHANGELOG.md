@@ -80,6 +80,21 @@ with the new version heading.
   back to the lowest available rendition rather than failing playback.
 
 ### Changed
+- Performance optimizations (OPT-1, OPT-2, OPT-4, OPT-5, OPT-6, OPT-7, OPT-8,
+  OPT-10, OPT-11, OPT-12, OPT-13, OPT-15, OPT-16, OPT-18, OPT-21, OPT-22):
+  shared `reqwest::Client` via `Arc` (fewer TLS handshakes), incremental cache
+  size tracking (O(1) eviction), debounced manifest writes (30s throttle),
+  ALSA `CHUNK_FRAMES` 256→1024 (4-16× fewer writer wakeups), cursor-based
+  `InterleavedResampler` (eliminates O(N²) memmove), reusable 46 KB Opus decode
+  buffer, pre-allocated PCM output in `decode_to_pcm`, deinterleave/interleave
+  thread-local buffer pooling, adaptive recovery poll (5s idle vs 500ms active),
+  default features no longer enable audio backends (opt in via `--features alsa`
+  or `--features backend`), trimmed tokio features from `full` to the used
+  subset. YouTube stream URLs are now resolution-cached (30-min TTL) so replay
+  of the same URL avoids re-running yt-dlp. HTML detection moved into the
+  download stream (first-chunk check) instead of re-reading the whole file
+  post-download.
+
 - The `Build Release Binaries` workflow's manual dispatch now **requires a
   `branch` input**: a dispatch run no longer builds whichever ref the trigger
   names by default (a bare `gh workflow run` falls back to the default branch),

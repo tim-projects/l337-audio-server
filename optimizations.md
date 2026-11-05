@@ -401,24 +401,64 @@ and trim.
 
 | ID | Area | Impact | Effort | Risk |
 |----|------|--------|--------|------|
-| OPT-1 | ALSA volume SIMD | M | Low | Low |
-| OPT-2 | ALSA chunk size | M | Low | Low |
+| OPT-1 | ALSA volume SIMD | M | Low | Low | DONE |
+| OPT-2 | ALSA chunk size | M | Low | Low | DONE |
 | OPT-3 | ALSA idle wake | M | Medium | Medium |
-| OPT-4 | Resampler memmove | H | Medium | Low |
-| OPT-5 | Deinterleave alloc | M | Medium | Low |
-| OPT-6 | Opus buffer alloc | M | Low | Low |
-| OPT-7 | Decode pre-alloc | M | Low | Low |
-| OPT-8 | Reuse reqwest Client | M | Low | Low |
+| OPT-4 | Resampler memmove | H | Medium | Low | DONE |
+| OPT-5 | Deinterleave alloc | M | Medium | Low | DONE |
+| OPT-6 | Opus buffer alloc | M | Low | Low | DONE |
+| OPT-7 | Decode pre-alloc | M | Low | Low | DONE |
+| OPT-8 | Reuse reqwest Client | M | Low | Low | DONE |
 | OPT-9 | Seek without full decode | H | High | Medium |
-| OPT-10 | Rate limiter prune | L | Low | Low |
-| OPT-13 | Incremental decode | H | High | Medium |
+| OPT-10 | Rate limiter prune | L | Low | Low | DONE |
+| OPT-11 | Token generation | L | Low | Low | DONE |
+| OPT-12 | verify_and_consume | L | Low | Low | DONE |
+| OPT-13 | Incremental decode | H | High | Medium | DONE |
 | OPT-14 | Ring buffer | M | Medium | Low |
-| OPT-15 | Track cache size | M | Low | Low |
-| OPT-16 | Debounce manifest | M | Low | Low |
-| OPT-18 | Recovery poll interval | L | Low | Low |
+| OPT-15 | Track cache size | M | Low | Low | DONE |
+| OPT-16 | Debounce manifest | M | Low | Low | DONE |
+| OPT-17 | Eviction sorting | L | Low | Low |
+| OPT-18 | Recovery poll interval | L | Low | Low | DONE |
 | OPT-19 | Producer notify | M | Medium | Low |
-| OPT-21 | Default features | M | Low | Low |
-| OPT-22 | Tokio features | M | Low | Low |
+| OPT-20 | Streaming file poll | L | Low | Low |
+| OPT-21 | Default features | M | Low | Low | DONE |
+| OPT-22 | Tokio features | M | Low | Low | DONE |
+---
+
+## New optimizations discovered beyond the original 22
+
+### NEW-1 — YouTube stream URL resolution cache (CPU, network)
+
+**File:** `src/player/engine.rs`
+
+**Current:** Every `POST /player/play` for a YouTube URL re-runs yt-dlp to resolve
+the direct stream URL, even when the same URL was played recently. Each
+resolution spawns a yt-dlp process, runs `--dump-single-json`, parses JSON, and
+selects a rendition — roughly 1-3 seconds of CPU and wall time per play.
+
+**Optimization:** Cache resolved stream URLs keyed by `(url, ceiling)` with a
+30-minute TTL (googlevideo.com signatures expire within hours). On a cache hit,
+skip yt-dlp entirely and use the cached `(url, abr, codec, ext, duration)`.
+On a miss, run yt-dlp and store the result.
+
+**Impact:** H — avoids re-running yt-dlp on replay of the same URL.
+
+---
+
+### NEW-2 — HTML detection during download stream (I/O, CPU)
+
+**File:** `src/player/engine.rs:download_stream`
+
+**Current:** After downloading a file, `download_stream` re-reads the entire
+file from disk (`tokio::fs::read(dest)`) just to check if the first 5 bytes are
+HTML markup (`<!doc`, `<html`, `<?xml`). For a multi-megabyte download this is a
+full second read + syscall.
+
+**Optimization:** Check the first chunk (>= 5 bytes) as it arrives from the
+network stream. If it starts with HTML markup, remove the partial file and fail
+immediately — no second disk read.
+
+**Impact:** M — saves one full file re-read + stat per download.
 
 ---
 

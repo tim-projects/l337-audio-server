@@ -95,7 +95,13 @@ pub struct OpusTrackDecoder {
     dec: *mut OpusDecoder,
     channels: u16,
     pre_skip_remaining: u32,
+    /// Reusable decode buffer sized to the largest Opus frame (120 ms @ 48 kHz
+    /// = 5760 samples/channel). Persists across calls to avoid a fresh 46 KB
+    /// allocation on every packet (OPT-6).
+    out: Vec<f32>,
 }
+
+const OPUS_MAX_FRAME: usize = 5760;
 
 // The raw pointer is only used from the single decode thread; no interior state
 // is shared, so Send is sound.
@@ -120,6 +126,7 @@ impl OpusTrackDecoder {
             dec,
             channels: head.channels,
             pre_skip_remaining: head.pre_skip,
+            out: Vec::with_capacity(OPUS_MAX_FRAME * head.channels as usize),
         })
     }
 
@@ -132,8 +139,10 @@ impl OpusTrackDecoder {
     /// (skipped) so a bad packet never aborts playback.
     pub fn push(&mut self, packet: &[u8]) -> Vec<f32> {
         // Largest Opus frame is 120 ms @ 48 kHz = 5760 samples/channel.
-        const FRAME: usize = 5760;
-        let mut out = vec![0f32; FRAME * self.channels as usize];
+        const FRAME: usize = OPUS_MAX_FRAME;
+        let out = &mut self.out;
+        out.clear();
+        out.extend(std::iter::repeat(0f32).take(FRAME * self.channels as usize));
         let n = unsafe {
             opus_decode_float(
                 self.dec,
@@ -148,7 +157,7 @@ impl OpusTrackDecoder {
             tracing::warn!("Opus decode of {} byte packet failed: {}", packet.len(), opus_error_message(n));
             return Vec::new();
         }
-        let mut pcm = out;
+        let mut pcm = std::mem::take(out);
         pcm.truncate(n as usize * self.channels as usize);
 
         if self.pre_skip_remaining > 0 {

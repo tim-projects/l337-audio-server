@@ -6,6 +6,7 @@ use rubato::SincFixedIn;
 use rubato::SincInterpolationParameters;
 use rubato::SincInterpolationType;
 use rubato::WindowFunction;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +58,23 @@ impl std::fmt::Display for YouTubeError {
 
 impl std::error::Error for YouTubeError {}
 
+/// Cached resolution of a YouTube URL to a direct stream URL. YouTube stream
+/// URLs (googlevideo.com) expire within hours, so entries are TTL-bounded.
+/// Avoids re-running yt-dlp on every play of the same URL.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedStream {
+    pub(crate) url: String,
+    pub(crate) abr: Option<u32>,
+    pub(crate) codec: Option<String>,
+    pub(crate) ext: Option<String>,
+    pub(crate) duration: Option<u64>,
+}
+
+/// TTL for cached YouTube stream URLs. googlevideo.com signatures expire
+/// within hours; a short TTL forces re-resolution before the URL goes stale.
+const YT_DLP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
 /// Why a streaming start failed. `Resolve` means the URL never became a
-/// playable stream (yt-dlp could not select a format); `Playback` means it did
 /// and the fetch/decode broke afterwards. The caller only retries on `Playback`.
 #[derive(Debug)]
 pub enum StreamStartError {
@@ -121,6 +137,13 @@ pub struct PlayerEngine {
     actual_kbps: Option<u32>,
     /// Short codec label of the current/last track when known (for PlayerStatus).
     codec_label: Option<String>,
+    /// Shared HTTP client reused across all downloads (OPT-8): avoids rebuilding
+    /// a reqwest::Client (TLS session cache, connection pool, DNS cache) on every
+    /// download_stream / stream_http_to_file call.
+    pub http_client: Arc<reqwest::Client>,
+    /// Cached YouTube stream URL resolutions (key: `url|ceiling`). Avoids
+    /// re-running yt-dlp on every play of the same URL.
+    pub yt_dlp_cache: Arc<Mutex<HashMap<String, (ResolvedStream, std::time::Instant)>>>,
 }
 
 impl PlayerEngine {
@@ -206,6 +229,13 @@ impl PlayerEngine {
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
             codec_label: None,
+            http_client: Arc::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
+                    .build()
+                    .expect("failed to build reqwest client"),
+            ),
+            yt_dlp_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -238,6 +268,13 @@ impl PlayerEngine {
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
             codec_label: None,
+            http_client: Arc::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
+                    .build()
+                    .expect("failed to build reqwest client"),
+            ),
+            yt_dlp_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -434,7 +471,7 @@ impl PlayerEngine {
                     }
                     error!("YouTube streaming failed, falling back to download: {}", e);
                     let path = self.storage.get_active_slot_path("current");
-                    if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
+                    if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await {
                         if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
                             return Err(EngineError::YouTube(yt_err.clone()));
                         }
@@ -454,7 +491,7 @@ impl PlayerEngine {
             path.display()
         );
 
-        if let Err(e) = download_stream(&track.stream_url, &path, ceiling).await {
+        if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await {
             let err_box = e;
             if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
                 return Err(EngineError::YouTube(yt_err.clone()));
@@ -507,7 +544,7 @@ impl PlayerEngine {
         Ok(())
     }
 
-    async fn persist_slot(&self, track_id: &str, slot_path: &PathBuf) {
+    async fn persist_slot(&mut self, track_id: &str, slot_path: &PathBuf) {
         let Some(dest_path) = self.storage.get_path_for_track(track_id) else {
             error!("persist_slot: refusing unsafe track_id {:?}", track_id);
             return;
@@ -518,6 +555,32 @@ impl PlayerEngine {
         }
     }
 
+    /// OPT-13: Decode a complete file incrementally into the audio buffer
+    /// instead of allocating the whole decoded PCM at once. Decodes
+    /// packet-by-packet, applying stretch/pitch/resample per packet, keeping
+    /// memory bounded by the rebuffer window rather than the track length.
+    ///
+    /// Returns `(file_sample_rate, channels, codec_label, total_frames)`.
+    async fn decode_file_incremental(
+        &mut self,
+        path: &PathBuf,
+    ) -> Result<(u32, u16, Option<String>, u64), String> {
+        let audio_buffer = self.audio_buffer.clone();
+        let path = path.clone();
+        let speed = self.speed;
+        let pitch = self.pitch;
+        let device_rate = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.sample_rate
+        };
+
+        tokio::task::spawn_blocking(move || {
+            decode_file_incremental_blocking(&path, audio_buffer, speed, pitch, device_rate)
+        })
+        .await
+        .map_err(|e| format!("decode task join error: {e}"))?
+    }
+
     pub async fn load_and_play(&mut self, slot: &str) {
         self.ensure_stream();
         if self.has_backend_error() {
@@ -526,11 +589,13 @@ impl PlayerEngine {
 
         let path = self.storage.get_active_slot_path(slot);
 
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
+        // Compressed file size, captured before decode — the delivered source
+        // bitrate estimate (G2 actual_kbps).
+        let bytes_len = match fs::metadata(&path).await {
+            Ok(meta) => meta.len(),
             Err(e) => {
                 error!(
-                    "load_and_play({}): cannot read {}: {}",
+                    "load_and_play({}): cannot stat {}: {}",
                     slot,
                     path.display(),
                     e
@@ -538,48 +603,27 @@ impl PlayerEngine {
                 return;
             }
         };
-        // Compressed file size, captured before `bytes` is moved into the decode
-        // task — the delivered source bitrate estimate (G2 actual_kbps).
-        let bytes_len = bytes.len();
 
-        let decode = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)))
-        })
-        .await;
-
-        let (pcm, file_sample_rate, channels, codec) = match decode {
-            Ok(Ok(Ok(result))) => result,
-            Ok(Ok(Err(e))) => {
-                error!(
-                    "load_and_play({}): decode failed on {}: {:?}",
-                    slot,
-                    path.display(),
-                    e
-                );
-                return;
-            }
-            Ok(Err(_)) => {
-                error!(
-                    "load_and_play({}): decoder panicked on {} (unsupported/corrupt container)",
-                    slot,
-                    path.display()
-                );
-                return;
-            }
-            Err(e) => {
-                error!("load_and_play({}): decode task join error: {}", slot, e);
-                return;
-            }
-        };
+        // OPT-13: decode incrementally into the audio buffer instead of
+        // allocating the whole decoded PCM at once (peak RSS ~ compressed
+        // size x 2-2.5 for hour-long tracks).
+        let (file_sample_rate, channels, codec, total_frames) =
+            match self.decode_file_incremental(&path).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(
+                        "load_and_play({}): incremental decode failed on {}: {}",
+                        slot,
+                        path.display(),
+                        e
+                    );
+                    return;
+                }
+            };
 
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
-        // shortcut: the file path still decodes the whole track into `pcm` in one
-        // shot (peak RSS ~ compressed size×2-2.5 for hour-long tracks); the
-        // device writer reclaims it as playback advances (G4). Upgrade path:
-        // decode local files incrementally into the same throttled producer that
-        // streaming_decode_sync uses, removing the whole-track peak entirely.
-        let duration_sec = ((pcm.len() / channels as usize) as f64 / file_sample_rate as f64).round() as u64;
+        let duration_sec = (total_frames as f64 / file_sample_rate as f64).round() as u64;
         self.duration_sec = Some(duration_sec);
         // G2 observability: codec + delivered bitrate of this (file/download)
         // source — compressed file bytes over duration is the true source bitrate.
@@ -590,18 +634,7 @@ impl PlayerEngine {
             None
         };
 
-        let device_rate = {
-            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buf.sample_rate
-        };
-
-        let playback_pcm =
-            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
-
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        buf.pcm = playback_pcm;
-        buf.read_pos = 0;
-        buf.consumed_total = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
@@ -706,11 +739,24 @@ impl PlayerEngine {
             let ext = guess_ext_from_url(url);
             (url.to_string(), None, None, ext, None)
         } else {
-            match resolve_youtube_stream_url(url, ceiling).await {
-                Ok(v) => v,
-                // Resolution failed: the URL never became a playable stream, so
-                // a caller must NOT retry it through another yt-dlp download.
-                Err(e) => return Err(StreamStartError::Resolve(e)),
+            let cache_key = format!("{url}|{ceiling}");
+            let now = std::time::Instant::now();
+            let cached = {
+                let cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.get(&cache_key).filter(|(_, ts)| now.duration_since(*ts) < YT_DLP_CACHE_TTL).cloned()
+            };
+            match cached {
+                Some((rs, _)) => (rs.url, rs.abr, rs.codec, rs.ext, rs.duration),
+                None => match resolve_youtube_stream_url(url, ceiling).await {
+                    Ok(v) => {
+                        let (stream_url, abr, codec, ext, duration) = &v;
+                        let mut cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.insert(cache_key, (ResolvedStream { url: stream_url.clone(), abr: *abr, codec: codec.clone(), ext: ext.clone(), duration: *duration }, now));
+                        drop(cache);
+                        v
+                    }
+                    Err(e) => return Err(StreamStartError::Resolve(e)),
+                },
             }
         };
         // Record the delivered bitrate / codec / duration of the chosen stream.
@@ -742,9 +788,10 @@ impl PlayerEngine {
         let fallback_url = direct_url.clone();
 
         let download_cancel = cancel.clone();
+        let http_client = self.http_client.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let download_handle = tokio::spawn(async move {
-            let result = stream_http_to_file(&direct_url, &dl_path, download_cancel).await;
+            let result = stream_http_to_file(&http_client, &direct_url, &dl_path, download_cancel).await;
             let _ = tx.send(result);
         });
 
@@ -809,7 +856,7 @@ impl PlayerEngine {
                     "stream container could not be probed from a partial file; falling back to a whole-file download"
                 );
                 self.stop();
-                stream_http_to_file(&fallback_url, &path, Arc::new(AtomicBool::new(false)))
+                stream_http_to_file(&self.http_client, &fallback_url, &path, Arc::new(AtomicBool::new(false)))
                     .await
                     .map_err(StreamStartError::Playback)?;
                 {
@@ -1051,7 +1098,7 @@ impl PlayerEngine {
         // `audio_available` reports whether a writer thread still exists.
         let next_cached = self.storage.get_active_slot_path("next").exists();
         let prev_cached = self.storage.get_active_slot_path("prev").exists();
-        let utilization = self.storage.get_total_size().await;
+        let utilization = self.storage.total_size;
 
         let position_sec = position_sec.or(Some(self.position_sec));
 
@@ -1125,8 +1172,11 @@ pub(crate) fn decode_to_pcm(
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::io::MediaSourceStream;
 
+    let pcm_hint = bytes.len().saturating_div(4);
     let source = std::io::Cursor::new(bytes);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    // `pcm_hint` (captured above before `bytes` was moved) is used to
+    // pre-allocate the PCM output buffer (OPT-7).
 
     let hint = symphonia::core::probe::Hint::new();
     let format_opts = Default::default();
@@ -1149,7 +1199,11 @@ pub(crate) fn decode_to_pcm(
         let head = crate::player::opus::parse_opus_head(extra)
             .ok_or("Opus track missing OpusHead sideband")?;
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
-        let mut pcm: Vec<f32> = Vec::new();
+        // Pre-allocate based on compressed size: raw PCM f32 is typically
+        // several times larger than the compressed bytes, so bytes.len()/4 is
+        // a conservative initial capacity that avoids most small reallocations
+        // without over-allocating (OPT-7).
+        let mut pcm: Vec<f32> = Vec::with_capacity(pcm_hint);
         loop {
             let packet = match format.next_packet() {
                 Ok(p) => p,
@@ -1173,7 +1227,7 @@ pub(crate) fn decode_to_pcm(
     };
 
     let mut sample_buf = None;
-    let mut pcm = Vec::new();
+    let mut pcm = Vec::with_capacity(pcm_hint);
 
     loop {
         let packet = match format.next_packet() {
@@ -1216,6 +1270,242 @@ pub(crate) fn decode_to_pcm(
     Ok((pcm, sample_rate, channels.max(1), codec))
 }
 
+/// OPT-13: Blocking incremental decode of a complete file into the audio
+/// buffer. Decodes packet-by-packet, applying stretch/pitch/resample per
+/// packet, keeping memory bounded by the rebuffer window rather than the
+/// track length. Runs on a blocking thread (called via spawn_blocking from
+/// `decode_file_incremental`).
+fn decode_file_incremental_blocking(
+    path: &PathBuf,
+    audio_buffer: Arc<Mutex<AudioBuffer>>,
+    speed: f32,
+    pitch: f32,
+    device_rate: u32,
+) -> Result<(u32, u16, Option<String>, u64), String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let source = FileSource { file };
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    let hint = Hint::new();
+    let probed =
+        symphonia::default::get_probe().format(&hint, mss, &Default::default(), &Default::default())
+            .map_err(|e| format!("format probe failed: {e}"))?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| {
+            let ct = t.codec_params.codec;
+            ct == symphonia::core::codecs::CODEC_TYPE_AAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_MP3
+                || ct == symphonia::core::codecs::CODEC_TYPE_OPUS
+                || ct == symphonia::core::codecs::CODEC_TYPE_VORBIS
+                || ct == symphonia::core::codecs::CODEC_TYPE_FLAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_ALAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
+        })
+        .cloned()
+        .or_else(|| format.default_track().cloned())
+        .ok_or("no default track in file")?;
+
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let codec = codec_label(codec_params.codec);
+
+    let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
+    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+
+    {
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        ab.channels = channels;
+        ab.file_sample_rate = file_sample_rate;
+    }
+
+    let mut total_frames: u64 = 0;
+
+    // Opus: decode via libopus at 48 kHz, no resample needed.
+    #[cfg(feature = "opus")]
+    if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        let extra: &[u8] = codec_params.extra_data.as_deref().unwrap_or(&[]);
+        let head = crate::player::opus::parse_opus_head(extra)
+            .ok_or("Opus track missing OpusHead sideband")?;
+        {
+            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            ab.channels = head.channels;
+            ab.file_sample_rate = 48000;
+        }
+        let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
+        loop {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let out = opus_dec.push(packet.buf());
+            if !out.is_empty() {
+                let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                ab.pcm.extend_from_slice(&out);
+                total_frames += (out.len() / head.channels as usize) as u64;
+            }
+        }
+        return Ok((48000, head.channels, codec, total_frames));
+    }
+
+    // Non-Opus: decode via Symphonia.
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &Default::default())
+        .map_err(|e| format!("decoder init: {e}"))?;
+
+    let mut sample_buf = None;
+    let tempo = speed;
+    let mut stretcher = if tempo != 1.0 {
+        wsola::TimeStretch::new(file_sample_rate, channels)
+            .ok()
+            .map(|mut ts| { ts.set_tempo(tempo); ts })
+    } else {
+        None
+    };
+
+    let mut shifter = if pitch != 1.0 {
+        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+    } else {
+        None
+    };
+    let shift_semitones = if pitch != 1.0 {
+        Some(12.0 * (pitch as f64).log2() as f32)
+    } else {
+        None
+    };
+
+    let mut resampler = InterleavedResampler::new(channels, file_sample_rate, device_rate);
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                let spec = *audio_buf.spec();
+                if sample_buf.is_none() {
+                    sample_buf = Some(SampleBuffer::<f32>::new(
+                        audio_buf.capacity() as u64,
+                        spec,
+                    ));
+                }
+
+                if let Some(buf) = &mut sample_buf {
+                    buf.copy_interleaved_ref(audio_buf);
+                    let samples = buf.samples();
+
+                    let mut output = samples.to_vec();
+
+                    // Time-stretch (wsola): push samples, pull available output.
+                    if let Some(ref mut stretcher) = stretcher {
+                        stretcher.push(samples);
+                        let mut pulled = Vec::new();
+                        loop {
+                            let batch = stretcher.pull(4096);
+                            if batch.is_empty() {
+                                break;
+                            }
+                            pulled.extend_from_slice(&batch);
+                        }
+                        output = pulled;
+                    }
+
+                    // Pitch shift.
+                    if let (Some(ref mut shifter), Some(semitones)) =
+                        (shifter.as_mut(), shift_semitones)
+                    {
+                        let ch = channels as usize;
+                        let mut input_planar = vec![Vec::new(); ch];
+                        for frame in output.chunks(ch) {
+                            for (c, &sample) in frame.iter().enumerate() {
+                                input_planar[c].push(sample);
+                            }
+                        }
+                        let mut pitched_planar: Vec<Vec<f32>> = vec![Vec::new(); ch];
+                        for c in 0..ch {
+                            for chunk in input_planar[c].chunks(128) {
+                                let mut buf = [0.0f32; 128];
+                                for (i, &s) in chunk.iter().enumerate() {
+                                    buf[i] = s;
+                                }
+                                let result =
+                                    shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                                pitched_planar[c].extend_from_slice(result);
+                            }
+                        }
+                        let out_frames = pitched_planar[0].len();
+                        output = Vec::with_capacity(out_frames * ch);
+                        for f in 0..out_frames {
+                            for c in 0..ch {
+                                output.push(pitched_planar[c][f]);
+                            }
+                        }
+                    }
+
+                    // Resample and append to buffer.
+                    let resampled = resampler.process(&output);
+                    if !resampled.is_empty() {
+                        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        ab.pcm.extend_from_slice(&resampled);
+                        total_frames += (resampled.len() / channels as usize) as u64;
+                    }
+
+                    // Throttle if buffer exceeds rebuffer window.
+                    {
+                        let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        if ab.exceeds_window() {
+                            drop(ab);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Drain any remaining wsola output.
+    if let Some(ref mut stretcher) = stretcher {
+        loop {
+            let pulled = stretcher.pull(4096);
+            if pulled.is_empty() {
+                break;
+            }
+            let resampled = resampler.process(&pulled);
+            if !resampled.is_empty() {
+                let mut ab =
+                    audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                ab.pcm.extend_from_slice(&resampled);
+                total_frames += (resampled.len() / channels as usize) as u64;
+            }
+        }
+    }
+
+    // Flush resampler tail.
+    let tail = resampler.finish();
+    if !tail.is_empty() {
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        ab.pcm.extend_from_slice(&tail);
+        total_frames += (tail.len() / channels as usize) as u64;
+    }
+
+    Ok((file_sample_rate, channels, codec, total_frames))
+}
+
 /// Input chunk size (frames per channel) that rubato's `SincFixedIn` demands
 /// per call. `chunk_size` counts *input* frames, so handing it any other length
 /// fails with `InsufficientInputBufferSize`.
@@ -1241,6 +1531,10 @@ pub(crate) struct InterleavedResampler {
     inner: Option<SincFixedIn<f32>>,
     channels: usize,
     pending: Vec<f32>,
+    /// Offset into `pending` of the first unconsumed sample. Avoids memmove on
+    /// every `process()` call; data is compacted to the front only when the
+    /// offset grows large (OPT-4).
+    pending_offset: usize,
 }
 
 impl InterleavedResampler {
@@ -1273,6 +1567,7 @@ impl InterleavedResampler {
             inner,
             channels,
             pending: Vec::new(),
+            pending_offset: 0,
         }
     }
 
@@ -1285,21 +1580,27 @@ impl InterleavedResampler {
         self.pending.extend_from_slice(input);
         let chunk_samples = RESAMPLE_CHUNK_FRAMES * self.channels;
         let mut output = Vec::new();
-        // Consume by cursor and compact once: draining a prefix per chunk
-        // memmoves the rest of the buffer every iteration, which is quadratic in
-        // track length on the whole-file path (a 4-minute track = ~110 GB of
-        // memmove). The streaming path appends a packet at a time, so the
-        // compaction below stays small there.
+        // Cursor-based consumption: read from pending_offset + consumed, no
+        // memmove per chunk. Compact to front only when offset grows large.
         let mut consumed = 0;
-        while self.pending.len() - consumed >= chunk_samples {
+        let base = self.pending_offset;
+        while self.pending.len() - base - consumed >= chunk_samples {
             let wave_in =
-                deinterleave(&self.pending[consumed..consumed + chunk_samples], self.channels);
+                deinterleave(&self.pending[base + consumed..base + consumed + chunk_samples], self.channels);
             if let Ok(planar) = resampler.process(&wave_in, None) {
-                output.extend_from_slice(&interleave(&planar));
+                output.extend_from_slice(&interleave(planar));
             }
+            return_planar_to_pool(wave_in);
             consumed += chunk_samples;
         }
-        self.pending.drain(..consumed);
+        self.pending_offset = base + consumed;
+        // Compact when offset is large enough to justify a memmove.
+        if self.pending_offset > RESAMPLE_CHUNK_FRAMES * self.channels {
+            let remaining_len = self.pending.len() - self.pending_offset;
+            self.pending.copy_within(self.pending_offset.., 0);
+            self.pending.truncate(remaining_len);
+            self.pending_offset = 0;
+        }
         output
     }
 
@@ -1307,24 +1608,46 @@ impl InterleavedResampler {
     /// A no-op (empty output) when no rate change is in effect.
     pub(crate) fn finish(&mut self) -> Vec<f32> {
         let Some(resampler) = self.inner.as_mut() else {
-            return std::mem::take(&mut self.pending);
+            let remaining = std::mem::take(&mut self.pending);
+            self.pending_offset = 0;
+            return remaining;
         };
-        if self.pending.is_empty() {
+        if self.pending.len() <= self.pending_offset {
             return Vec::new();
         }
-        let wave_in = deinterleave(&self.pending, self.channels);
+        let wave_in = deinterleave(&self.pending[self.pending_offset..], self.channels);
+        self.pending_offset = 0;
         self.pending.clear();
-        resampler
+        let result = resampler
             .process_partial(Some(&wave_in), None)
-            .map(|planar| interleave(&planar))
-            .unwrap_or_default()
+            .map(|planar| interleave(planar))
+            .unwrap_or_default();
+        return_planar_to_pool(wave_in);
+        result
     }
 }
 
 /// Split interleaved samples into per-channel vectors (whole frames only).
+///
+/// Uses a thread-local pool of reusable per-channel buffers to avoid fresh
+/// allocations per call (OPT-5). The returned buffers are owned by the caller
+/// and must be passed to [`interleave`] (which returns them to the pool) or
+/// [`return_planar_to_pool`] when done.
 fn deinterleave(input: &[f32], channels: usize) -> Vec<Vec<f32>> {
+    thread_local! {
+        static POOL: std::cell::RefCell<Vec<Vec<Vec<f32>>>> = std::cell::RefCell::new(Vec::new());
+    }
     let frames = input.len() / channels;
-    let mut planar = vec![Vec::with_capacity(frames); channels];
+    let mut planar = POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        pool.pop().unwrap_or_else(|| Vec::with_capacity(channels))
+    });
+    planar.clear();
+    planar.resize_with(channels, || Vec::with_capacity(frames));
+    for p in planar.iter_mut() {
+        p.clear();
+        p.reserve(frames);
+    }
     for frame in input[..frames * channels].chunks(channels) {
         for (ch, &sample) in frame.iter().enumerate() {
             planar[ch].push(sample);
@@ -1333,8 +1656,23 @@ fn deinterleave(input: &[f32], channels: usize) -> Vec<Vec<f32>> {
     planar
 }
 
-/// Join per-channel vectors back into the interleaved layout the stream wants.
-fn interleave(planar: &[Vec<f32>]) -> Vec<f32> {
+/// Return a pooled `Vec<Vec<f32>>`'s inner buffers to the thread-local pool
+/// for reuse (OPT-5). Caller must not use `planar` after this.
+fn return_planar_to_pool(planar: Vec<Vec<f32>>) {
+    thread_local! {
+        static POOL: std::cell::RefCell<Vec<Vec<Vec<f32>>>> = std::cell::RefCell::new(Vec::new());
+    }
+    POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < 16 {
+            pool.push(planar);
+        }
+    });
+}
+fn interleave(planar: Vec<Vec<f32>>) -> Vec<f32> {
+    thread_local! {
+        static POOL: std::cell::RefCell<Vec<Vec<Vec<f32>>>> = std::cell::RefCell::new(Vec::new());
+    }
     let channels = planar.len();
     if channels == 0 {
         return Vec::new();
@@ -1346,6 +1684,12 @@ fn interleave(planar: &[Vec<f32>]) -> Vec<f32> {
             output.push(planar[ch][frame]);
         }
     }
+    POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < 16 {
+            pool.push(planar);
+        }
+    });
     output
 }
 
@@ -1451,6 +1795,7 @@ pub(crate) static DOWNLOAD_STREAM_INVOKED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub async fn download_stream(
+    http_client: &Arc<reqwest::Client>,
     url: &str,
     dest: &PathBuf,
     ceiling: u32,
@@ -1480,10 +1825,7 @@ pub async fn download_stream(
             .map_err(|e| format!("yt-dlp download failed for {url}: {e}").into());
     }
 
-    let response = reqwest::Client::builder()
-        .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
-        .build()
-        .map_err(|e| format!("reqwest client build failed: {e}"))?
+    let response = http_client
         .get(url)
         .header("Accept", "*/*")
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -1511,22 +1853,22 @@ pub async fn download_stream(
         .await?;
 
     let mut stream = response.bytes_stream();
+    let mut first_chunk_checked = false;
     while let Some(item) = stream.next().await {
         let chunk = item?;
+        if !first_chunk_checked && chunk.len() >= 5 {
+            let start = &chunk[0..5];
+            if start == b"<!doc" || start == b"<html" || start == b"<?xml" {
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(
+                    format!("downloaded content for {url} appears to be markup, not audio").into(),
+                );
+            }
+            first_chunk_checked = true;
+        }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-
-    if let Ok(bytes) = tokio::fs::read(dest).await {
-        if bytes.len() >= 5
-            && (&bytes[0..5] == b"<!doc" || &bytes[0..5] == b"<html" || &bytes[0..5] == b"<?xml")
-        {
-            let _ = tokio::fs::remove_file(dest).await;
-            return Err(
-                format!("downloaded content for {url} appears to be markup, not audio").into(),
-            );
-        }
-    }
     Ok(())
 }
 
@@ -1887,16 +2229,14 @@ async fn resolve_youtube_stream_url(
 }
 
 async fn stream_http_to_file(
+    http_client: &Arc<reqwest::Client>,
     url: &str,
     dest: &PathBuf,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
 
-    let response = reqwest::Client::builder()
-        .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
-        .build()
-        .map_err(|e| format!("reqwest client build failed: {e}"))?
+    let response = http_client
         .get(url)
         .header("Accept", "*/*")
         .header("Accept-Language", "en-US,en;q=0.9")

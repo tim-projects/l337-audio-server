@@ -162,7 +162,7 @@ pub struct AlsaAudioOutputStream {
 
 impl AlsaAudioOutputStream {
     fn writer_loop(state: Arc<AlsaState>, funcs: AlsaFuncs) {
-        const CHUNK_FRAMES: usize = 256;
+        const CHUNK_FRAMES: usize = 1024;
         let silence_buf = vec![0u8; CHUNK_FRAMES * 4];
 
         loop {
@@ -201,10 +201,7 @@ impl AlsaAudioOutputStream {
                 let src = &buf.pcm[buf.read_pos..buf.read_pos + to_copy];
                 let volume = *state.volume.lock().unwrap_or_else(|e| e.into_inner());
 
-                let mut samples = vec![0.0f32; to_copy];
-                for (dst, src) in samples.iter_mut().zip(src.iter()) {
-                    *dst = src * volume;
-                }
+                let samples: Vec<f32> = src.iter().map(|s| s * volume).collect();
 
                 let bytes = unsafe { samples.align_to::<u8>().1 };
                 buf.read_pos += to_copy;
