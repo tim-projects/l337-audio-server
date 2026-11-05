@@ -459,6 +459,23 @@ async fn main() {
                 .join("l337-audio-server")
         });
     let challenge_state = Arc::new(ChallengeState::new(challenge_dir));
+#[cfg(feature = "qr")]
+    if std::env::args().any(|a| a == "--qr" || a == "--print-pairing-qr") {
+        if let Err(e) = challenge_state.issue().await {
+            eprintln!("failed to issue challenge: {e}");
+            std::process::exit(1);
+        }
+        if let Some(token) = challenge_state.current_token().await {
+            let code = qrcode::QrCode::new(token.as_bytes()).unwrap();
+            let s = code
+                .render::<char>()
+                .quiet_zone(true)
+                .module_dimensions(2, 1)
+                .build();
+            println!("{s}");
+        }
+        return;
+    }
     let socket_mode = use_socket;
     let rate_limiter = Arc::new(RateLimiter::new());
 
@@ -489,8 +506,10 @@ async fn main() {
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
         .route("/auth/challenge", post(handlers::auth_challenge))
-        .route("/auth/redeem", post(handlers::auth_redeem))
-        .with_state(shared_state)
+        .route("/auth/redeem", post(handlers::auth_redeem));
+#[cfg(feature = "qr")]
+    let app = app.route("/auth/challenge/qr", get(handlers::auth_challenge_qr));
+    let mut app = app.with_state(shared_state)
         .layer(Extension(challenge_state.clone()))
         .layer(Extension(auth_layer.clone()))
         .layer(Extension(socket_mode))

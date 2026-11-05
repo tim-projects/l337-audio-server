@@ -16,6 +16,8 @@ pulseaudio = ["backend"]
 # Termux it comes from `pkg install libopus`, surfaced via LD_LIBRARY_PATH=$PREFIX/lib).
 # Not enabled by default so cross targets that lack libopus are not forced to link it.
 opus = []
+# Optional QR rendering for pairing (text/Unicode output only; no image encoding).
+qr = ["dep:qrcode"]
 
 [dependencies]
 axum = "0.7.9"
@@ -42,6 +44,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.13"
 rand = "0.8"
+qrcode = { version = "0.14", optional = true, default-features = false }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
