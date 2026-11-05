@@ -1,8 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use crate::player::engine::{InterleavedResampler, PlayerEngine, decode_to_pcm, stretch_and_resample};
-    use crate::player::storage::StorageManager;
-    use std::path::PathBuf;
+use crate::player::engine::{InterleavedResampler, PlayerEngine, decode_to_pcm, stretch_and_resample};
+use crate::player::storage::StorageManager;
+use crate::platform::common::AudioBuffer;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
@@ -309,6 +312,95 @@ mod tests {
             "pitch-only stretch length {} != input {}",
             output.len(),
             input.len()
+        );
+    }
+
+    // OPT-3: AudioBuffer::wait_for_signal must return after the timeout even when
+    // no data arrives, so an ALSA/PipeWire writer never blocks forever on an
+    // empty rebuffer window.
+    #[tokio::test]
+    async fn test_wait_for_signal_returns_after_timeout() {
+        let ab = AudioBuffer::new(48000, 48000);
+        let start = std::time::Instant::now();
+        ab.wait_for_signal(Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(40) && elapsed < Duration::from_millis(200),
+            "wait_for_signal should return after ~50ms, took {elapsed:?}"
+        );
+    }
+
+    // OPT-19: wait_for_space blocks until notify_space is called, then returns.
+    // A producer throttled by exceeds_window() must not spin; it waits on the
+    // condvar and is woken when the consumer frees buffer space.
+    #[tokio::test]
+    async fn test_wait_for_space_wakes_on_notify() {
+        let ab = Arc::new(AudioBuffer::new(48000, 48000));
+        let ab2 = Arc::clone(&ab);
+
+        let waiter = std::thread::spawn(move || {
+            ab2.wait_for_space(Duration::from_secs(5));
+        });
+
+        // Give the waiter a moment to block on the condvar.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Notify space — the waiter should return promptly.
+        ab.notify_space();
+        waiter.join().unwrap();
+    }
+
+    // OPT-9: seek() at a non-zero position must decode only from that point
+    // forward (symphonia container seek), not decode the whole track into PCM
+    // then split off. A 5-second WAV with seek at 2s yields ~3s of audio.
+    #[tokio::test]
+    async fn test_seek_from_nonzero_position() {
+        let dir = std::env::temp_dir().join("l337-seek-nonzero-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
+        let mut engine = PlayerEngine::new_dummy(storage, 24 * 1024 * 1024, 0);
+
+        let sample_rate = 48000u32;
+        let channels = 2u16;
+        let duration_secs = 5u32;
+        let num_samples = (sample_rate * duration_secs) as usize;
+        let data_bytes = (num_samples * channels as usize) as u32 * 2;
+        let chunk_size = 36 + data_bytes;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&chunk_size.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for _ in 0..num_samples * channels as usize {
+            bytes.extend_from_slice(&[0u8; 2]);
+        }
+        let wav_path = dir.join("seek-nonzero-test.wav");
+        std::fs::write(&wav_path, &bytes).unwrap();
+
+        let slot_path = engine.storage.get_active_slot_path("current");
+        let _ = std::fs::copy(&wav_path, &slot_path);
+
+        engine.seek(2);
+        let status = engine.get_status().await;
+        assert_eq!(
+            status.state,
+            crate::api::models::PlayerStateLabel::Playing
+        );
+        assert_eq!(status.position_sec.unwrap(), 2, "seek position should be 2s");
+        assert_eq!(
+            status.duration_sec.unwrap(),
+            3,
+            "remaining duration after seek should be 3s"
         );
     }
 }

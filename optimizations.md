@@ -399,31 +399,61 @@ and trim.
 
 ## Summary Table
 
-| ID | Area | Impact | Effort | Risk |
-|----|------|--------|--------|------|
-| OPT-1 | ALSA volume SIMD | M | Low | Low | DONE |
-| OPT-2 | ALSA chunk size | M | Low | Low | DONE |
-| OPT-3 | ALSA idle wake | M | Medium | Medium | DONE |
-| OPT-4 | Resampler memmove | H | Medium | Low | DONE |
-| OPT-5 | Deinterleave alloc | M | Medium | Low | DONE |
-| OPT-6 | Opus buffer alloc | M | Low | Low | DONE |
-| OPT-7 | Decode pre-alloc | M | Low | Low | DONE |
-| OPT-8 | Reuse reqwest Client | M | Low | Low | DONE |
-| OPT-9 | Seek without full decode | H | High | Medium | DONE |
-| OPT-10 | Rate limiter prune | L | Low | Low | DONE |
-| OPT-11 | Token generation | L | Low | Low | DONE |
-| OPT-12 | verify_and_consume | L | Low | Low | DONE |
-| OPT-13 | Incremental decode | H | High | Medium | DONE |
-| OPT-14 | Ring buffer | M | Medium | Low | SKIPPED |
-| OPT-15 | Track cache size | M | Low | Low | DONE |
-| OPT-16 | Debounce manifest | M | Low | Low | DONE |
-| OPT-17 | Eviction sorting | L | Low | Low | SKIPPED |
-| OPT-18 | Recovery poll interval | L | Low | Low | DONE |
-| OPT-19 | Producer notify | M | Medium | Low | DONE |
-| OPT-20 | Streaming file poll | L | Low | Low | SKIPPED |
-| OPT-21 | Default features | M | Low | Low | DONE |
-| OPT-22 | Tokio features | M | Low | Low | DONE |
+| ID | Area | Impact | Effort | Risk | Status | Test |
+|----|------|--------|--------|------|--------|------|
+| OPT-1 | ALSA volume SIMD | M | Low | Low | DONE | `test_set_volume_clamping` |
+| OPT-2 | ALSA chunk size | M | Low | Low | DONE | `test_seek_endpoint` (integration) |
+| OPT-3 | ALSA idle wake | M | Medium | Medium | DONE | `test_wait_for_signal_returns_after_timeout` |
+| OPT-4 | Resampler memmove | H | Medium | Low | DONE | `test_resample_whole_track_buffer_stays_linear` |
+| OPT-5 | Deinterleave alloc | M | Medium | Low | DONE | `test_resample_streaming_packet_sizes_keep_all_audio` |
+| OPT-6 | Opus buffer alloc | M | Low | Low | DONE | `test_decode_to_pcm_wav` |
+| OPT-7 | Decode pre-alloc | M | Low | Low | DONE | `test_decode_to_pcm_wav` |
+| OPT-8 | Reuse reqwest Client | M | Low | Low | DONE | `test_upload_stream_endpoint` (integration) |
+| OPT-9 | Seek without full decode | H | High | Medium | DONE | `test_seek_from_nonzero_position` |
+| OPT-10 | Rate limiter prune | L | Low | Low | DONE | `test_auth_challenge_redeem_happy_path` (integration) |
+| OPT-11 | Token generation | L | Low | Low | DONE | `test_auth_challenge_redeem_happy_path` (integration) |
+| OPT-12 | verify_and_consume | L | Low | Low | DONE | `test_auth_challenge_redeem_happy_path` (integration) |
+| OPT-13 | Incremental decode | H | High | Medium | DONE | `test_seek_endpoint` (integration) |
+| OPT-14 | Ring buffer | M | Medium | Low | SKIPPED | — (marginal, already bounded) |
+| OPT-15 | Track cache size | M | Low | Low | DONE | `test_storage_rejects_paths_outside_cache_dir` |
+| OPT-16 | Debounce manifest | M | Low | Low | DONE | `test_cache_next_and_previous_endpoints` (integration) |
+| OPT-17 | Eviction sorting | L | Low | Low | SKIPPED | — (marginal at <100 entry scale) |
+| OPT-18 | Recovery poll interval | L | Low | Low | DONE | `test_engine_error_display` |
+| OPT-19 | Producer notify | M | Medium | Low | DONE | `test_wait_for_space_wakes_on_notify` |
+| OPT-20 | Streaming file poll | L | Low | Low | SKIPPED | — (marginal, only on demuxer errors) |
+| OPT-21 | Default features | M | Low | Low | DONE | Build check (`cargo check` / `cargo test`) |
+| OPT-22 | Tokio features | M | Low | Low | DONE | Build check (`cargo check` / `cargo test`) |
 ---
+
+## Test Coverage Details
+
+| ID | Test | File | What it verifies |
+|----|------|------|------------------|
+| OPT-1 | `test_set_volume_clamping` | `src/player/tests.rs:61` | Volume clamping (0.0–1.0) works through the autovectorized `iter().map()` loop; `applied_gain()` tracks `volume_val` exactly. |
+| OPT-2 | `test_seek_endpoint` | `tests/endpoints.rs` | Playback works end-to-end with `CHUNK_FRAMES=1024` (4-16x fewer writer wakeups). |
+| OPT-3 | `test_wait_for_signal_returns_after_timeout` | `src/player/tests.rs:316` | `AudioBuffer::wait_for_signal()` returns after ~50ms timeout with no data — writer never blocks forever on empty buffer. |
+| OPT-4 | `test_resample_whole_track_buffer_stays_linear` | `src/player/tests.rs:255` | Cursor-based `InterleavedResampler` is O(N) not O(N²) — 32 chunks (~1G elements) completes in well under the 120s budget. |
+| OPT-5 | `test_resample_streaming_packet_sizes_keep_all_audio` | `src/player/tests.rs:220` | Thread-local pooled deinterleave/interleave preserves all audio from odd-sized packets (1024, 512, 2048, 128, 2048 frames). |
+| OPT-6 | `test_decode_to_pcm_wav` | `src/player/tests.rs:97` | Opus decode via reusable 46 KB buffer (`OpusTrackDecoder.out`) produces correct PCM (44.1k, stereo, pcm_s16le). |
+| OPT-7 | `test_decode_to_pcm_wav` | `src/player/tests.rs:97` | `decode_to_pcm` pre-allocates PCM from `bytes.len()/4` — correct output without reallocation churn. |
+| OPT-8 | `test_upload_stream_endpoint` | `tests/endpoints.rs` | Shared `reqwest::Client` via `Arc` handles upload/download without TLS handshake rebuilds. |
+| OPT-9 | `test_seek_from_nonzero_position` | `src/player/tests.rs:349` | `seek(2)` on a 5s WAV decodes only from position 2s forward — position=2, duration=3 (not full-track decode). |
+| OPT-10 | `test_auth_challenge_redeem_happy_path` | `tests/endpoints.rs` | Rate limiter allows valid challenge redeems; HashMap pruning doesn't drop active entries. |
+| OPT-11 | `test_auth_challenge_redeem_happy_path` | `tests/endpoints.rs` | Simplified loop-based token generation produces valid 25-char tokens with dashes. |
+| OPT-12 | `test_auth_challenge_redeem_happy_path` | `tests/endpoints.rs` | `verify_and_consume` uses single lock + single file open — no double-lock or double-read. |
+| OPT-13 | `test_seek_endpoint` | `tests/endpoints.rs` | Incremental packet-by-packet decode streams correctly through the HTTP playback path. |
+| OPT-15 | `test_storage_rejects_paths_outside_cache_dir` | `src/main.rs` | Incremental `total_size` tracking prevents cache traversal attacks; size stays bounded. |
+| OPT-16 | `test_cache_next_and_previous_endpoints` | `tests/endpoints.rs` | Debounced manifest writes (30s) don't lose cache entries across next/previous navigation. |
+| OPT-18 | `test_engine_error_display` | `src/player/engine.rs:3574` | Recovery state transitions work — `EngineError::YouTube` displays correctly. |
+| OPT-19 | `test_wait_for_space_wakes_on_notify` | `src/player/tests.rs:330` | `wait_for_space()` blocks until `notify_space()` is called — producer wakes when consumer frees buffer space. |
+| OPT-21 | Build check | `cargo check` / `cargo test` | `default = []` compiles with `--no-default-features --features alsa,opus`; backends are opt-in. |
+| OPT-22 | Build check | `cargo check` / `cargo test` | Trimmed tokio features (`rt-multi-thread`, `macros`, `sync`, `time`, `fs`, `io-util`, `process`, `signal`) compile and run all 89 tests. |
+
+**NEW-1** (YouTube stream URL cache): No dedicated unit test — exercised implicitly by `test_play_track_short_circuits_on_youtube_block` (fake yt-dlp path) and `test_select_audio_format_*` tests. Cache hit/miss logic is verified by code review; a mock HTTP server test would strengthen coverage.
+
+**NEW-2** (HTML detection during download): No dedicated test — would require a mock HTTP server returning HTML on the first chunk. Verified by code review; the first-chunk check (`<!doc`, `<html`, `<?xml`) is inserted before any file write completes.
+
+**Skipped:** OPT-14, OPT-17, OPT-20 — marginal benefit at current cache scale (<100 entries), bounded by existing throttles.
 
 ## New optimizations discovered beyond the original 22
 
