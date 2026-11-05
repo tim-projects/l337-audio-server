@@ -1461,3 +1461,54 @@ path is covered by `test_end_of_track_reports_stopped`).
 Still owed before the merge gate can close: the remaining table items (a stock-host
 PipeWire/ALSA run, RSS reclaim on a real backend, the streamed-track `actual_kbps` ceiling check,
 and the `CHUNK_FRAMES` device re-check), then the merge `g1-opus-decode` → `main`.
+
+---
+
+## Session — 2026-11-05: audible audio drops every ~5 s on the Termux device (whole-process freezes, not a player defect)
+
+**Symptom.** While listening to the 213 s Rick Astley verification streams, the audio dropped briefly
+roughly every 5 s. The client-facing view showed nothing wrong: `position_sec` advanced continuously,
+no stall, `state` stayed `playing`.
+
+**Investigation** (isolated instance; every candidate subsystem instrumented in turn, all
+instrumentation removed again afterwards):
+
+| Instrumented | Result |
+|---|---|
+| Writer starvation (`available == 0` while playing) | **0 events** — the PulseAudio writer never found the buffer empty |
+| Writer lock / `pa_stream_write` / pacing sleep durations | all fast, no section above 100 ms |
+| PulseAudio mainloop guard + `pa_threaded_mainloop_lock` waits | 0 slow acquisitions |
+| Engine buffer (`unconsumed`) during the drops | 4–12 s of decoded audio buffered, never near empty |
+| Wall time between two consecutive `pa_stream_write` calls | **5,099 / 5,133 / 5,102 ms gaps** — one per audible drop, reproduced three times |
+| Engine (decode thread) log cadence across the same window | also silent — the **whole process** stops for ~9 s around each gap |
+
+**Conclusion.** The drop is not the reader, not the wedge policy, not producer starvation and not the
+PulseAudio mainloop: the entire server process stops running for seconds at a time, so neither the
+decode thread nor the audio writer thread gets any CPU. The process sits in the `top-app` cpuset and
+averages ~3 % CPU over the run, so it is not CPU-starved in aggregate; the freezes are periodic and
+process-wide, which is what Android does to a process with no foreground activity (Termux is
+backgrounded; the server was started from a shell, not an Activity). Mechanism could not be pinned
+further without root to read the app/pid cgroup quota; the standard Termux mitigation for exactly
+this is a wake lock, which this repo's build script already relies on for Rust builds.
+
+**Related nuance.** The device build is unoptimized and, on a trickling download, the re-probe policy
+rebuilds ~4.6×/s (rate-limited), each replay re-parsing the whole downloaded prefix. That makes the
+process far busier than a release build and likely widens the throttle windows. The release build's
+CPU profile is much lower, so drops should be rarer with it — but they would still occur, because the
+cause is the process being frozen, not the work it does.
+
+**Mitigations — one needs choosing (not implemented):**
+1. **Hold a Termux partial wake lock for the service's lifetime** (`termux-wake-lock` before `exec` in
+   the run script, `termux-wake-unlock` on exit; the installer writes that script). Keeps the app out
+   of the freezer; costs battery only while playing. Cheapest and targeted at the actual cause.
+2. **Give the sink-input a buffer margin** instead of just-in-time pacing: raise the PulseAudio
+   stream's buffered latency (`pa_buffer_attr` / `tlength`, ~2–3 s) so short freezes are absorbed by
+   the sink. Interacts with **BUG-2** (the unbounded-sink-backlog fix) — the margin must stay bounded
+   and reclaimed, so this is a design change to the G4 pacing, not a one-liner.
+3. Both, if battery cost is acceptable.
+
+**Reproduction recipe** (30 s is enough): isolated instance, `LD_LIBRARY_PATH=$PREFIX/lib`,
+`L337_RUNTIME_DIR=<tmp>`, `RUST_LOG=l337_audio_server=warn`, play a live Opus/WebM URL, and timestamp
+each `pa_stream_write`; the ~5 s inter-write gap plus the engine's own silence across it is the
+signature. Instrumentation points: `src/platform/pulseaudio.rs` writer loop (lock/write/sleep
+timings) and `src/player/engine.rs` streaming loops (buffer dumps, rebuild timings).
