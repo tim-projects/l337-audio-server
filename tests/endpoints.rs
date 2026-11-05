@@ -496,7 +496,7 @@ async fn test_seek_endpoint() {
     sleep(Duration::from_millis(200)).await;
 
     let seek_payload = serde_json::json!({
-        "position": 0
+        "position_sec": 0
     });
 
     let seek_resp = client
@@ -760,7 +760,7 @@ async fn test_cache_next_and_previous_endpoints() {
         .send()
         .await
         .expect("Failed to call /player/cache/next");
-    assert_eq!(cache_next_resp.status(), 202);
+    assert_eq!(cache_next_resp.status(), 200);
 
     let cache_prev_payload = serde_json::json!({
         "track_id": "prev-cache-track",
@@ -777,7 +777,7 @@ async fn test_cache_next_and_previous_endpoints() {
         .send()
         .await
         .expect("Failed to call /player/cache/previous");
-    assert_eq!(cache_prev_resp.status(), 202);
+    assert_eq!(cache_prev_resp.status(), 200);
 
     sleep(Duration::from_secs(2)).await;
 
@@ -1034,7 +1034,7 @@ async fn test_cache_next_honors_runtime_target_ceiling() {
         .send()
         .await
         .expect("Failed to call /player/cache/next");
-    assert_eq!(cache_resp.status(), 202);
+    assert_eq!(cache_resp.status(), 200);
 
     // The cache task runs in the background: wait for the download invocation.
     let mut recorded = String::new();
@@ -1106,7 +1106,7 @@ async fn test_cache_next_best_picks_highest_available() {
         .send()
         .await
         .expect("Failed to call /player/cache/next");
-    assert_eq!(cache_resp.status(), 202);
+    assert_eq!(cache_resp.status(), 200);
 
     // The cache task runs in the background: wait for the download invocation.
     let mut recorded = String::new();

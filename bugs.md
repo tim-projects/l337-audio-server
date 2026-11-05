@@ -1547,3 +1547,243 @@ Fixtures generated with ffmpeg: `test_opus_ogg.opus` (10 s), `test_opus_webm.web
 **Limitations:** root-gated installer-install (apt/dnf/pacman libopus path) and any pulseaudio-backend
 device check could not be run here. The merged `g1-opus-decode` branch is not yet on `main`.
 
+---
+
+## New findings — comprehensive API test battery (2026-11-05, Arch + PipeWire)
+
+A full endpoint battery was run against the locally built alsa+opus binary
+(`/tmp/l337-build/release/l337-audio-server`, `0.0.0-dev`) on port 13370 with
+`L337__SERVER__TOKEN=dbgtkn123`, exercising all 21 routes, auth matrix, all 7
+codecs, seek, volume, speed, target, cache, settings, stop/pause/next/previous,
+concurrent plays, large-file upload, unsupported/empty files, and track_id
+traversal. Two genuine bugs and one API inconsistency were found:
+
+### NF-1 — Seek request field `position` vs status field `position_sec` (API inconsistency)
+
+`SeekPayload.position` (src/api/models.rs:125) uses the field name `position`,
+but `PlayerStatus.position_sec` (src/api/models.rs:153) reports `position_sec`.
+API consumers that read `position_sec` from status and send it back to seek will
+get a 422 "missing field `position`" error. The field names should be aligned
+(either both `position` or both `position_sec`).
+
+**Verified:** `POST /player/seek {"position_sec":5}` → 422 missing field `position`;
+`{"position":5}` → 200 OK. `position_sec` readback after seek works correctly.
+
+### NF-2 — Mutation endpoints return empty 200 OK bodies (API inconsistency)
+
+`upload_stream` (handlers.rs:493), `set_volume` (handlers.rs:346), `set_speed`
+(handlers.rs:336), `set_target` (handlers.rs:364ff), `stop`, `pause`, and
+`settings` all return `StatusCode::OK` with an empty body. Only `/player/play`
+returns `{"ok":true}`. Clients expecting a JSON confirmation body on every
+mutation endpoint will fail to parse the empty response.
+
+**Verified:** `POST /player/play/stream` → 200 empty body (operation succeeds,
+state=playing). `POST /player/play {"stream_url":"file://..."}` → `{"ok":true}`.
+
+### NF-3 — Out-of-range volume/speed silently clamped (design note, not a bug)
+
+`set_volume` clamps to [0.0, 1.0] (engine.rs:850) and `set_speed_and_pitch`
+clamps to [0.25, 4.0] (engine.rs:832-833). `volume=1.5`, `volume=-0.1`,
+`speed=0` all return 200 OK with the clamped value applied, not 400. This is
+intentional defensive behavior, but API clients cannot distinguish "accepted"
+from "clamped" without reading back the status.
+
+**Verified:** volume 1.5 → 200, readback 1.0; speed 0 → 200, readback 0.25;
+target -1 → 422 (correctly rejected via TargetPayload validation).
+
+### Not bugs (by design or test artifacts)
+
+- `GET /setup` → 404 in HTTP mode: socket-mode-only endpoint by design
+  (handlers.rs:40-46).
+- `POST /auth/challenge` → 202: ACCEPTED by design in non-socket mode.
+- `current_track`/`duration_sec`/`actual_kbps`/`codec` null when stopped:
+  expected, not missing fields.
+- Unsupported/empty file uploads accepted with 200: upload writes to disk;
+  decode failure surfaces later, not at upload time.
+
+## Solutions implemented (2026-11-05)
+
+### NF-1 fix — Align seek field names (commit pending)
+
+**Change:** `src/api/models.rs` line 125: `SeekPayload.position` → `SeekPayload.position_sec`
+
+**Rationale:** The request field name now matches the response field name
+(`PlayerStatus.position_sec`). A client that reads `position_sec` from status
+and sends it back to seek will get 200 instead of 422.
+
+**Files changed:**
+- `src/api/models.rs:125` — `pub position: u64` → `pub position_sec: u64`
+- `src/api/handlers.rs:353` — `engine.seek(payload.position)` → `engine.seek(payload.position_sec)`
+
+### NF-2 fix — JSON `{"ok": true}` bodies on all mutation endpoints (commit pending)
+
+**Change:** All 9 mutation endpoints now return `Json(serde_json::json!({"ok": true}))` instead of an empty `StatusCode::OK`.
+
+**Rationale:** Only `/player/play` returned a JSON body; all other mutations returned
+an empty 200 OK. Clients parsing the response body would fail. Consistent `{"ok": true}`
+bodies make all mutation endpoints predictable.
+
+**Files changed:**
+- `src/api/handlers.rs:223` — pause: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:229` — stop: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:235` — next: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:241` — previous: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:336` — set_speed: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:345` — set_volume: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:354` — seek: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:379` — set_settings: empty 200 → `{"ok": true}`
+- `src/api/handlers.rs:493` — upload_stream: empty 200 → `{"ok": true}`
+
+### NF-3 resolution — Silent clamping is intentional, no code change
+
+**Resolution:** Documented as intentional defensive behavior (engine.rs:832-833,
+engine.rs:850). Volume clamps to [0.0, 1.0]; speed clamps to [0.25, 4.0]. Out-of-range
+inputs return 200 OK with the clamped value applied. API clients can detect clamping
+by reading back status after the mutation. No code change required.
+
+---
+
+## Additional findings — deep-dive round 2 (2026-11-05)
+
+A deeper code review of handlers, models, engine, and auth uncovered 7 more
+issues (NF-4 through NF-10), all now fixed.
+
+### NF-4 — Test uses removed field name `position` (test breakage from NF-1 fix)
+
+**Bug:** `src/api/tests.rs:111` — `test_api_seek` constructs `SeekPayload { position: 0 }`,
+which references the old field name removed by the NF-1 fix. The test would not
+compile.
+
+**Fix:** Changed to `SeekPayload { position_sec: 0 }`.
+
+**Files changed:**
+- `src/api/tests.rs:111` — `position: 0` → `position_sec: 0`
+
+### NF-5 — No NaN/Inf validation on volume/speed/pitch (security/correctness)
+
+**Bug:** `VolumePayload.volume` (models.rs:110), `SpeedPayload.speed` (models.rs:103),
+and `SpeedPayload.pitch` (models.rs:105) are bare `f32` fields with no NaN/Inf
+checks. `f32::clamp` propagates NaN, so `volume: NaN` or `speed: Infinity` returns
+200 OK but stores garbage state. NaN serializes as `null` in JSON, confusing
+clients that read back status.
+
+**Fix:** Added `is_nan()`/`is_infinite()` guards in `set_volume` and `set_speed`
+handlers, returning 400 with `{"ok": false, "error": "..."}` for non-finite values.
+
+**Files changed:**
+- `src/api/handlers.rs` — `set_speed` (line ~334): NaN/Inf check on speed + pitch
+- `src/api/handlers.rs` — `set_volume` (line ~344): NaN/Inf check on volume
+
+### NF-6 — cache_next/cache_previous return empty ACCEPTED bodies
+
+**Bug:** `handlers.rs:284` and `handlers.rs:327` — `cache_next` and `cache_previous`
+returned `StatusCode::ACCEPTED.into_response()` with an empty body, inconsistent
+with other mutation endpoints.
+
+**Fix:** Both now return `Json(serde_json::json!({"ok": true}))`.
+
+**Files changed:**
+- `src/api/handlers.rs` — `cache_next`: empty ACCEPTED → `{"ok": true}`
+- `src/api/handlers.rs` — `cache_previous`: empty ACCEPTED → `{"ok": true}`
+
+### NF-7 — Auth rate limiting bypass when ConnectInfo is None (security)
+
+**Bug:** `handlers.rs:73-81` and `handlers.rs:117-125` — `auth_challenge` and
+`auth_redeem` only applied rate limiting inside `if let Some(ConnectInfo(addr)) =
+maybe_addr`. When no remote address is available (e.g. Unix socket connections
+or certain proxy configurations), rate limiting was entirely skipped, allowing
+unlimited auth attempts.
+
+**Fix:** Rate limit address now defaults to `SocketAddr::from(([0,0,0,0], 0))`
+when `ConnectInfo` is absent, so rate limiting always applies.
+
+**Files changed:**
+- `src/api/handlers.rs` — `auth_challenge`: always check rate limiter
+- `src/api/handlers.rs` — `auth_redeem`: always check rate limiter
+
+### NF-8 — track_id_missing() returns plain text, not JSON
+
+**Bug:** `handlers.rs:172-178` — `track_id_missing()` returned plain text
+`"track_id and stream_url are required"` with a 400, inconsistent with the JSON
+error format used by `play`, `cache_next`, `cache_previous`, and `auth_redeem`.
+
+**Fix:** Now returns `Json(serde_json::json!({"ok": false, "error": "track_id and stream_url are required"}))`.
+
+**Files changed:**
+- `src/api/handlers.rs` — `track_id_missing()`: plain text → JSON error body
+
+### NF-9 — upload_stream error responses return plain text, not JSON
+
+**Bug:** `handlers.rs` — `upload_stream` returned plain text bodies for three
+error cases: invalid endpoint (`"invalid upload endpoint"`), missing/invalid
+`X-Track-Id` header, and upload I/O failure (`"upload failed"`). Inconsistent
+with JSON error format used elsewhere.
+
+**Fix:** All three error paths now return JSON `{"ok": false, "error": "..."}`.
+
+**Files changed:**
+- `src/api/handlers.rs` — invalid endpoint error: plain text → JSON
+- `src/api/handlers.rs` — X-Track-Id error: plain text → JSON
+- `src/api/handlers.rs` — upload failed error: plain text → JSON
+
+### NF-10 — SpeedPayload.pitch defaults to 0.0, silently clamped to 0.25
+
+**Bug:** `models.rs:104` — `SpeedPayload.pitch` used `#[serde(default)]`, which
+defaults `f32` to `0.0`. `set_speed_and_pitch` clamps pitch to [0.25, 4.0], so
+sending `{"speed": 1.5}` without a pitch field silently changed pitch to 0.25
+instead of leaving it at the neutral 1.0.
+
+**Fix:** Changed to `#[serde(default = "default_pitch")]` with a new
+`default_pitch()` function returning `1.0` (neutral, no pitch shift).
+
+**Files changed:**
+- `src/api/models.rs` — `SpeedPayload.pitch`: `#[serde(default)]` → `#[serde(default = "default_pitch")]`
+- `src/api/models.rs` — added `fn default_pitch() -> f32 { 1.0 }`
+
+---
+
+## Additional findings — deep-dive round 3 (2026-11-05)
+
+A third code review pass over `download_stream`, `play_pushed`, and the upload
+handler uncovered 2 more issues (NF-11 through NF-12), all now fixed.
+
+### NF-11 — `download_stream` allows reading arbitrary local files via bare absolute path `stream_url` (security)
+
+**Bug:** `engine.rs:1461-1467` — `download_stream` accepted bare absolute paths
+(e.g. `/etc/passwd`) as `stream_url`, copying any readable file on the filesystem
+into the server's slot directory. The `file://` prefix was the documented local
+file mechanism; bare absolute paths were an undocumented second path that
+bypassed any intent to scope local file access. Combined with `POST /player/play`
+accepting any `stream_url` string, an authenticated client could read arbitrary
+files the server process can read.
+
+**Fix:** Removed the bare absolute path branch from `download_stream`. Local
+file access now requires the `file://` prefix only (`url.strip_prefix("file://")`).
+
+**Files changed:**
+- `src/player/engine.rs` — `download_stream`: only `file://` prefix accepted for local files; bare absolute paths rejected
+
+### NF-12 — `play_pushed` swallows playback errors after stream upload
+
+**Bug:** `engine.rs:483-504` — `play_pushed` returned `()` and called
+`load_and_play` (which also returns `()`) without checking whether playback
+actually started. If the uploaded file couldn't be decoded, `load_and_play`
+logged an error and returned, leaving the engine in `Stopped` state. The caller
+(`upload_stream` for the `current` slot) returned `{"ok": true}` to the client
+even though nothing was playing.
+
+**Fix:** `play_pushed` now returns `Result<(), String>`. After `load_and_play`,
+it checks `self.state != PlayerStateLabel::Playing` and returns an error if
+playback didn't start. `upload_stream` propagates this as a 500 with a JSON
+error body.
+
+**Files changed:**
+- `src/player/engine.rs` — `play_pushed`: returns `Result<(), String>`, checks state after `load_and_play`
+- `src/api/handlers.rs` — `upload_stream`: propagates `play_pushed` error as 500 JSON
+
+---
+
+
+
+
+

@@ -70,14 +70,15 @@ pub async fn auth_challenge(
             .into_response();
     }
 
-    if let Some(ConnectInfo(addr)) = maybe_addr {
-        if let Err(_) = rate_limiter.check(addr) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "rate_limited"})),
-            )
-                .into_response();
-        }
+    let addr = maybe_addr
+        .map(|ConnectInfo(a)| a)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    if let Err(_) = rate_limiter.check(addr) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
     }
 
     match challenge_state.issue().await {
@@ -114,14 +115,15 @@ pub async fn auth_redeem(
             .into_response();
     }
 
-    if let Some(ConnectInfo(addr)) = maybe_addr {
-        if let Err(_) = rate_limiter.check(addr) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "rate_limited"})),
-            )
-                .into_response();
-        }
+    let addr = maybe_addr
+        .map(|ConnectInfo(a)| a)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    if let Err(_) = rate_limiter.check(addr) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
     }
 
     let presented = match headers.get("X-L337-Challenge").and_then(|v| v.to_str().ok()) {
@@ -172,7 +174,7 @@ fn valid_track_id(track_id: &str) -> bool {
 fn track_id_missing() -> impl IntoResponse {
     (
         StatusCode::BAD_REQUEST,
-        "track_id and stream_url are required",
+        Json(serde_json::json!({"ok": false, "error": "track_id and stream_url are required"})),
     )
         .into_response()
 }
@@ -220,25 +222,25 @@ pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
         crate::api::models::PlayerStateLabel::Paused => engine.resume(),
         _ => {}
     }
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.stop();
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn next(State(state): State<AppState>) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.trigger_next().await;
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn previous(State(state): State<AppState>) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.trigger_previous().await;
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn cache_next(
@@ -281,7 +283,7 @@ pub async fn cache_next(
             info!("Background cache complete for {}", track_id);
         }
     });
-    StatusCode::ACCEPTED.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn cache_previous(
@@ -324,25 +326,39 @@ pub async fn cache_previous(
             info!("Background cache complete for {}", track_id);
         }
     });
-    StatusCode::ACCEPTED.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn set_speed(
     State(state): State<AppState>,
     Json(payload): Json<SpeedPayload>,
 ) -> impl IntoResponse {
+    if payload.speed.is_nan() || payload.speed.is_infinite() || payload.pitch.is_nan() || payload.pitch.is_infinite() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "speed and pitch must be finite numbers"})),
+        )
+            .into_response();
+    }
     let mut engine = state.0.lock().await;
     engine.set_speed_and_pitch(payload.speed, payload.pitch);
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn set_volume(
     State(state): State<AppState>,
     Json(payload): Json<VolumePayload>,
 ) -> impl IntoResponse {
+    if payload.volume.is_nan() || payload.volume.is_infinite() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "volume must be a finite number"})),
+        )
+            .into_response();
+    }
     let mut engine = state.0.lock().await;
     engine.set_volume(payload.volume);
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn seek(
@@ -350,8 +366,8 @@ pub async fn seek(
     Json(payload): Json<SeekPayload>,
 ) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
-    engine.seek(payload.position);
-    StatusCode::OK.into_response()
+    engine.seek(payload.position_sec);
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn set_target(
@@ -376,7 +392,7 @@ pub async fn set_settings(
 ) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.storage.max_pool_size = settings.max_disk_pool_bytes;
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 /// Unauthenticated liveness probe used by clients to detect server reachability.
@@ -425,7 +441,11 @@ pub async fn upload_stream(
         "/player/cache/next/stream" => "next",
         "/player/cache/previous/stream" => "prev",
         _ => {
-            return (StatusCode::BAD_REQUEST, "invalid upload endpoint").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "invalid upload endpoint"})),
+            )
+                .into_response();
         }
     };
 
@@ -434,7 +454,7 @@ pub async fn upload_stream(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                "X-Track-Id header must be a non-empty single path component (no /, \\, .. or NUL)",
+                Json(serde_json::json!({"ok": false, "error": "X-Track-Id header must be a non-empty single path component (no /, \\\\, .. or NUL)"})),
             )
                 .into_response();
         }
@@ -475,14 +495,15 @@ pub async fn upload_stream(
 
     if let Err(e) = result {
         error!("Stream upload to {}.stream failed: {}", slot, e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": "upload failed"}))).into_response();
     }
 
     let mut engine = state.0.lock().await;
     if slot == "current" {
-        engine
-            .play_pushed(&track_id, "current", title, artist)
-            .await;
+        if let Err(e) = engine.play_pushed(&track_id, "current", title, artist).await {
+            error!("play_pushed failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": e}))).into_response();
+        }
     } else {
         // next/prev are precached; record access so eviction accounts for them.
         if let Ok(meta) = tokio::fs::metadata(&dest).await {
@@ -490,7 +511,7 @@ pub async fn upload_stream(
             engine.storage.evict_if_needed(meta.len()).await;
         }
     }
-    StatusCode::OK.into_response()
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 /// Look up which of the requested track_ids are present in the cache.

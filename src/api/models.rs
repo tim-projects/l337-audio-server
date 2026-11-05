@@ -101,8 +101,15 @@ pub struct Track {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpeedPayload {
     pub speed: f32,
-    #[serde(default)]
+    #[serde(default = "default_pitch")]
     pub pitch: f32,
+}
+
+/// Default pitch value: 1.0 (neutral, no pitch shift). Using 0.0 as the serde
+/// default would silently clamp to 0.25 via `set_speed_and_pitch`, changing
+/// the pitch even when the client never sent a pitch value.
+fn default_pitch() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,7 +129,7 @@ pub struct TargetPayload {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SeekPayload {
-    pub position: u64,
+    pub position_sec: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

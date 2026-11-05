@@ -486,7 +486,7 @@ impl PlayerEngine {
         slot: &str,
         title: Option<String>,
         artist: Option<String>,
-    ) {
+    ) -> Result<(), String> {
         self.stop();
         self.current_track = Some(Track {
             track_id: track_id.to_string(),
@@ -500,7 +500,11 @@ impl PlayerEngine {
 
         let path = self.storage.get_active_slot_path(slot);
         self.load_and_play(slot).await;
+        if self.state != PlayerStateLabel::Playing {
+            return Err(format!("failed to load pushed audio from slot {slot}"));
+        }
         self.persist_slot(track_id, &path).await;
+        Ok(())
     }
 
     async fn persist_slot(&self, track_id: &str, slot_path: &PathBuf) {
@@ -1458,13 +1462,7 @@ pub async fn download_stream(
         DOWNLOAD_STREAM_INVOKED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    let local_path: Option<PathBuf> = if let Some(path) = url.strip_prefix("file://") {
-        Some(PathBuf::from(path))
-    } else if !url.contains("://") && PathBuf::from(url).is_absolute() {
-        Some(PathBuf::from(url))
-    } else {
-        None
-    };
+    let local_path: Option<PathBuf> = url.strip_prefix("file://").map(PathBuf::from);
 
     if let Some(src) = local_path {
         if src.exists() {

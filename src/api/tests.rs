@@ -108,7 +108,7 @@ mod tests {
         };
         let _ = play(State(state.clone()), Json(track)).await;
 
-        let response = seek(State(state.clone()), Json(SeekPayload { position: 0 })).await;
+        let response = seek(State(state.clone()), Json(SeekPayload { position_sec: 0 })).await;
         assert_eq!(
             response.into_response().status(),
             axum::http::StatusCode::OK
