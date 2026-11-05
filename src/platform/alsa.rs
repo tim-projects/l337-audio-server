@@ -208,6 +208,9 @@ impl AlsaAudioOutputStream {
                 if buf.read_pos >= (1 << 20) {
                     buf.reclaim_consumed();
                 }
+                // Signal any producer throttled by exceeds_window() that space
+                // has been freed (OPT-19).
+                buf.notify_space();
                 drop(buf);
 
                 let result = unsafe {
@@ -243,10 +246,33 @@ impl AlsaAudioOutputStream {
                         break;
                     }
                 }
-                thread::sleep(Duration::from_millis(10));
+                // Block until new data arrives or a timeout elapses, instead of
+                // burning a wakeup every 10 ms while idle (OPT-3).
+                let guard = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                guard.wait_for_signal(Duration::from_millis(10));
+                buf = guard;
             } else {
+                // No data available but still playing: write silence briefly and
+                // block rather than spin, so the CPU can idle (OPT-3).
                 drop(buf);
-                thread::sleep(Duration::from_millis(10));
+                let result = unsafe {
+                    (funcs.snd_pcm_writei)(
+                        pcm_ptr,
+                        silence_buf.as_ptr() as *const std::os::raw::c_void,
+                        silence_buf.len() as u64 / 4,
+                    )
+                };
+                if result < 0 {
+                    let recovered = unsafe { (funcs.snd_pcm_recover)(pcm_ptr, result as i32, 1) };
+                    if recovered < 0 {
+                        state.buffer.lock().unwrap_or_else(|e| e.into_inner())
+                            .backend_error.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                let guard = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                guard.wait_for_signal(Duration::from_millis(10));
+                buf = guard;
             }
         }
     }

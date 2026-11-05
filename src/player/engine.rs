@@ -1351,6 +1351,7 @@ fn decode_file_incremental_blocking(
             if !out.is_empty() {
                 let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 ab.pcm.extend_from_slice(&out);
+                ab.notify_data();
                 total_frames += (out.len() / head.channels as usize) as u64;
             }
         }
@@ -1461,6 +1462,7 @@ fn decode_file_incremental_blocking(
                     if !resampled.is_empty() {
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                         ab.pcm.extend_from_slice(&resampled);
+                        ab.notify_data();
                         total_frames += (resampled.len() / channels as usize) as u64;
                     }
 
@@ -1490,6 +1492,7 @@ fn decode_file_incremental_blocking(
                 let mut ab =
                     audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 ab.pcm.extend_from_slice(&resampled);
+                ab.notify_data();
                 total_frames += (resampled.len() / channels as usize) as u64;
             }
         }
@@ -1500,6 +1503,7 @@ fn decode_file_incremental_blocking(
     if !tail.is_empty() {
         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.pcm.extend_from_slice(&tail);
+        ab.notify_data();
         total_frames += (tail.len() / channels as usize) as u64;
     }
 
@@ -2303,16 +2307,23 @@ impl symphonia::core::io::MediaSource for FileSource {
 fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &AtomicBool) {
     let mut stalls: u32 = 0;
     loop {
-        {
+        let exceeded = {
             let b = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            if !b.exceeds_window() {
-                return;
-            }
+            b.exceeds_window()
+        };
+        if !exceeded {
+            return;
         }
         if cancel.load(Ordering::SeqCst) {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Block until the consumer frees buffer space instead of polling every
+        // 20 ms (OPT-19). A missed signal is harmless: the timeout bounds
+        // re-check latency.
+        {
+            let b = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            b.wait_for_space(std::time::Duration::from_millis(20));
+        }
         stalls += 1;
         if stalls > 3600 {
             return;
@@ -2638,6 +2649,7 @@ fn streaming_decode_sync(
                     if !out.is_empty() {
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                         ab.pcm.extend_from_slice(&out);
+                        ab.notify_data();
                     }
                     error_cycles = 0;
                     stall_cycles = 0;
@@ -2866,6 +2878,7 @@ fn streaming_decode_sync(
                             // Rate conversion + append in one step: the wrapper
                             // buffers short packets instead of dropping them.
                             ab.pcm.extend_from_slice(&resampler.process(&output));
+                            ab.notify_data();
                         }
 
                         error_cycles = 0;
@@ -3047,10 +3060,11 @@ fn streaming_decode_sync(
     // writer underruns before `get_status` declares end-of-track. Skipped on
     // cancel, where the buffer is being torn down anyway.
     let tail = resampler.finish();
-    if !tail.is_empty() {
-        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        ab.pcm.extend_from_slice(&tail);
-    }
+        if !tail.is_empty() {
+            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            ab.pcm.extend_from_slice(&tail);
+            ab.notify_data();
+        }
 
     Ok(())
 }

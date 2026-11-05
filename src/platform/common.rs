@@ -45,7 +45,6 @@ impl PlatformInfo {
 
 
 /// Audio buffer shared between the engine and the native audio backend callback.
-#[derive(Debug)]
 pub struct AudioBuffer {
     pub pcm: Vec<f32>,
     pub read_pos: usize,
@@ -64,6 +63,13 @@ pub struct AudioBuffer {
     /// Set once when the unconsumed window is entered over-window, so writers
     /// log the (non-fatal) diagnostic once per transition, not per sample write.
     over_logged: std::sync::atomic::AtomicBool,
+    /// Signaled when new PCM data is appended to the buffer, so the ALSA/PipeWire
+    /// writer can block instead of polling every 10 ms when the window is empty
+    /// (OPT-3).
+    pub(crate) notify: std::sync::Condvar,
+    /// Signaled when the backend consumes PCM data, so a producer throttled by
+    /// `exceeds_window()` can block instead of polling every 20 ms (OPT-19).
+    pub(crate) space_notify: std::sync::Condvar,
     /// Backend cap in bytes of the *unconsumed rebuffer window* (G4) — a few
     /// seconds of decoded PCM, not a whole track. Backends drain/reclaim consumed
     /// samples as playback advances, so memory stays independent of track length.
@@ -83,6 +89,8 @@ impl AudioBuffer {
             pitch: 1.0,
             backend_error: std::sync::atomic::AtomicBool::new(false),
             over_logged: std::sync::atomic::AtomicBool::new(false),
+            notify: std::sync::Condvar::new(),
+            space_notify: std::sync::Condvar::new(),
             max_bytes: 24 * 1024 * 1024,
         }
     }
@@ -128,6 +136,38 @@ impl AudioBuffer {
                 self.pcm.shrink_to_fit();
             }
         }
+        // Signal any producer throttled by exceeds_window() that space was freed
+        // (OPT-19).
+        self.notify_space();
+    }
+
+    /// Wake one blocked writer that new PCM data has been appended. Called by
+    /// decode/producer paths after extending `pcm` (OPT-3).
+    pub fn notify_data(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Wake one blocked producer that buffer space has been freed. Called by
+    /// backend writers after consuming PCM data (OPT-19).
+    pub fn notify_space(&self) {
+        self.space_notify.notify_one();
+    }
+
+    /// Block on the internal condvar without holding the buffer lock, using a
+    /// throwaway mutex just for the condvar machinery. A missed signal is
+    /// harmless: the 10 ms timeout bounds re-check latency (OPT-3).
+    pub fn wait_for_signal(&self, timeout: std::time::Duration) {
+        let dummy = std::sync::Mutex::new(());
+        let guard = dummy.lock().unwrap();
+        let _ = self.notify.wait_timeout(guard, timeout).unwrap();
+    }
+
+    /// Block until buffer space is freed or `timeout` elapses, using a throwaway
+    /// mutex just for the condvar machinery (OPT-19).
+    pub fn wait_for_space(&self, timeout: std::time::Duration) {
+        let dummy = std::sync::Mutex::new(());
+        let guard = dummy.lock().unwrap();
+        let _ = self.space_notify.wait_timeout(guard, timeout).unwrap();
     }
 }
 
