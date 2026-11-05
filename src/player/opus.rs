@@ -134,6 +134,12 @@ impl OpusTrackDecoder {
         self.channels
     }
 
+    /// Clear remaining pre-skip so decoded output is not trimmed when seeking
+    /// to a position inside the stream (OPT-9).
+    pub(crate) fn clear_pre_skip(&mut self) {
+        self.pre_skip_remaining = 0;
+    }
+
     /// Decode one Opus packet into interleaved 48 kHz f32, applying the OpusHead
     /// pre-skip to the first samples. Returns an empty vec for a corrupt packet
     /// (skipped) so a bad packet never aborts playback.

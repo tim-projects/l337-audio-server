@@ -409,7 +409,7 @@ and trim.
 | OPT-6 | Opus buffer alloc | M | Low | Low | DONE |
 | OPT-7 | Decode pre-alloc | M | Low | Low | DONE |
 | OPT-8 | Reuse reqwest Client | M | Low | Low | DONE |
-| OPT-9 | Seek without full decode | H | High | Medium |
+| OPT-9 | Seek without full decode | H | High | Medium | DONE |
 | OPT-10 | Rate limiter prune | L | Low | Low | DONE |
 | OPT-11 | Token generation | L | Low | Low | DONE |
 | OPT-12 | verify_and_consume | L | Low | Low | DONE |

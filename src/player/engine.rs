@@ -945,19 +945,21 @@ impl PlayerEngine {
         self.ensure_stream();
 
         let path = self.storage.get_active_slot_path("current");
-
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                error!("seek: cannot read {}: {}", path.display(), e);
-                return;
-            }
+        let path_clone = path.clone();
+        let speed = self.speed;
+        let pitch = self.pitch;
+        let device_rate = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.sample_rate
         };
 
-        let decode =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)));
+        // OPT-9: decode only from the seek position instead of decoding the whole
+        // track, then splitting off. Avoids full-track PCM allocation on long files.
+        let decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            decode_from_position_blocking(&path_clone, position, speed, pitch, device_rate)
+        }));
 
-        let (mut pcm, file_sample_rate, channels, _codec) = match decode {
+        let (mut pcm, file_sample_rate, channels, _codec, _total_frames) = match decode {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 error!("seek: decode failed on {}: {:?}", path.display(), e);
@@ -972,44 +974,28 @@ impl PlayerEngine {
             }
         };
 
-        // Seeking at/past the end leaves nothing to play: previously the whole
-        // track was silently re-buffered from 0 while `position_sec` reported the
-        // end (position > duration). Clamp instead so the reported position is
-        // always reachable.
+        // Clamp position to track duration so the reported playhead is always
+        // reachable (seeking at/past the end leaves nothing to play).
         let total_frames = pcm.len() / (channels as usize);
         let total_sec = (total_frames as f64 / file_sample_rate as f64).round() as u64;
         let position = position.min(total_sec);
 
-        let target_orig_pos = (position as u64) * (file_sample_rate as u64);
-        let start_sample = (target_orig_pos * channels as u64) as usize;
-        if start_sample < pcm.len() {
-            pcm = pcm.split_off(start_sample);
-        }
-
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
 
-        let device_rate = {
-            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buf.sample_rate
-        };
-
-        let playback_pcm =
-            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
-        tracing::info!("seek: after resample: playback_pcm.len()={}", playback_pcm.len());
-
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        buf.pcm = playback_pcm;
+        buf.pcm = pcm;
         buf.read_pos = 0;
         buf.consumed_total = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
         buf.pitch = self.pitch;
+        buf.notify_data();
         drop(buf);
 
         self.position_sec = position;
-        let remaining_frames = pcm.len() / channels as usize;
+        let remaining_frames = total_frames;
         self.duration_sec = Some((remaining_frames as f64 / file_sample_rate as f64).round() as u64);
         self.state = PlayerStateLabel::Playing;
     }
@@ -1508,6 +1494,255 @@ fn decode_file_incremental_blocking(
     }
 
     Ok((file_sample_rate, channels, codec, total_frames))
+}
+
+/// OPT-9: Blocking decode starting at a seek position instead of decoding the
+/// whole track. Opens the file via the seekable `FileSource`, seeks to
+/// `position_sec`, then decodes only packets from that point forward. PCM is
+/// stretch/pitch/resampled per packet just like `decode_file_incremental_blocking`,
+/// so memory stays bounded by the rebuffer window rather than the track length.
+///
+/// For Opus tracks, symphonia cannot decode Opus (libopus does), so instead of
+/// container-level seeking we scan packets from the start, tracking cumulative
+/// decoded time, skip until `position_sec`, then decode from there with pre-skip
+/// cleared.
+fn decode_from_position_blocking(
+    path: &PathBuf,
+    position_sec: u64,
+    speed: f32,
+    pitch: f32,
+    device_rate: u32,
+) -> Result<(Vec<f32>, u32, u16, Option<String>, u64), String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+    use symphonia::core::units::Time;
+    use symphonia::core::formats::{SeekMode, SeekTo};
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let source = FileSource { file };
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    let hint = Hint::new();
+    let probed =
+        symphonia::default::get_probe().format(&hint, mss, &Default::default(), &Default::default())
+            .map_err(|e| format!("format probe failed: {e}"))?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| {
+            let ct = t.codec_params.codec;
+            ct == symphonia::core::codecs::CODEC_TYPE_AAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_MP3
+                || ct == symphonia::core::codecs::CODEC_TYPE_OPUS
+                || ct == symphonia::core::codecs::CODEC_TYPE_VORBIS
+                || ct == symphonia::core::codecs::CODEC_TYPE_FLAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_ALAC
+                || ct == symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
+        })
+        .cloned()
+        .or_else(|| format.default_track().cloned())
+        .ok_or("no default track in file")?;
+
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let codec = codec_label(codec_params.codec);
+
+    let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
+    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+
+    let mut total_frames: u64 = 0;
+
+    // Opus: libopus decode, no container-level seek. Scan packets from start,
+    // tracking cumulative time, skip until position_sec, then decode from there.
+    #[cfg(feature = "opus")]
+    if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        let extra: &[u8] = codec_params.extra_data.as_deref().unwrap_or(&[]);
+        let head = crate::player::opus::parse_opus_head(extra)
+            .ok_or("Opus track missing OpusHead sideband")?;
+        let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
+        let mut pcm: Vec<f32> = Vec::new();
+        let mut cum_time_sec: f64 = 0.0;
+        let mut started = position_sec == 0;
+        if position_sec > 0 {
+            opus_dec.clear_pre_skip();
+        }
+        loop {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let out = opus_dec.push(packet.buf());
+            if out.is_empty() {
+                continue;
+            }
+            let out_frames = out.len() / head.channels as usize;
+            if !started {
+                cum_time_sec += out_frames as f64 / 48000.0;
+                if cum_time_sec >= position_sec as f64 {
+                    started = true;
+                    // Trim this packet's leading samples to land exactly on position.
+                    let overshoot = (cum_time_sec - position_sec as f64) * 48000.0;
+                    let drop_samples = overshoot as usize * head.channels as usize;
+                    if drop_samples < out.len() {
+                        pcm.extend_from_slice(&out[drop_samples..]);
+                        total_frames +=
+                            ((out.len() - drop_samples) / head.channels as usize) as u64;
+                    }
+                }
+            } else {
+                pcm.extend_from_slice(&out);
+                total_frames += out_frames as u64;
+            }
+        }
+        return Ok((pcm, 48000, head.channels, Some("opus".to_string()), total_frames));
+    }
+
+        // Non-Opus: use symphonia's container-level seek to jump to position_sec.
+    if position_sec > 0 {
+        let _ = format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: Time::new(position_sec, 0.0),
+                track_id: None,
+            },
+        );
+    }
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &Default::default())
+        .map_err(|e| format!("decoder init: {e}"))?;
+
+    let mut sample_buf = None;
+    let tempo = speed;
+    let mut stretcher = if tempo != 1.0 {
+        wsola::TimeStretch::new(file_sample_rate, channels)
+            .ok()
+            .map(|mut ts| { ts.set_tempo(tempo); ts })
+    } else {
+        None
+    };
+
+    let mut shifter = if pitch != 1.0 {
+        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+    } else {
+        None
+    };
+    let shift_semitones = if pitch != 1.0 {
+        Some(12.0 * (pitch as f64).log2() as f32)
+    } else {
+        None
+    };
+
+    let mut resampler = InterleavedResampler::new(channels, file_sample_rate, device_rate);
+
+    let mut pcm: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                let spec = *audio_buf.spec();
+                if sample_buf.is_none() {
+                    sample_buf = Some(SampleBuffer::<f32>::new(
+                        audio_buf.capacity() as u64,
+                        spec,
+                    ));
+                }
+
+                if let Some(buf) = &mut sample_buf {
+                    buf.copy_interleaved_ref(audio_buf);
+                    let samples = buf.samples();
+
+                    let mut output = samples.to_vec();
+
+                    if let Some(ref mut stretcher) = stretcher {
+                        stretcher.push(samples);
+                        let mut pulled = Vec::new();
+                        loop {
+                            let batch = stretcher.pull(4096);
+                            if batch.is_empty() {
+                                break;
+                            }
+                            pulled.extend_from_slice(&batch);
+                        }
+                        output = pulled;
+                    }
+
+                    if let (Some(ref mut shifter), Some(semitones)) =
+                        (shifter.as_mut(), shift_semitones)
+                    {
+                        let ch = channels as usize;
+                        let mut input_planar = vec![Vec::new(); ch];
+                        for frame in output.chunks(ch) {
+                            for (c, &sample) in frame.iter().enumerate() {
+                                input_planar[c].push(sample);
+                            }
+                        }
+                        let mut pitched_planar: Vec<Vec<f32>> = vec![Vec::new(); ch];
+                        for c in 0..ch {
+                            for chunk in input_planar[c].chunks(128) {
+                                let mut buf = [0.0f32; 128];
+                                for (i, &s) in chunk.iter().enumerate() {
+                                    buf[i] = s;
+                                }
+                                let result =
+                                    shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                                pitched_planar[c].extend_from_slice(result);
+                            }
+                        }
+                        let out_frames = pitched_planar[0].len();
+                        output = Vec::with_capacity(out_frames * ch);
+                        for f in 0..out_frames {
+                            for c in 0..ch {
+                                output.push(pitched_planar[c][f]);
+                            }
+                        }
+                    }
+
+                    let resampled = resampler.process(&output);
+                    if !resampled.is_empty() {
+                        pcm.extend_from_slice(&resampled);
+                        total_frames += (resampled.len() / channels as usize) as u64;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    if let Some(ref mut stretcher) = stretcher {
+        loop {
+            let pulled = stretcher.pull(4096);
+            if pulled.is_empty() {
+                break;
+            }
+            let resampled = resampler.process(&pulled);
+            if !resampled.is_empty() {
+                pcm.extend_from_slice(&resampled);
+                total_frames += (resampled.len() / channels as usize) as u64;
+            }
+        }
+    }
+
+    let tail = resampler.finish();
+    if !tail.is_empty() {
+        pcm.extend_from_slice(&tail);
+        total_frames += (tail.len() / channels as usize) as u64;
+    }
+
+    Ok((pcm, file_sample_rate, channels, codec, total_frames))
 }
 
 /// Input chunk size (frames per channel) that rubato's `SincFixedIn` demands
