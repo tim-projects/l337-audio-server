@@ -56,6 +56,23 @@ impl ChallengeState {
         }
     }
 
+
+    pub async fn current_token(&self) -> Option<String> {
+        let inner = self.inner.lock().await;
+        let file = std::fs::File::open(&inner.path).ok()?;
+        let metadata = file.metadata().ok()?;
+        let modified = metadata.modified().ok()?;
+        if modified.elapsed().unwrap_or(Duration::from_secs(u64::MAX)) > CHALLENGE_TTL {
+            return None;
+        }
+        let mut contents = String::new();
+        use std::io::Read;
+        let mut file = file;
+        file.read_to_string(&mut contents).ok()?;
+        let stored = contents.trim().to_string();
+        if stored.is_empty() { None } else { Some(stored) }
+    }
+
     pub async fn issue(&self) -> Result<(), ChallengeError> {
         let inner = self.inner.lock().await;
         let token = generate_token();
@@ -122,7 +139,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 pub fn generate_token() -> String {
     use rand::Rng;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     let mut token = String::with_capacity(25);
     for i in 0..20 {

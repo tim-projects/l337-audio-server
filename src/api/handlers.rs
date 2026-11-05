@@ -547,3 +547,42 @@ pub async fn cache_lookup(
 
     Json(serde_json::json!({"cached": cached})).into_response()
 }
+
+#[cfg(feature = "qr")]
+pub async fn auth_challenge_qr(
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    maybe_addr: Option<ConnectInfo<SocketAddr>>,
+    axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    if socket_mode {
+        return (StatusCode::OK, "socket_mode").into_response();
+    }
+    let addr = maybe_addr
+        .map(|ConnectInfo(a)| a)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    if let Err(_) = rate_limiter.check(addr) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+        )
+            .into_response();
+    }
+    let token = match challenge_state.current_token().await {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "no active challenge",
+            )
+                .into_response();
+        }
+    };
+    let code = qrcode::QrCode::new(token.as_bytes()).unwrap();
+    let s = code
+        .render::<char>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .build();
+    (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], s).into_response()
+}
