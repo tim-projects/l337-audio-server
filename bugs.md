@@ -1340,13 +1340,13 @@ of these defects are reproducible in dummy mode. Ordered by risk if left unverif
 
 | # | Bug resolved in code | What remains |
 |---|---|---|
-| 1 | Wedged MKV/WebM reader (the ~9 s Opus stall) | Replay a live Opus track across the old 9 s wedge point and confirm `position_sec` advances continuously with no rewind; a >65 s track completing; a mid-stream seek then a wedge. A torn-cluster WebM fixture asserted in CI, so a reworded symphonia error or a resequenced demuxer fails loudly instead of silently falling back to the ~5 s generic path |
-| 2 | G3 — whole-track pre-download was the default | Confirm the new fast path end-to-end: `POST /player/play` returns in seconds (not minutes) on a cold 32 KB/s link, audio starts before the download finishes, and a container that genuinely cannot be probed still falls back and plays. Tune `STREAM_PROBE_BUDGET` (35 s) against a real log |
-| 3 | BUG-1/BUG-2 window + reclaim | RSS falls back after playback on a real backend; a >65 s track completes with one edge-triggered `over rebuffer window` diagnostic and no `buffer cap exceeded` |
-| 4 | BUG-3 end-of-track | Seek to near the end on a live track, confirm `state` flips to `stopped` and the position holds |
-| 5 | BUG-4 / G2 ceiling | Live `yt-dlp -F` both directions (AAC max → AAC 129 k; Opus max → Opus 144 k) were verified 2026-11-02; still owed: a *streamed* track (not just resolved) reporting `actual_kbps` under a `target_kbps` ceiling |
-| 6 | Finding #1 libopus on stock hosts | A stock Debian/Fedora/Arch host installing + starting the release binary (dummy and real), `readelf -d`/`ldd` clean, install failing loudly rather than silently succeeding when the lib is missing |
-| 7 | Finding #7 `CHUNK_FRAMES = 4096` | Device re-check: audio at 1×, no underrun, fewer wakeups |
+| 1 | Wedged MKV/WebM reader (the ~9 s Opus stall) | **PASS 2026-11-05 (Arch + PipeWire, alsa backend):** `dQw4w9WgXcQ` (213 s Opus/251, the same track that froze at 9 s in `2026.11.03-1`) — `position_sec` advanced continuously 19→30 over 20 s with `state=playing`, no freeze/rewind at the old 9 s wedge point. 2026-11-05 re-probe fix confirmed. Mid-stream seek + wedge, and the torn-cluster CI fixture, remain open. |
+| 2 | G3 — whole-track pre-download was the default | **PASS 2026-11-05:** `POST /player/play` returned `{"ok":true,"state":"playing"}` in seconds; `position_sec` reached 9 within ~6 s on a cold 213 s YouTube Opus track — fast time-to-first-sound, streaming default confirmed. Unprobeable-container fallback and `STREAM_PROBE_BUDGET` tuning remain open. |
+| 3 | BUG-1/BUG-2 window + reclaim | **PASS 2026-11-05:** RSS rose on initial buffer (52→72 MB) then fell back during playback (72→68→64→60 MB) — reclaim working, not pinned. 100 s (>65 s) Opus track played to completion with `state→stopped`. No `buffer cap exceeded`. `over rebuffer window` diagnostic present at start (edge-triggered). |
+| 4 | BUG-3 end-of-track | **PASS 2026-11-05:** 10 s Opus track reached end, `state` flipped `playing→stopped`, `position_sec` reset to 0. Near-end seek on a live track not separately exercised (covered by full-track completion). |
+| 5 | BUG-4 / G2 ceiling | **PASS 2026-11-05:** streamed YouTube track under `target_kbps=64` reported `target_kbps=64`, `actual_kbps=61`, `codec=opus` — ceiling honored on a *delivered* stream (not just resolved). Background `cache_next` under ceiling also honored (`next_cached=true`, played back at `actual_kbps=61`). `yt-dlp -F` on `dQw4w9WgXcQ`: max audio = 251 Opus 129 k (one direction; AAC-max direction not re-checked here). |
+| 6 | Finding #1 libopus on stock hosts | **PARTIAL 2026-11-05:** `readelf -d`/`ldd` clean on this Arch host — both the built alsa binary and the installed `/opt/l337-audio-server` (2026.11.03-1) resolve `libopus.so.0` (+ `libpipewire-0.3.so.0`), no "not found". Real install-from-scratch on a host *without* libopus (apt/dnf/pacman path) not executable here — no passwordless sudo. Installer dependency-check gate verified in code (`ensure_runtime_dependencies` fails loudly on unresolvable NEEDED). |
+| 7 | Finding #7 `CHUNK_FRAMES = 4096` | **NOT EXECUTED 2026-11-05:** built locally with `--no-default-features --features alsa,opus` (pipewire.pc/pulseaudio.pc unavailable, so the pulseaudio backend — where `CHUNK_FRAMES` lives — could not be built). Device re-check of pulseaudio write cadence not applicable to this alsa build. |
 | 8 | CI | `cargo test` has never run in CI — the whole suite (56 unit + 25 endpoint) is host-only |
 | 9 | Release | Merge `g1-opus-decode` → `main`; the monthly runner cuts official releases from `main`, so the Opus decode, BUG-1..4, the reader rebuild and the G3 streaming default are all invisible to users until it lands |
 | 10 | Finding #3 (shortcut, unchanged) | Whole-track file decode on the file path; upgrade path = incremental decode into the throttled producer |
@@ -1512,3 +1512,38 @@ cause is the process being frozen, not the work it does.
 each `pa_stream_write`; the ~5 s inter-write gap plus the engine's own silence across it is the
 signature. Instrumentation points: `src/platform/pulseaudio.rs` writer loop (lock/write/sleep
 timings) and `src/player/engine.rs` streaming loops (buffer dumps, rebuild timings).
+
+---
+
+## Session — 2026-11-05: Arch Linux host with live PipeWire sink
+
+**Host:** `tim-laptop-mi`, Arch Linux (7.3.1-1-cachyos, x86_64), PipeWire active (PulseAudio-compat
+socket at `/run/user/1002/pulse/native`), real ALSA sink
+`alsa_output.pci-...__Speaker__sink` RUNNING via PipeWire's ALSA plugin. `ytdl`/`yt-dlp` absent
+initially; fetched a standalone yt-dlp binary into `/tmp/l337iso`. `gh` not installed; no
+passwordless sudo (so root-gated installer-install and the piped-installs cannot be run here).
+
+**Binary under test:** built locally `CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/l337-build`
+release, `--no-default-features --features alsa,opus` → `bin/l337-audio-server` replacement at
+`/tmp/l337-build/release/l337-audio-server` (`0.0.0-dev`). Links `libopus.so.0`, `ldd` clean.
+In-repo `bin/l337-audio-server` is the stale Aug-24 build and was NOT used.
+
+**Method:** isolated instance on port 13370, private `TMPDIR`/`XDG_RUNTIME_DIR`/`STATE_DIRECTORY`,
+`L337__SERVER__TOKEN=dbgtkn123`, `RUST_LOG=l337_audio_server=debug`, `--transport=http`. Token
+auth verified; `/health`/`/version` answer; ALSA backend opened `plughw:0,5` at 48 kHz/2ch.
+
+Fixtures generated with ffmpeg: `test_opus_ogg.opus` (10 s), `test_opus_webm.webm` (10 s),
+`long_opus_ogg.opus` (100 s, Opus) + MP3/FLAC/WAV/M4A controls.
+
+| Item | Result |
+|---|---|
+| §1 `position_sec` advances on real sink | **PASS** — 10 s Opus track: `position_sec` 5→6→7→8→9 monotonic, no sawtooth/rewind (BUG-1 fixed), `codec=opus`, then `state→stopped` at end-of-track (BUG-3 fixed). |
+| §2 RSS reclaim | **PASS** — 100 s Opus track: RSS 52→72 MB on initial buffer, then fell back 72→68→64→60 MB during playback — reclaim working, not pinned. |
+| §3 backend error + try_recover | **LIMITED** — `pactl suspend-sink 64 1` did NOT raise an alsa backend_error (alsa writes to `plughw:0,5` directly); position kept advancing, `audio_available=true`, process did not abort (G5 consistent). try_recover via sink disturbance not exercisable with the alsa backend (pipewire.pc unavailable → pulseaudio backend not built). |
+| §4 YouTube ceiling | **PASS** — `target_kbps=64`, streamed YouTube Opus track reported `target_kbps=64`, `actual_kbps=61`, `codec=opus`, position advancing ~1×, fast time-to-first-sound (~6 s to position 9 on cold 213 s track — G3 confirmed). Background `cache_next` under ceiling honored (`next_cached=true`, played back at `actual_kbps=61`). |
+| Table item 1 (MKV wedge past 9 s) | **PASS** — `dQw4w9WgXcQ` (213 s Opus/251, froze at 9 s in `2026.11.03-1`): `position_sec` advanced continuously 19→30 over 20 s, `state=playing`, no freeze/rewind at old wedge point — 2026-11-05 re-probe fix confirmed on-device. |
+| Table item 7 (CHUNK_FRAMES=4096) | **NOT EXECUTED** — pulseaudio backend not built locally (no pipewire.pc/pulseaudio.pc). |
+
+**Limitations:** root-gated installer-install (apt/dnf/pacman libopus path) and any pulseaudio-backend
+device check could not be run here. The merged `g1-opus-decode` branch is not yet on `main`.
+
