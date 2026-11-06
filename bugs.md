@@ -1862,3 +1862,40 @@ suite 67/67 (64 + 3 new pacing tests).
   with the WRITE_GAP instrumentation if drops are heard on a stream.
 - The client-side sink-margin experiment (`pa_buffer_attr`) remains unviable: PulseAudio
   negotiated 43 ms regardless of the requested 4 s (see the 2026-11-06 note above).
+
+---
+
+## Session — 2026-11-06 (continued): default the Termux sink buffer to ~100 ms
+
+With the pacing fix in, the writer delivers at exactly 1x, but the sink's own
+buffer was still ~43 ms — anything longer than that reaches the speaker. PulseAudio
+*tunes the latency down* unless the stream asks for a specific one, and it overrides
+the request while `PA_STREAM_ADJUST_LATENCY` is set (which is why the earlier 4 s
+`buffer_attr` experiment negotiated 43 ms and sounded worse, not better).
+
+So the stream now requests its own latency (`c13b4bd`): `tlength` = 60 ms
+(negotiates **~86 ms** on this device — PulseAudio rounds up to the device's fragment
+size), `maxlength` = 2× so the backlog stays bounded (BUG-2's property), `prebuf = -1`
+so playback waits the target before the first sample, and `PA_STREAM_ADJUST_LATENCY`
+is dropped so the request survives.
+
+**Measured on device after the change:**
+- `pactl list sink-inputs` → `Buffer Latency: 85577 usec` (was 43 ms).
+- Start delay unchanged in practice: the `/player/play` request already blocks on the
+  file copy/decode (~1.0–1.6 s), and the first sample follows within ~6 ms of the
+  response, because the buffer fills during the decode.
+- Full 213 s tracks — local file and local-HTTP stream — **zero writer starvation
+  mid-track**; the only logged event remains the ~30 ms end-of-track drain tail, which
+  is inside the sink buffer and inaudible.
+
+Scope: `src/platform/pulseaudio.rs`, gated `#[cfg(all(target_os = "android",
+feature = "pulseaudio"))]` — the Termux path only. No other backend is affected.
+
+**Still open on this device:**
+- Real YouTube streaming could not be run to completion here (googlevideo throttles
+  the direct URL to a fraction of the playback rate, so the run is download-bound, not
+  writer-bound). The streaming path *is* verified drop-free against local HTTP with the
+  same code, but a long real-YouTube run with this build is still owed.
+- The ~5 s whole-process freezes (2026-11-05) were not observed in any of these
+  low-CPU release runs; if they reappear a >=86 ms sink buffer no longer covers them and
+  the wake lock becomes the remaining fix.
