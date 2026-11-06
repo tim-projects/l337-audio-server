@@ -1819,3 +1819,46 @@ error body.
 
 
 
+
+---
+
+## Session — 2026-11-06 (Termux device): the ~5 s drops were a PulseAudio pacing bug — FIXED
+
+**Symptom.** Occasional audible drops during playback, on local files and streams alike.
+
+**Method.** Local audio file (Rick Astley, 213 s Opus/251, downloaded with yt-dlp →
+`~/l337-live-verify/local-track.webm`) played through the installed release build, with the
+PulseAudio writer instrumented server-side to log (a) every starvation event while playing and
+(b) every inter-write gap above a threshold. Server-side logging was essential: client-side
+`position_sec` polling missed the sub-second drops entirely.
+
+**Evidence.** WRITE_GAPs of **85–86 ms on 60/60 consecutive writes** on a local-file playback —
+i.e. *every* write interval was 2× the audio duration. The sink's own buffer is ~43 ms
+(`pactl list sink-inputs` → `Buffer Latency: 42915 usec`), so writing 42.7 ms of audio every
+85 ms left it dry twice per chunk: continuous drops, not just "occasional".
+
+**Root cause.** `writer_loop` paced itself with the **shared buffer's** `channels` field, which is
+0 until the engine sets it and need not match the sample spec the stream was created with. A
+2-channel stream paced with a 1-channel assumption sleeps twice as long as the audio written. The
+reciprocal bug (buffer says 2 while the stream is 1) would have starved the *producer* instead.
+
+**Fix** (`6db3714`): `writer_loop` takes the `rate`/`channels` the stream was *created* with; the
+arithmetic moved to `pace_seconds()` with unit tests pinning the stereo case, the doubled-pace
+regression and the degenerate inputs; the starved-writer diagnostic is edge-triggered per episode
+(≥3 consecutive polls, ~30 ms — below the sink's own buffer, which is why one poll is not logged)
+so a real drop is reported once and the end-of-track tail does not add noise.
+
+**Verification.** Release build (optimized, `--no-default-features --features pulseaudio,opus`),
+local file, full 213 s track, twice: **4 write gaps of 61–66 ms** (normal `thread::sleep` jitter,
+vs 60/60 at 85–86 ms before), zero mid-track starvation, clean `state → stopped` at EOS. Rust
+suite 67/67 (64 + 3 new pacing tests).
+
+**Still open on this device:**
+- The **YouTube-streaming** path has not been re-measured with the fixed writer (the installed
+  release `2026.11.03-1` still carries the old wedge — it froze at 12 s in this session; the
+  streaming path with the fix needs a fresh release or a local build).
+- The **~5 s whole-process freezes** (2026-11-05 session) were not observed during these local-file
+  runs, but a low-CPU release build is exactly the case where they should be rarest; re-measure
+  with the WRITE_GAP instrumentation if drops are heard on a stream.
+- The client-side sink-margin experiment (`pa_buffer_attr`) remains unviable: PulseAudio
+  negotiated 43 ms regardless of the requested 4 s (see the 2026-11-06 note above).
