@@ -50,6 +50,12 @@ pub struct YouTubeError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdWarm {
+    Cold,
+    Warm,
+}
+
 impl std::fmt::Display for YouTubeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
@@ -144,6 +150,10 @@ pub struct PlayerEngine {
     /// Cached YouTube stream URL resolutions (key: `url|ceiling`). Avoids
     /// re-running yt-dlp on every play of the same URL.
     pub yt_dlp_cache: Arc<Mutex<HashMap<String, (ResolvedStream, std::time::Instant)>>>,
+    warmth: ColdWarm,
+    last_client_contact: std::time::Instant,
+    active_sessions: u32,
+    idle_grace: std::time::Duration,
 }
 
 impl PlayerEngine {
@@ -236,6 +246,10 @@ impl PlayerEngine {
                     .expect("failed to build reqwest client"),
             ),
             yt_dlp_cache: Arc::new(Mutex::new(HashMap::new())),
+            warmth: ColdWarm::Cold,
+            last_client_contact: std::time::Instant::now(),
+            active_sessions: 0,
+            idle_grace: std::time::Duration::from_secs(90),
         })
     }
 
@@ -275,6 +289,10 @@ impl PlayerEngine {
                     .expect("failed to build reqwest client"),
             ),
             yt_dlp_cache: Arc::new(Mutex::new(HashMap::new())),
+            warmth: ColdWarm::Cold,
+            last_client_contact: std::time::Instant::now(),
+            active_sessions: 0,
+            idle_grace: std::time::Duration::from_secs(90),
         }
     }
 
@@ -4061,5 +4079,77 @@ exit 1
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Warmth state helpers ──────────────────────────────────────────────────
+    impl PlayerEngine {
+        /// Update last_client_contact so the server stays warm while a player
+        /// is active/polling. Idempotent; cheap (lock + Instant::now).
+        pub fn touch(&mut self) {
+            let _ = self.active_sessions.saturating_add(1);
+            self.last_client_contact = std::time::Instant::now();
+            self.warmth = ColdWarm::Warm;
+        }
+
+        /// Increment active_sessions and warm. Called when a new player session
+        /// connects (via /player/session/connect).
+        pub fn warm_up(&mut self) {
+            self.active_sessions += 1;
+            self.warmth = ColdWarm::Warm;
+            self.last_client_contact = std::time::Instant::now();
+        }
+
+        /// Decrement active_sessions. Called when a player session ends
+        /// (via /player/session/disconnect).
+        pub fn cool_down(&mut self) {
+            self.active_sessions = self.active_sessions.saturating_sub(1);
+        }
+
+        /// Try to warm down: if stopped+idle for > idle_grace and no sessions,
+        /// // disconnect the PipeWire stream on the mainloop thread.
+        /// Returns true if warm-down was performed.
+        pub fn try_warm_down(&mut self, now: std::time::Instant) -> bool {
+            if self.active_sessions > 0 {
+                return false;
+            }
+            if self.state != PlayerStateLabel::Stopped {
+                return false;
+            }
+            if now - self.last_client_contact < self.idle_grace {
+                return false;
+            }
+            // Perform local state teardown (pause + clear buffer).
+            // The actual PipeWire disconnect is deferred to the mainloop thread
+            // via a channel send (see server reaper in main.rs).
+            if let Some(stream) = self.stream.as_mut() {
+                let _ = stream.pause();
+            }
+            {
+                let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                buf.pcm.clear();
+                buf.read_pos = 0;
+                buf.consumed_total = 0;
+                buf.backend_error.store(false, Ordering::SeqCst);
+            }
+            self.position_sec = 0;
+            self.state = PlayerStateLabel::Stopped;
+            self.warmth = ColdWarm::Cold;
+            return true;
+        }
+
+        /// Ensure the PipeWire stream is warmed (connected/active). Called at every
+        /// playback entry point and on explicit session connect. If already warm
+        /// returns immediately; if cold, starts/connects the stream and marks warm.
+        pub fn ensure_warm(&mut self) {
+            if self.warmth == ColdWarm::Warm {
+                return;
+            }
+            self.backend
+                .start_stream("l337-audio-server", 48000, 2, self.audio_buffer.clone(), self.volume.clone())
+                .ok();
+            self.warmth = ColdWarm::Warm;
+            self.last_client_contact = std::time::Instant::now();
+            self.active_sessions = 1;
+        }
     }
 }
