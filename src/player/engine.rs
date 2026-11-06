@@ -681,19 +681,21 @@ impl PlayerEngine {
             }
             streaming.decode_handle.abort();
         }
-        // Tear the backend stream down, not just pause it: a paused PulseAudio
-        // stream stays connected (the sink-input survives), and its writer keeps
-        // appending silence, so the sink-input's Buffer Latency grows to ~1000 s
-        // and only drains at 0.03x — the "9975 s backlog" of the original report,
-        // and a leaked sink-input that survived every `POST /player/stop`.
-        // Dropping the stream frees it; the next play reopens one.
-        if let Some(mut stream) = self.stream.take() {
-            stream.stop();
+        // Pause the backend stream instead of destroying it from the engine
+        // thread. PipeWire stream/mainloop objects are not safe to tear down
+        // from an arbitrary thread; dropping them here can trigger
+        // "called from wrong context" errors and leave the backend in an
+        // unrecoverable error state. Clearing the buffer stops output
+        // immediately; a backend error path still drops/recreates the stream
+        // via ensure_stream.
+        if let Some(stream) = self.stream.as_mut() {
+            stream.pause().ok();
         }
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm.clear();
         buf.read_pos = 0;
         buf.consumed_total = 0;
+        buf.backend_error.store(false, Ordering::SeqCst);
         drop(buf);
         self.position_sec = 0;
         self.state = PlayerStateLabel::Stopped;
@@ -705,6 +707,14 @@ impl PlayerEngine {
     /// with a full buffer would look like a rebuffer that never drains.
     fn ensure_stream(&mut self) {
         if self.stream.is_some() {
+            // Clear a stale backend-error flag so a recovered/reused stream
+            // can play. The PipeWire callback sets backend_error on terminal
+            // state changes; once we decide to (re)use a stream we must not
+            // let a stale flag block load_and_play/status.
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.backend_error.swap(false, Ordering::SeqCst) {
+                info!("ensure_stream: cleared stale backend_error on existing stream");
+            }
             return;
         }
         match self.backend.start_stream(
@@ -714,12 +724,15 @@ impl PlayerEngine {
             self.audio_buffer.clone(),
             self.volume.clone(),
         ) {
-            Ok(stream) => self.stream = Some(stream),
+            Ok(stream) => {
+                self.audio_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .backend_error
+                    .store(false, Ordering::SeqCst);
+                self.stream = Some(stream);
+            }
             Err(e) => {
-                // Surface the failure the same way a writer does: without this a
-                // failed restart leaves the buffer filling with no writer, which
-                // reads as `Playing` forever (decode never finishes, buffer never
-                // drains) instead of a visible stop.
                 error!("ensure_stream: backend start failed: {}", e);
                 self.audio_buffer
                     .lock()

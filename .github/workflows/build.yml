@@ -140,7 +140,7 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: "--features opus"
+            features: "--features backend,opus"
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
             features: "--no-default-features --features alsa,opus"
@@ -251,7 +251,7 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: "--features opus"
+            features: "--features backend,opus"
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
             features: "--no-default-features --features alsa,opus"

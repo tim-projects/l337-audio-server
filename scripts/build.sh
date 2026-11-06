@@ -65,12 +65,14 @@ fi
 # broken mount on some shared setups). Caller can override with --target-dir.
 export CARGO_TARGET_DIR="${TARGET_DIR_ARG:-/tmp/l337-build}"
 
-# When --no-audio is requested, disable the default `backend` feature so the
-# build does not require system audio libraries (PipeWire / CoreAudio / WASAPI).
+# When --no-audio is requested, build without an audio backend (noop).
+# Otherwise enable the platform `backend` feature so release binaries produce
+# sound (PipeWire on Linux, CoreAudio on macOS, WASAPI on Windows). ALSA builds
+# are handled by CI/explicit feature flags; this default matches desktop use.
 if [ "$NO_AUDIO" -eq 1 ]; then
     FEATURES="--no-default-features"
 else
-    FEATURES=""
+    FEATURES="--features backend"
 fi
 
 # If cargo is not on PATH, install a minimal toolchain into /tmp/cargo/.
