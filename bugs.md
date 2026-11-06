@@ -1497,6 +1497,38 @@ process far busier than a release build and likely widens the throttle windows. 
 CPU profile is much lower, so drops should be rarer with it — but they would still occur, because the
 cause is the process being frozen, not the work it does.
 
+### Follow-up experiment 2026-11-06: a client-side sink margin — FAILED, and why
+
+Tried mitigation (2) as an experiment: request a ~4 s sink buffer via
+`pa_buffer_attr` (`maxlength` = `tlength` = 4 s, `prebuf = 0`) and make the writer
+*write ahead* — fill that margin, then wait only as long as the surplus takes to
+drain — instead of the just-in-time wall-clock pacing. Result: **playback became
+very choppy**, immediately reverted (release binary restored, change discarded).
+
+Root cause, measured: `pactl list sink-inputs` shows **`Buffer Latency: 42915 usec`
+(~43 ms)** — PulseAudio *ignored the requested 4 s* and negotiated a 43 ms buffer.
+The writer's accounting assumed a 4 s reservoir existed, so it slept waiting for
+room that never arrived while the real 43 ms sink buffer ran dry every iteration.
+`PA_STREAM_ADJUST_LATENCY` (still set) explicitly permits the server to tune the
+latency down to whatever the device allows, which is what happened.
+
+Consequences for the next attempt:
+- Client-side `buffer_attr` cannot create the margin while `ADJUST_LATENCY` is set;
+  the server overrides it. Termux's PulseAudio simply does not give this stream more
+  than ~43 ms.
+- Drive any write-ahead from the **actual** latency — `pa_stream_get_latency()` *is*
+  exported by Termux's `libpulse.so` (`nm -D` confirmed), unlike the header-inline
+  `pa_stream_writable_size()` — so the writer can know the real free space instead
+  of assuming it. With a 43 ms ceiling that only absorbs ~43 ms freezes, which is
+  not enough for the ~5 s observed.
+- Therefore the margin has to come from the **daemon**, not the client: raise
+  Termux PulseAudio's default fragment/buffer latency (its config, e.g.
+  `default-fragment-size-msec` / `tsched-buffer-size-msec`) or drop
+  `ADJUST_LATENCY` and verify the negotiated `pa_stream_get_buffer_attr()` actually
+  grows. Until one of those is proven, mitigation (2) is not viable on this device
+  and mitigation (1) — a Termux wake lock for the service, so the process is not
+  suspended at all — is the only option that addresses the observed cause.
+
 **Mitigations — one needs choosing (not implemented):**
 1. **Hold a Termux partial wake lock for the service's lifetime** (`termux-wake-lock` before `exec` in
    the run script, `termux-wake-unlock` on exit; the installer writes that script). Keeps the app out
