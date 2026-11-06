@@ -38,38 +38,48 @@ detect_distro() {
         DISTRO_ID="${ID:-}"
         DISTRO_VERSION="${VERSION_ID:-}"
 
-        # ID_LIKE lists families; ID is the concrete distro. Check both.
-        local like="${ID_LIKE:-} ${ID:-}"
-        for fam in $like; do
-            case "$fam" in
-                debian|ubuntu|linuxmint|pop|pureos)
-                    DISTRO_FAMILY="debian"; break ;;
-                rhel|fedora|centos|rocky|almalinux|amzn)
-                    DISTRO_FAMILY="rhel"; break ;;
-                arch|manjaro|endeavouros)
-                    DISTRO_FAMILY="arch"; break ;;
+# ID_LIKE lists families; ID is the concrete distro. Check both.
+local like="${ID_LIKE:-} ${ID:-}"
+for fam in $like; do
+    case "$fam" in
+        debian|ubuntu|linuxmint|pop|pureos)
+            DISTRO_FAMILY="debian"; break ;;
+        rhel|fedora|centos|rocky|almalinux|amzn)
+            DISTRO_FAMILY="rhel"; break ;;
+        arch|manjaro|endeavouros|arcolinux)
+            DISTRO_FAMILY="arch"; break ;;
                 alpine)
                     DISTRO_FAMILY="alpine"; break ;;
+                gentoo)
+                    DISTRO_FAMILY="gentoo"; break ;;
+                void)
+                    DISTRO_FAMILY="void"; break ;;
+                nixos)
+                    DISTRO_FAMILY="nixos"; break ;;
             esac
         done
     fi
 
-    # Fallback: infer family from the package manager on PATH.
-    if [ -z "$DISTRO_FAMILY" ]; then
-        if command -v apt-get &>/dev/null; then
-            DISTRO_FAMILY="debian"
-        elif command -v dnf &>/dev/null; then
-            DISTRO_FAMILY="rhel"
-        elif command -v pacman &>/dev/null; then
-            DISTRO_FAMILY="arch"
-        elif command -v zypper &>/dev/null; then
-            DISTRO_FAMILY="rhel"
-        elif command -v apk &>/dev/null; then
-            DISTRO_FAMILY="alpine"
-        else
-            warn "Could not detect the distribution or package manager."
-            return 1
-        fi
+# Fallback: infer family from the package manager on PATH.
+if [ -z "$DISTRO_FAMILY" ]; then
+    if command -v apt-get &>/dev/null; then
+        DISTRO_FAMILY="debian"
+    elif command -v dnf &>/dev/null; then
+        DISTRO_FAMILY="rhel"
+    elif command -v pacman &>/dev/null; then
+        DISTRO_FAMILY="arch"
+    elif command -v zypper &>/dev/null; then
+        DISTRO_FAMILY="suse"
+    elif command -v apk &>/dev/null; then
+        DISTRO_FAMILY="alpine"
+    elif command -v emerge &>/dev/null; then
+        DISTRO_FAMILY="gentoo"
+    elif command -v xbps-install &>/dev/null; then
+        DISTRO_FAMILY="void"
+    else
+        warn "Could not detect the distribution or package manager."
+        return 1
+    fi
     fi
 }
 
@@ -78,13 +88,15 @@ detect_distro() {
 # ---------------------------------------------------------------------------
 
 # pkg_manager: print the first package-manager binary found on PATH.
-# Returns 1 if none of apt-get/dnf/pacman/zypper/apk are found.
+# Returns 1 if none of apt-get/dnf/pacman/zypper/apk/emerge/xbps-install are found.
 pkg_manager() {
     if command -v apt-get &>/dev/null; then echo "apt-get"
     elif command -v dnf &>/dev/null; then echo "dnf"
     elif command -v pacman &>/dev/null; then echo "pacman"
     elif command -v zypper &>/dev/null; then echo "zypper"
     elif command -v apk &>/dev/null; then echo "apk"
+    elif command -v emerge &>/dev/null; then echo "emerge"
+    elif command -v xbps-install &>/dev/null; then echo "xbps-install"
     else return 1
     fi
 }
