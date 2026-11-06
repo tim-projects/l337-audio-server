@@ -30,6 +30,17 @@ struct pa_sample_spec {
 
 const PA_SAMPLE_FLOAT32LE: c_int = 5;
 
+/// PulseAudio's pa_buffer_attr; field order and width must match the C ABI.
+/// `u32::MAX` in a field means "-1" to PulseAudio (use the default).
+#[repr(C)]
+struct pa_buffer_attr {
+    maxlength: u32,
+    tlength: u32,
+    prebuf: u32,
+    minreq: u32,
+    fragsize: i32,
+}
+
 // pa_context_state_t
 const PA_CONTEXT_READY: c_int = 4;
 // pa_stream_state_t
@@ -39,7 +50,19 @@ const PA_STREAM_FAILED: c_int = 3;
 // pa_stream_flags_t subset used for playback
 const PA_STREAM_INTERPOLATE_TIMING: u32 = 0x0002;
 const PA_STREAM_AUTO_TIMING_UPDATE: u32 = 0x0008;
-const PA_STREAM_ADJUST_LATENCY: u32 = 0x0100;
+
+/// Target sink-side buffer, in milliseconds.
+///
+/// A ~100 ms delay is inaudible for music and works like a jitter buffer: it
+/// absorbs short writer stalls (the device report of whole-process freezes,
+/// and ordinary scheduler jitter) that a just-in-time writer would otherwise
+/// pass straight to the sink as a drop. PulseAudio tunes this *down* to
+/// whatever the device allows unless the stream asks for a specific latency,
+/// and it overrides the request while PA_STREAM_ADJUST_LATENCY is set — so the
+/// request has to be explicit and that flag must go. maxlength stays bounded
+/// (see the buffer_attr below) so the backlog can never grow without limit
+/// (the BUG-2 property).
+const PULSE_SINK_TARGET_MSECS: u32 = 60;
 
 // pa_seek_mode_t
 const PA_SEEK_RELATIVE: c_int = 0;
@@ -445,11 +468,26 @@ impl AudioBackend for PulseAudioAudioBackend {
 
             pa_stream_set_state_callback(stream, Some(stream_state_cb), mainloop);
 
-            let flags = PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_ADJUST_LATENCY;
+            // Ask for the target latency rather than accepting the ~43 ms PA
+            // default, and without PA_STREAM_ADJUST_LATENCY PA keeps what we
+            // asked for. maxlength allows headroom for timing jitter but still
+            // bounds the backlog; prebuf = -1 lets PA use tlength, so playback
+            // waits the target delay before the first sample (a ~100 ms start,
+            // inaudible) and then keeps that margin full.
+            let bytes_per_msec = (sample_rate as u32 * channels as u32 * 4) / 1000;
+            let tlength = bytes_per_msec * PULSE_SINK_TARGET_MSECS;
+            let buffer_attr = pa_buffer_attr {
+                maxlength: tlength * 2,
+                tlength,
+                prebuf: u32::MAX,
+                minreq: u32::MAX,
+                fragsize: u32::MAX as i32,
+            };
+            let flags = PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE;
             if pa_stream_connect_playback(
                 stream,
                 std::ptr::null(),
-                std::ptr::null(),
+                &buffer_attr as *const pa_buffer_attr as *const c_void,
                 flags,
                 std::ptr::null(),
                 std::ptr::null_mut(),
