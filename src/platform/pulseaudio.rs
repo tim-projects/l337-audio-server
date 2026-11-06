@@ -202,16 +202,23 @@ pub struct PulseAudioAudioOutputStream {
 }
 
 impl PulseAudioAudioOutputStream {
-    fn writer_loop(state: Arc<PulseAudioState>) {
+    fn writer_loop(state: Arc<PulseAudioState>, rate: u32, channels: u16) {
+        // Consecutive starved polls during playback. One poll (~10 ms) is
+        // inside the sink's own buffer and inaudible; a sustained drain is a
+        // real drop, and this also skips the end-of-track tail (the writer
+        // drains the last samples for a poll or two before the state flips).
+        let starved_polls = std::sync::atomic::AtomicU32::new(0);
+        let starved_logged = std::sync::atomic::AtomicBool::new(false);
         const CHUNK_FRAMES: usize = 4096;
         let silence = vec![0u8; CHUNK_FRAMES * 4];
-        // Device clock for pacing (constant for the stream's life: 48000). The
-        // channel count is read per-iteration below because it is 0 until the
-        // engine sets it (playback start).
-        let rate = {
-            let b = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-            b.sample_rate.max(1)
-        };
+        // Pace from the parameters this stream was *created* with, never from the
+        // shared buffer: the buffer's `channels` is 0 before the engine fills it
+        // and can disagree with the negotiated sample spec. A 2026-11-06 device
+        // report traced audible drops to exactly that — a 2ch stream paced with
+        // a 1ch assumption wrote 42.7 ms of audio every 85 ms, so the sink's
+        // ~43 ms buffer ran dry twice per chunk.
+        let rate = rate.max(1);
+        let channels = channels.max(1);
 
         loop {
             if state.cancel.load(Ordering::Relaxed) || state.backend_error.load(Ordering::SeqCst) {
@@ -292,6 +299,19 @@ impl PulseAudioAudioOutputStream {
                     Ok(silence.len() / 4)
                 } else {
                     drop(buf);
+                    // Edge-triggered: the writer had nothing to write while
+                    // playback is running, so the sink's buffer ran dry. One
+                    // diagnostic per episode (a device report showed the pacing
+                    // reading the buffer's channel count and starving twice per
+                    // chunk; 60 lines/s made that invisible, one per episode
+                    // does not).
+                    let polls = starved_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if polls >= 3 && !starved_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            "audio writer starved while playing for ~{}ms: sink buffer ran dry",
+                            polls * 10
+                        );
+                    }
                     Ok(0)
                 }
             })();
@@ -303,13 +323,11 @@ impl PulseAudioAudioOutputStream {
 
             match outcome {
                 Ok(n) if n > 0 => {
+                    // Writing again ends any starvation episode.
+                    starved_polls.store(0, std::sync::atomic::Ordering::Relaxed);
+                    starved_logged.store(false, std::sync::atomic::Ordering::Relaxed);
                     // Pace to the device clock: read_pos now advances at ~1x (G4).
-                    // `n` is interleaved samples, so seconds = n / (channels * rate).
-                    let channels = {
-                        let b = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-                        b.channels.max(1) as f64
-                    };
-                    thread::sleep(Duration::from_secs_f64(n as f64 / (channels * rate as f64)));
+                    thread::sleep(Duration::from_secs_f64(pace_seconds(n, rate, channels)));
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
@@ -320,6 +338,17 @@ impl PulseAudioAudioOutputStream {
             }
         }
     }
+}
+
+
+/// How long the writer must sleep after writing *samples* interleaved samples,
+/// so the sink receives audio at exactly 1x. `channels`/`rate` must be the
+/// parameters the stream was created with: using a channel count that disagrees
+/// with the stream's sample spec scales the delivery rate — the 2026-11-06
+/// device report was a 2ch stream paced as mono, i.e. 85 ms sleeps for 42 ms
+/// chunks, and the sink's small buffer ran dry (continuous audible drops).
+fn pace_seconds(samples: usize, rate: u32, channels: u16) -> f64 {
+    samples as f64 / (rate.max(1) as f64 * channels.max(1) as f64)
 }
 
 impl AudioBackend for PulseAudioAudioBackend {
@@ -468,7 +497,7 @@ impl AudioBackend for PulseAudioAudioBackend {
 
             let state_clone = state.clone();
             let thread = thread::spawn(move || {
-                PulseAudioAudioOutputStream::writer_loop(state_clone);
+                PulseAudioAudioOutputStream::writer_loop(state_clone, sample_rate, channels);
             });
 
             Ok(Box::new(PulseAudioAudioOutputStream {
@@ -516,5 +545,38 @@ impl AudioOutputStream for PulseAudioAudioOutputStream {
 impl Drop for PulseAudioAudioOutputStream {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::pace_seconds;
+
+    #[test]
+    fn stereo_chunk_paces_to_its_real_duration() {
+        // CHUNK_FRAMES is 4096 *samples*; at 48 kHz stereo that is 2048 frames.
+        let secs = pace_seconds(4096, 48000, 2);
+        assert!(
+            (secs - 4096.0 / (48000.0 * 2.0)).abs() < 1e-9,
+            "pace must be samples over frames-per-second: {secs}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_channel_count_doubles_the_pace() {
+        // The device bug: pacing a 2ch stream as if it were mono sleeps twice
+        // as long as the audio written, so the sink starves every other chunk.
+        let correct = pace_seconds(4096, 48000, 2);
+        let wrong = pace_seconds(4096, 48000, 1);
+        assert!((wrong / correct - 2.0).abs() < 1e-9, "mono pacing must be 2x stereo");
+        assert!((0.085..0.086).contains(&wrong), "the observed 85 ms gap: {wrong}");
+    }
+
+    #[test]
+    fn mono_and_high_rates_stay_consistent() {
+        assert!((pace_seconds(48000, 48000, 1) - 1.0).abs() < 1e-9);
+        assert!((pace_seconds(96000, 48000, 1) - 2.0).abs() < 1e-9);
+        // Degenerate channel/rate values must not divide by zero.
+        assert!(pace_seconds(1024, 0, 0).is_finite());
     }
 }
