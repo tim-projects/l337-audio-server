@@ -407,7 +407,8 @@ async fn main() {
                 }
             }
         }
-    });
+        // Idle reaper: warm down the PipeWire stream if stopped+idle for > idle_grace
+});
 
     // Resolve the auth token: reuse configured value, else load/persist a stable
     // generated token so the client only needs to copy it once.
