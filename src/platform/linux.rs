@@ -7,7 +7,13 @@ struct SendSyncStream(pipewire::stream::StreamBox<'static>);
 unsafe impl Send for SendSyncStream {}
 unsafe impl Sync for SendSyncStream {}
 
-pub struct PipeWireAudioBackend;
+#[derive(Debug, Clone)]enum Command {    SetActive(bool),    Disconnect,}struct PipeWireCommandSender {    sender: pipewire::channel::Sender<Command>,}impl PipeWireCommandSender {    fn set_active(&self, active: bool) {
+        let _ = self.sender.send(Command::SetActive(active));
+    }
+    fn disconnect(&self) {
+        let _ = self.sender.send(Command::Disconnect);
+    }
+}pub struct PipeWireAudioBackend;
 
 pub struct PipeWireAudioOutputStream {
     playing: Arc<AtomicBool>,
