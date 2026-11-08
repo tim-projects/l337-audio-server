@@ -178,7 +178,7 @@ impl PlayerEngine {
         let backend: Box<dyn AudioBackend> = {
             #[cfg(all(target_os = "linux", feature = "backend"))]
             {
-                Box::new(crate::platform::linux::PipeWireAudioBackend)
+                Box::new(crate::platform::linux::PipeWireAudioBackend::default())
             }
             #[cfg(all(target_os = "linux", feature = "alsa", not(feature = "backend")))]
             {

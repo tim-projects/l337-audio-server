@@ -3,32 +3,37 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-struct SendSyncStream(pipewire::stream::StreamBox<'static>);
-unsafe impl Send for SendSyncStream {}
-unsafe impl Sync for SendSyncStream {}
+struct PipeWireInner {
+    main_loop_thread: Option<std::thread::JoinHandle<()>>,
+    cmd_sender: Option<pipewire::channel::Sender<Command>>,
+}
 
 #[derive(Debug, Clone)]
-enum Command {
+pub enum Command {
     SetActive(bool),
     Disconnect,
 }
-struct PipeWireCommandSender {
-    sender: pipewire::channel::Sender<Command>,
+
+pub struct PipeWireAudioBackend {
+    inner: Arc<Mutex<PipeWireInner>>,
 }
-impl PipeWireCommandSender {
-    fn set_active(&self, active: bool) {
-        let _ = self.sender.send(Command::SetActive(active));
-    }
-    fn disconnect(&self) {
-        let _ = self.sender.send(Command::Disconnect);
+
+impl Default for PipeWireAudioBackend {
+    fn default() -> Self {
+        Self { inner: Arc::new(Mutex::new(PipeWireInner::default())) }
     }
 }
-pub struct PipeWireAudioBackend;
 
 pub struct PipeWireAudioOutputStream {
     playing: Arc<AtomicBool>,
     backend_error: Arc<AtomicBool>,
-    _stream: Option<SendSyncStream>,
+    cmd: pipewire::channel::Sender<Command>,
+}
+
+impl Default for PipeWireInner {
+    fn default() -> Self {
+        Self { main_loop_thread: None, cmd_sender: None }
+    }
 }
 
 fn terminal_pw_state(new: &pipewire::stream::StreamState) -> bool {
@@ -262,7 +267,7 @@ impl AudioBackend for PipeWireAudioBackend {
             .map_err(|e| format!("Failed to activate PipeWire stream: {}", e))?;
         tracing::info!("PipeWire stream activated successfully");
 
-        let stream = unsafe {
+        let _stream = unsafe {
             std::mem::transmute::<
                 pipewire::stream::StreamBox<'_>,
                 pipewire::stream::StreamBox<'static>,
@@ -287,10 +292,11 @@ impl AudioBackend for PipeWireAudioBackend {
             main_loop_ptr.run();
         });
 
+        let (cmd_tx, _cmd_rx) = pipewire::channel::channel::<Command>();
         Ok(Box::new(PipeWireAudioOutputStream {
             playing,
             backend_error,
-            _stream: Some(SendSyncStream(stream)),
+            cmd: cmd_tx,
         }))
     }
 }
@@ -311,7 +317,7 @@ impl AudioOutputStream for PipeWireAudioOutputStream {
     fn stop(&mut self) {
         self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
-        self._stream = None;
+        let _ = self.cmd.send(Command::Disconnect);
     }
 }
 
