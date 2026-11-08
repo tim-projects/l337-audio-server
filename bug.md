@@ -1,50 +1,25 @@
 ## Bug Status Summary (as of 2026-11-08)
 
-### ✅ Fixed and Verified (5 items)
-1. **AAC divide-by-zero bug** ( §6 ): Fix applied in `src/player/engine.rs` clamping `channels.max(1)`. Validated end-to-end: AAC files now play 6s with no panic; WAV playback unchanged. Test files: `/mnt/data2/music-work/Rendered/120_K10_A.wav` (387KB WAV), `/mnt/data2/music-work/Rendered/90s_house_5.ogg` (2.2MB OGG). CI binary `l337-audio-server-x86_64-linux-alsa` (v2026.10.23-1) confirms: `AAC upload OK → AAC status: playing cur aac-ci dur 6`. ✅ Merge approved.
-
-2. **Rust loglevel from `server.ini`** ( §11 ): `loglevel` key loaded and takes precedence over crate default. Verified on-device (2026-11-01). ✅ Implemented.
-
-3. **Pipelinepro install runtime libs** ( §12 ): Installer now skips C runtime SONAMEs (`libc.so.6`, `libm.so.6`), refreshes `ldconfig` cache before checking, and probes via `ldconfig -p`. Simulation + verified on Debian host. ✅ Fixed (simulation verified; real host pending).
-
-4. **OGG/Vorbis (long-file) decode/playback deadlock / no audio, hung upload** (2026-11-08): `load_and_play` decoded incrementally before starting backend consumption; decoder throttled on `AudioBuffer::exceeds_window()` with `playing=false`, deadlocking for PCM larger than the rebuffer window. Fixed in `src/player/engine.rs` by starting `stream.play()`/`Playing` before incremental decode (metadata populated after decode; decode errors stop/clear). Rebuilt `bin/l337-audio-server` (`--features backend,opus`). `90s_house_5.ogg` plays audibly in normal PipeWire mode (user confirmed, ~10s sufficient); mpv comparator OK.
-
-5. **Socket-mode multi-server/startup hardening** (2026-11-08, `src/main.rs`): stale-socket handling no longer removes on ambiguous connect failures. `classify_socket`/`ensure_socket_path_clear` treat active listeners and protected/ambiguous paths (symlink/non-socket, `PermissionDenied`, other errors) as unsafe to remove; only confirmed stale socket nodes (`ConnectionRefused`/`NotFound` on connect) are removed. Bind failures are reported (no `expect`) and startup refuses to hijack/intercept. Note: the global single-instance lock still enforces one normal instance; `L337_RUNTIME_DIR` isolation intentionally allows separate runtimes/endpoints for tests/side-by-side runs.
-
-### 📋 Remaining / Pending
-- **Single-instance lock scope vs isolated runtimes (design note):** `InstanceLock` on Linux also locks `/tmp/l337-audio-server-runtime/instance.lock` for cross-TMPDIR detection, except when `L337_RUNTIME_DIR` is set (isolated mode locks only that runtime). Correct for normal mode; operators/tests wanting a fully separate instance should set `L337_RUNTIME_DIR` consistently (and use matching runtime dirs).
-- **§9b**: TUI not launched; `/auth/challenge` + `/auth/redeem` not tested live.
-- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.
-- **CI build matrix:** `.github/workflows/build.yml` already builds PipeWire/ALSA variants with appropriate system deps and uses `--no-default-features` where needed (e.g. Windows/ARMv7/RISC-V/minimal targets). The earlier “default features need `libpipewire-0.3-dev`” note is addressed in CI; keep as build documentation for local/default-feature builds only.
-- **Play-stream response latency / metadata timing:** `/player/play/stream` (pushed file path) starts audible output before decode completes, but the HTTP request still blocks until full decode completes (`play_pushed` awaits `load_and_play`). Metadata (`duration_sec`/`codec`/`actual_kbps`) appears after decode. Consider decoupled ack/progress if clients need a fast response.
-- **`--token` / token source clarity (minor):** `--token` prints the persisted token file path (same path logic as generated/persisted tokens) but runs before config/env resolution; if `L337__SERVER__TOKEN` or `[server] token` is configured, that configured token is authoritative at runtime. Document/adjust output if this confuses operators.
-
- 2026-11-08)
-
 ### ✅ Fixed and Verified
 1. **AAC divide-by-zero bug** ( §6 ): Fix applied in `src/player/engine.rs` clamping `channels.max(1)`. Validated end-to-end: AAC files now play 6s with no panic; WAV playback unchanged. ✅ Merge approved.
 
 2. **Rust loglevel from `server.ini`** ( §11 ): `loglevel` key loaded and takes precedence over crate default. Verified on-device (2026-11-01). ✅ Implemented.
 
-3. **Pipelinepro install libs** ( §12 ): Installer now skips C runtime SONAMEs (`libc.so.6`, `libm.so.6`) refreshes `ldcache` before checking, and probes via `ldconfig -p`. Simulation + verified on Debian host. ✅ Fixed (simulation verified; real host pending).
+3. **Pipelinepro install runtime libs** ( §12 ): Installer now skips C runtime SONAMEs (`libc.so.6`, `libm.so.6`), refreshes `ldconfig` cache before checking, and probes via `ldconfig -p`. Simulation + verified on Debian host. ✅ Fixed (simulation verified; real host pending).
 
-### 🟡 In Progress / Investigating
-1. **OGG/OPUS no-audio bug** ( §7 ): **confirmed reproducible in normal mode with sound card** (historical). `.ogg` files report `state: playing` but produce **no audio output** through speakers. Investigation needed in `opus.rs`, `engine.rs`, and audio output backends.
+4. **PipeWire backend stream errors / WAV silent** (2026-11-08, `src/platform/linux.rs`): refactor `9deda51` left the PipeWire stream/main loop/command receiver miswired and dropped, producing `Connecting -> Unconnected` and no audible output despite `state: playing`. Fixed by keeping main loop/context/core/stream/listener alive on the thread, routing commands via `pipewire::channel` attached to the main loop, and treating only `StreamState::Error` as terminal. Stream transitions `Connecting -> Paused -> Streaming`; WAV `120_K10_A.wav` audible in normal PipeWire mode (user confirmed). Rebuild: `--features backend,opus`. ✅ Fixed/verified.
 
-2. **NEW — PipeWire backend stream errors / WAV silent (2026-11-08, blocks OGG repro):** `--features backend,opus` build, normal mode (`--transport=socket`, no `--dummy`, `PIPEWIRE_RUNTIME_DIR=/run/user/1002`). PipeWire connects but logs repeated `PipeWire stream entered error state: Connecting -> Unconnected`. WAV upload plays by API (`state: playing`, `audio_available: true`) but **no audible output** (user confirmed); `wpctl` shows l337 clients with **no active playback stream under Streams** to Speaker. Both WAV/OGG silent in this setup until PipeWire stream path is fixed. Likely: `src/platform/linux.rs` stream state/linking/target handling.
+5. **OGG/Vorbis (long-file) decode/playback deadlock / no audio, hung upload** (2026-11-08, `src/player/engine.rs`): `load_and_play` decoded incrementally before starting backend consumption; with `playing=false` the callback consumed no PCM and the decoder throttled on `AudioBuffer::exceeds_window()` (default ~24 MiB rebuffer window), deadlocking for decoded PCM larger than the window. Fixed by starting `stream.play()`/`Playing` before incremental decode (metadata populated after decode; decode errors stop/clear). `90s_house_5.ogg` (Ogg Vorbis, 44100 Hz stereo, 4:21, ~87.8 MiB decoded) plays audibly in normal PipeWire mode (user confirmed, ~10s sufficient); WAV baseline still OK; mpv comparator OK. ✅ Fixed/verified.
 
-3. **Lower-severity issues** ( §7 ):
-   - Stale binary in repo → binary replaced in CI but should be documented
-   - Single-instance lock path uses privileged path → needs `runtime_dir()` fix
-   - `token_file_path()` vs env token → minor assertion update
+6. **Socket-mode multi-server/startup hardening** (2026-11-08, `src/main.rs`): stale-socket handling no longer removes on ambiguous/protected failures. `classify_socket`/`ensure_socket_path_clear` treat active listeners and protected/ambiguous paths (symlink/non-socket, `PermissionDenied`, other errors) as unsafe to remove; only confirmed stale socket nodes (`ConnectionRefused`/`NotFound` on connect) are removed. Bind failures are reported cleanly (no panic). Added per-socket advisory lock (`<socket>.sock.lock`, held for process lifetime) so isolated lock scopes cannot serve the same Unix socket path. ✅ Fixed.
 
 ### 📋 Remaining / Pending
-- **§9b**: TUI not launched; `/auth/challenge` + `/auth/redeem` not tested live
-- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect
-
----
-
-# bug.md — Audio Server End-to-End Verification
+- **Single-instance lock scope vs isolated runtimes (design note):** `InstanceLock` on Linux also locks `/tmp/l337-audio-server-runtime/instance.lock` for cross-TMPDIR detection, except when `L337_RUNTIME_DIR` is set (isolated mode locks only that runtime). Correct for normal mode; operators/tests wanting a fully separate instance should set `L337_RUNTIME_DIR` consistently (and use matching runtime dirs). Per-socket lock now protects the same socket path regardless of lock scope.
+- **§9b**: TUI not launched; `/auth/challenge` + `/auth/redeem` not tested live.
+- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.
+- **CI build matrix:** `.github/workflows/build.yml` already builds PipeWire/ALSA variants with appropriate system deps and uses `--no-default-features` where needed (e.g. Windows/ARMv7/RISC-V/minimal targets). Addressed in CI; keep as build documentation for local/default-feature builds only.
+- **Play-stream response latency / metadata timing:** `/player/play/stream` (pushed file path) starts audible output before decode completes, but the HTTP request still blocks until full decode completes (`play_pushed` awaits `load_and_play`). Metadata (`duration_sec`/`codec`/`actual_kbps`) appears after decode. Consider decoupled ack/progress if clients need a fast response.
+- **`--token` / token source clarity (minor):** `--token` prints the persisted token file path (same path logic as generated/persisted tokens) but runs before config/env resolution; if `L337__SERVER__TOKEN` or `[server] token` is configured, that configured token is authoritative at runtime. Document/adjust output if this confuses operators.
 
 > **Executive summary:** The player → (Unix socket) → local audio server connection and playback
 > flow **works end-to-end** against a running dummy-mode server. **One critical bug was found and
