@@ -30,8 +30,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f)                 FORCE=true; shift ;;
+        --uninstall|-u)
+            UNINSTALL_REQUESTED=true
+            shift ;;
+        --pipewire-user)
+            FORWARD_ARGS+=("--pipewire-user")
+            shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ..."
+            echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall"
             echo ""
             echo "Resolves the newest GitHub release that publishes a binary for this"
             echo "platform, downloads it, and runs the platform installer on it."
@@ -43,12 +49,15 @@ while [ $# -gt 0 ]; do
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
             echo "--pre-release and --force are not forwarded to the platform installer."
-            echo "All other options (--dry-run, --group, --no-audio, --user, --prefix,"
-            echo "--uninstall, --remove-data, ...) are forwarded unchanged."
+            echo "  --uninstall, -u     Uninstall (runs before install; other flags ignored)"
+            echo "Install-only options (--dry-run, --no-audio, --user, --prefix, --pipewire-user [legacy]) are ignored with --uninstall."
             exit 0 ;;
         *) FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
+
+# (uninstall handler moved after platform detection)
+
 
 # --- Platform detection ---
 OS="$(uname -s)"
@@ -120,6 +129,31 @@ else
     fail "Unsupported OS: $OS"
 fi
 
+# Uninstall runs before the install path. Only `--uninstall`/`-u` triggers it;
+# all other flags are ignored so `install.sh --uninstall <anything>` uninstalls.
+if [ "$UNINSTALL_REQUESTED" = true ]; then
+    SCRIPT_TAG="${SCRIPT_TAG:-main}"
+    SCRIPT_PATH=""
+    script_dir="$(dirname "$0")"
+    if [ -n "$script_dir" ] && [ -f "$script_dir/scripts/${SCRIPT_NAME}.sh" ] \
+       && [ -f "$script_dir/scripts/lib-distro.sh" ]; then
+        SCRIPT_PATH="$script_dir/scripts/${SCRIPT_NAME}.sh"
+        export SCRIPT_DIR="$script_dir/scripts"
+    fi
+    if [ -z "$SCRIPT_PATH" ]; then
+        SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${SCRIPT_TAG}/scripts/${SCRIPT_NAME}.sh"
+        SCRIPT_PATH=$(mktemp -t "l337-${SCRIPT_NAME}.XXXXXXXX")
+        info "Downloading ${SCRIPT_NAME} (${SCRIPT_TAG})..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$SCRIPT_PATH" "$SCRIPT_URL" 2>/dev/null; then
+            rm -f "$SCRIPT_PATH"
+            fail "Failed to download uninstall script from $SCRIPT_URL"
+        fi
+        chmod 755 "$SCRIPT_PATH"
+    fi
+    info "Running ${SCRIPT_NAME}.sh --uninstall"
+    exec bash "$SCRIPT_PATH" --uninstall
+fi
+
 # --- Version helpers (CalVer-style: date-N, e.g. 2026.10.29-7) ---
 version_gt() {
     local a="$1" b="$2"
@@ -187,7 +221,9 @@ if [ "$OS_TYPE" = "linux" ]; then
     fi
 fi
 
-# --- GitHub release lookup, shared by the install path and the uninstall path ---
+# --- GitHub release lookup ---
+# Primary: REST API (fast). Fallback: curl-only github.com endpoints (slower, no
+# api.github.com) when the API returns 403 (rate limit/forbidden).
 # Flatten the releases API payload into one line per published asset:
 #   <tag> <prerelease:0|1> <asset filename> <browser download url>
 # Every filename comes from the asset's own "name" field and every URL from its
@@ -209,7 +245,9 @@ release_rows() {
     ' "$1"
 }
 
-fetch_release_rows() {
+# Returns 0 + rows on stdout for HTTP 200; returns 43 on HTTP 403 (caller should
+# use slower curl-only fallback); otherwise fails.
+fetch_release_rows_api() {
     local response http_code message
 
     response=$(mktemp "${TMPDIR:-/tmp}/l337-release.XXXXXX") || \
@@ -224,6 +262,14 @@ fetch_release_rows() {
         fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
     }
 
+    if [ "$http_code" = "403" ]; then
+        message=$(grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$response" \
+            | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
+        rm -f "$response"
+        warn "GitHub API HTTP 403${message:+ ($message)} — retrying with slower curl-only method (no api.github.com)"
+        return 43
+    fi
+
     if [ "$http_code" != "200" ]; then
         message=$(grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$response" \
             | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
@@ -233,6 +279,44 @@ fetch_release_rows() {
 
     release_rows "$response"
     rm -f "$response"
+}
+
+# --- curl-only fallback (no api.github.com) ---
+fetch_tags_web() {
+    local atom http
+    atom=$(mktemp "${TMPDIR:-/tmp}/l337-atom.XXXXXX") || fail "mktemp failed"
+    http=$(curl -sS -L --connect-timeout 15 --max-time 60 -o "$atom" -w '%{http_code}' \
+        "https://github.com/${REPO}/releases.atom") || { rm -f "$atom"; fail "Failed to fetch releases.atom"; }
+    if [ "$http" != "200" ]; then
+        rm -f "$atom"
+        fail "releases.atom HTTP $http"
+    fi
+    grep -oE '/releases/tag/[^"<]+' "$atom" | sed 's#.*/releases/tag/##' | awk '!seen[$0]++'
+    rm -f "$atom"
+}
+
+is_prerelease_tag_web() {
+    local tag="$1" page http
+    page=$(mktemp "${TMPDIR:-/tmp}/l337-tag.XXXXXX") || return 1
+    http=$(curl -sS -L --connect-timeout 15 --max-time 30 -o "$page" -w '%{http_code}' \
+        "https://github.com/${REPO}/releases/tag/${tag}") || { rm -f "$page"; return 1; }
+    if [ "$http" != "200" ]; then rm -f "$page"; return 1; fi
+    if grep -qiE 'Pre-release|Label--warning[^>]*>[^<]*Pre|class="[^"]*prerelease' "$page"; then
+        rm -f "$page"; return 0
+    fi
+    rm -f "$page"; return 1
+}
+
+tag_has_asset_web() {
+    local tag="$1" asset="$2" html http
+    html=$(mktemp "${TMPDIR:-/tmp}/l337-assets.XXXXXX") || return 1
+    http=$(curl -sS -L --connect-timeout 15 --max-time 60 -o "$html" -w '%{http_code}' \
+        "https://github.com/${REPO}/releases/expanded_assets/${tag}") || { rm -f "$html"; return 1; }
+    if [ "$http" != "200" ]; then rm -f "$html"; return 1; fi
+    if grep -qF "/releases/download/${tag}/${asset}" "$html"; then
+        rm -f "$html"; return 0
+    fi
+    rm -f "$html"; return 1
 }
 
 # The glibc a release-info.json requires for asset $1, "none" when the asset
@@ -278,22 +362,25 @@ release_info_checksum() {
         | sed 's/.*:[[:space:]]*//; s/^"//; s/,$//; s/"$//'
 }
 
-# Walk releases newest-first and resolve the newest one that is installable
-# here: it must publish ${BINARY_ASSET}, and on glibc platforms its own
-# release-info.json must record a glibc the running libc can satisfy. A release
-# without our asset, one whose manifest does not list it, and one needing a
-# newer glibc are all skipped instead of producing a 404 or a binary that
-# cannot start. Sets TAG and DOWNLOAD_URL; returns 1 when nothing fits.
-resolve_installable_release() {
-    local rows tag pre name url info_url info_file req
-
-    rows=$(fetch_release_rows)
+resolve_installable_release_api() {
+    local rows tag pre name url info_url info_file req rows_rc
 
     TAG=""
     DOWNLOAD_URL=""
     SELECTED_MD5=""
     SELECTED_CRC32=""
     SELECTED_SIZE=""
+
+    set +e
+    rows=$(fetch_release_rows_api)
+    rows_rc=$?
+    set -e
+    if [ "$rows_rc" -eq 43 ]; then
+        return 43
+    fi
+    if [ "$rows_rc" -ne 0 ]; then
+        return "$rows_rc"
+    fi
 
     while IFS=$'\t' read -r tag pre name url; do
         # --pre-release walks prereleases newest-first; a plain install walks
@@ -336,32 +423,80 @@ resolve_installable_release() {
         DOWNLOAD_URL="$url"
         break
     done <<<"$rows"
+    [ -n "$TAG" ]
 }
 
-# --- Uninstall: the platform installer needs no binary or release ---
-if [ "$UNINSTALL_REQUESTED" = true ]; then
-    SCRIPT_PATH=""
-    # Only a real checkout is trusted as a local script (see the note on the
-    # install path below); otherwise fetch the installer from main, which is
-    # always the newest code and needs no release resolution at all.
-    script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
-    if [ -n "$script_dir" ] && [ -f "$script_dir/scripts/${SCRIPT_NAME}.sh" ] \
-       && [ -d "$script_dir/.git" ]; then
-        SCRIPT_PATH="$script_dir/scripts/${SCRIPT_NAME}.sh"
-    else
-        SCRIPT_TAG="main"
-        SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${SCRIPT_TAG}/scripts/${SCRIPT_NAME}.sh"
-        SCRIPT_PATH=$(mktemp "${TMPDIR:-/tmp}/l337-install.XXXXXX") || \
-            fail "Could not create a temporary file for the installer script."
-        if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$SCRIPT_PATH" "$SCRIPT_URL"; then
-            rm -f "$SCRIPT_PATH"
-            fail "Failed to download uninstall script from $SCRIPT_URL"
+resolve_installable_release_web() {
+    local tag http info_file req
+
+    TAG=""
+    DOWNLOAD_URL=""
+    SELECTED_MD5=""
+    SELECTED_CRC32=""
+    SELECTED_SIZE=""
+
+    info "Resolving release via curl-only github.com method (slower, no api.github.com)..."
+    while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
+        if [ "$INSTALL_PRERELEASE" = true ]; then
+            is_prerelease_tag_web "$tag" || { info "skip $tag (not prerelease)"; continue; }
+        else
+            if is_prerelease_tag_web "$tag"; then
+                info "skip $tag (prerelease)"
+                continue
+            fi
         fi
-        chmod +x "$SCRIPT_PATH"
+
+        tag_has_asset_web "$tag" "$BINARY_ASSET" || { info "skip $tag (no $BINARY_ASSET)"; continue; }
+        tag_has_asset_web "$tag" "release-info.json" || { info "skip $tag (no release-info.json)"; continue; }
+
+        info_file=$(mktemp "${TMPDIR:-/tmp}/l337-info.XXXXXX") || continue
+        http=$(curl -sS -L --connect-timeout 15 --max-time 30 -o "$info_file" -w '%{http_code}' \
+            "https://github.com/${REPO}/releases/download/${tag}/release-info.json") || { rm -f "$info_file"; continue; }
+        if [ "$http" != "200" ]; then
+            rm -f "$info_file"
+            info "skip $tag (release-info.json HTTP $http)"
+            continue
+        fi
+
+        req=$(release_info_glibc "$info_file" "$BINARY_ASSET") || { rm -f "$info_file"; info "skip $tag (asset not in manifest)"; continue; }
+        SELECTED_MD5=$(release_info_checksum "$info_file" "$BINARY_ASSET" md5 || true)
+        SELECTED_CRC32=$(release_info_checksum "$info_file" "$BINARY_ASSET" crc32 || true)
+        SELECTED_SIZE=$(release_info_checksum "$info_file" "$BINARY_ASSET" size || true)
+        rm -f "$info_file"
+
+        if [ "$req" != "none" ] && [ -n "$SYSTEM_GLIBC" ] \
+           && version_lt "${SYSTEM_GLIBC%%-*}" "${req%%-*}"; then
+            info "skip $tag (needs glibc $req, have $SYSTEM_GLIBC)"
+            continue
+        fi
+
+        TAG="$tag"
+        DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${tag}/${BINARY_ASSET}"
+        break
+    done < <(fetch_tags_web)
+    [ -n "$TAG" ]
+}
+
+# Try REST API first (fast). On HTTP 403 (rate limit/forbidden), fall back to
+# the slower curl-only github.com method. Returns 1 when nothing fits.
+resolve_installable_release() {
+    local rc
+    set +e
+    resolve_installable_release_api
+    rc=$?
+    set -e
+    if [ "$rc" -eq 43 ]; then
+        resolve_installable_release_web
+        return $?
     fi
-    info "Uninstall requested — using installer script: ${SCRIPT_PATH}"
-    exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
-fi
+    if [ "$rc" -eq 0 ]; then
+        [ -n "$TAG" ] && return 0
+        return 1
+    fi
+    return 1
+}
+
 
 # --- Resolve the release to install ---
 if ! resolve_installable_release; then

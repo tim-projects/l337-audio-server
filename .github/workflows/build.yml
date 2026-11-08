@@ -678,7 +678,7 @@ jobs:
     - name: Syntax-check the bash installers
       run: |
         for s in install.sh scripts/install-android-termux.sh scripts/install-linux-alsa.sh \
-                 scripts/install-linux-pipewire.sh scripts/lib-distro.sh scripts/install-macos.sh scripts/install-systemd.sh; do
+                 scripts/install-linux-pipewire.sh scripts/lib-distro.sh scripts/install-macos.sh; do
           bash -n "$s" && echo "ok: $s"
         done
     - name: Parse install.ps1

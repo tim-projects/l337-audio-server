@@ -2,7 +2,7 @@
 # lib-distro.sh — Shared library for distro-aware package installation.
 #
 # Sourced by the Linux installer scripts (install-linux-alsa.sh,
-# install-linux-pipewire.sh, install-systemd.sh) to centralize:
+# install-linux-pipewire.sh, install-linux-alsa.sh) to centralize:
 #   - distro detection from /etc/os-release
 #   - package-manager discovery (apt-get / dnf / pacman / zypper / apk)
 #   - package-name mapping for base tools and shared libraries

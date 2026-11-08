@@ -40,7 +40,7 @@ warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
 
 # Stop every running instance of the server before the binary is replaced, the
-# way scripts/install-systemd.sh stops its unit before deploying. Two things
+# way the Linux installers stop the service before deploying. Two things
 # can be running: the termux-services (runit) service and a manually started
 # process. A survivor keeps the Unix socket actively listening, and the new
 # binary refuses to remove/rebind it and exits — so an update appears to do

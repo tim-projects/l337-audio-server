@@ -251,17 +251,17 @@ while [ $# -gt 0 ]; do
 Usage: $0 [OPTIONS] --binary <path>
 
 Linux PipeWire installer for L337 Audio Server.
-Installs a downloaded binary as systemd user services for every user with an
-active PipeWire session. Release lookup, the version check and the download
-itself live in install.sh, which resolves the newest release that ships a
-PipeWire binary for this platform and passes --binary here.
+Installs a downloaded binary as a systemd user service for the dedicated
+PipeWire user (default: l337). Per-login-user installs are intentionally disabled.
+Release lookup/download live in install.sh.
+
 
 Options:
   --binary <path>        Binary to install (required for install; passed by install.sh)
   --release <tag>        Release tag the binary came from (informational)
   --dry-run              Show what would happen without making changes
   --no-install-deps      Do not auto-install missing base tools and audio libraries
-  --user <username>      Install for a specific user only (default: all PipeWire users)
+  --user <username>      Legacy: install user service for this user (default: $USER_NAME only)
   --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
@@ -297,12 +297,16 @@ info "Platform: $OS_TYPE / $ARCH_TYPE"
 # ---------------------------------------------------------------------------
 # User detection
 # ---------------------------------------------------------------------------
-get_all_login_users() {
-    while IFS=: read -r username _ uid _ _ home _; do
-        if [ "$uid" -ge 1000 ] 2>/dev/null && [ -n "$home" ]; then
-            echo "$username"
-        fi
-    done < /etc/passwd
+# L337 should run as a single dedicated service user (`l337`), never as
+# arbitrary login users. The legacy behavior (install a systemd --user unit
+# for every login user with an active PipeWire session) caused multiple
+# servers/runtimes and is intentionally removed.
+resolve_target_users() {
+    if [ -n "$TARGET_USER" ]; then
+        echo "$TARGET_USER"
+        return 0
+    fi
+    echo "$USER_NAME"
 }
 
 user_has_pipewire() {
@@ -502,11 +506,19 @@ EOF
 # Uninstall (multi-user)
 # ---------------------------------------------------------------------------
 uninstall_user_service() {
-    info "Uninstalling systemd user services..."
+    info "Uninstalling systemd user services (dedicated $USER_NAME user + legacy per-user cleanup)..."
 
     local binary_path="${INSTALL_DIR}/l337-audio-server"
     local any_installed=false
-    while IFS= read -r user; do
+    local users=("$USER_NAME")
+    if [ -r /etc/passwd ]; then
+        while IFS=: read -r username _ uid _ _ _ _; do
+            if [ "$uid" -ge 1000 ] 2>/dev/null && [ "$username" != "$USER_NAME" ]; then
+                users+=("$username")
+            fi
+        done < /etc/passwd
+    fi
+    for user in "${users[@]}"; do
         local real_home
         real_home=$(eval echo "~${user}")
         local xdg_env
@@ -548,7 +560,7 @@ uninstall_user_service() {
             warn "User data retained for $user:"
             warn "  $user_config_dir"
         fi
-    done < <(get_all_login_users)
+    done
 
     if [ "$any_installed" = false ]; then
         warn "No user services found"
@@ -637,22 +649,14 @@ if [ -n "$TARGET_USER" ]; then
     fi
     setup_systemd_user "$BINARY_INPUT" "$TARGET_USER"
 else
-    info "Scanning for PipeWire users..."
-    pw_users=()
-    while IFS= read -r user; do
-        if user_has_pipewire "$user"; then
-            pw_users+=("$user")
-        fi
-    done < <(get_all_login_users)
-
-    if [ "${#pw_users[@]}" -eq 0 ]; then
-        fail "No users with active PipeWire sessions found. Start PipeWire or use install-linux-alsa.sh for ALSA."
+    # Single dedicated service user only. Do not install per-login-user units.
+    if ! id "$USER_NAME" &>/dev/null; then
+        fail "Dedicated service user '$USER_NAME' does not exist. Run install.sh (recommended) or create '$USER_NAME' first."
     fi
-
-    info "Found ${#pw_users[@]} PipeWire user(s): ${pw_users[*]}"
-    for user in "${pw_users[@]}"; do
-        setup_systemd_user "$BINARY_INPUT" "$user"
-    done
+    if ! user_has_pipewire "$USER_NAME"; then
+        warn "User $USER_NAME does not appear to have an active PipeWire session; continuing (service may require PipeWire access)."
+    fi
+    setup_systemd_user "$BINARY_INPUT" "$USER_NAME"
 fi
 
 # The binary was downloaded into TMPDIR by install.sh: drop it once it is
