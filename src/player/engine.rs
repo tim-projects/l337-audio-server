@@ -650,6 +650,27 @@ impl PlayerEngine {
             }
         };
 
+        // Start the backend consuming before incremental decode. The decoder
+        // throttles on AudioBuffer::exceeds_window() and blocks on space_notify;
+        // if playback is not active the PipeWire/ALSA callback never consumes
+        // PCM, so a file whose decoded output exceeds the rebuffer window (any
+        // track longer than ~20s at stereo 44.1kHz f32) deadlocks the decode
+        // and the play request never completes. Starting output here lets the
+        // callback drain the window while decode fills it (brief leading
+        // silence until the first chunks arrive is acceptable).
+        self.duration_sec = None;
+        self.codec_label = None;
+        self.actual_kbps = None;
+        self.position_sec = 0;
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(e) = stream.play() {
+                error!("load_and_play: stream.play failed: {}", e);
+                self.state = PlayerStateLabel::Stopped;
+                return;
+            }
+        }
+        self.state = PlayerStateLabel::Playing;
+
         // OPT-13: decode incrementally into the audio buffer instead of
         // allocating the whole decoded PCM at once (peak RSS ~ compressed
         // size x 2-2.5 for hour-long tracks).
@@ -663,6 +684,8 @@ impl PlayerEngine {
                         path.display(),
                         e
                     );
+                    // Leave playback stopped/empty on decode failure.
+                    self.stop();
                     return;
                 }
             };
@@ -687,16 +710,9 @@ impl PlayerEngine {
         buf.pitch = self.pitch;
         drop(buf);
 
-        if let Some(stream) = self.stream.as_mut() {
-            if let Err(e) = stream.play() {
-                error!("load_and_play: stream.play failed: {}", e);
-            }
-        }
-
-        self.position_sec = 0;
-        self.state = PlayerStateLabel::Playing;
+        // Playback was started before decode; keep state Playing.
         info!(
-            "load_and_play({}): Playing (duration {:?}s)",
+            "load_and_play({}): Playing (decode complete, duration {:?}s)",
             slot, self.duration_sec
         );
     }
@@ -1377,7 +1393,7 @@ pub(crate) fn decode_to_pcm(
             }
             pcm.extend(opus_dec.push(packet.buf()));
         }
-        return Ok((pcm, 48000, head.channels, Some("opus".to_string())));
+        return Ok((pcm, 48000, head.channels.max(1), Some("opus".to_string())));
     }
 
     tracing::info!(?codec_params, codec_id = ?codec_params.codec, "decode_to_pcm: probing result");
@@ -1502,7 +1518,7 @@ fn decode_file_incremental_blocking(
             .ok_or("Opus track missing OpusHead sideband")?;
         {
             let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            ab.channels = head.channels;
+            ab.channels = head.channels.max(1);
             ab.file_sample_rate = 48000;
         }
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
@@ -3057,7 +3073,7 @@ fn streaming_decode_sync(
             .ok_or("Opus track missing OpusHead sideband")?;
         {
             let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            ab.channels = head.channels;
+            ab.channels = head.channels.max(1);
             ab.file_sample_rate = 48000;
         }
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;

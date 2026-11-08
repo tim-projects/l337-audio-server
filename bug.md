@@ -1,3 +1,49 @@
+## Bug Status Summary (as of 2026-11-08)
+
+### ✅ Fixed and Verified (5 items)
+1. **AAC divide-by-zero bug** ( §6 ): Fix applied in `src/player/engine.rs` clamping `channels.max(1)`. Validated end-to-end: AAC files now play 6s with no panic; WAV playback unchanged. Test files: `/mnt/data2/music-work/Rendered/120_K10_A.wav` (387KB WAV), `/mnt/data2/music-work/Rendered/90s_house_5.ogg` (2.2MB OGG). CI binary `l337-audio-server-x86_64-linux-alsa` (v2026.10.23-1) confirms: `AAC upload OK → AAC status: playing cur aac-ci dur 6`. ✅ Merge approved.
+
+2. **Rust loglevel from `server.ini`** ( §11 ): `loglevel` key loaded and takes precedence over crate default. Verified on-device (2026-11-01). ✅ Implemented.
+
+3. **Pipelinepro install runtime libs** ( §12 ): Installer now skips C runtime SONAMEs (`libc.so.6`, `libm.so.6`), refreshes `ldconfig` cache before checking, and probes via `ldconfig -p`. Simulation + verified on Debian host. ✅ Fixed (simulation verified; real host pending).
+
+4. **OGG/Vorbis (long-file) decode/playback deadlock / no audio, hung upload** (2026-11-08): `load_and_play` decoded incrementally before starting backend consumption; decoder throttled on `AudioBuffer::exceeds_window()` with `playing=false`, deadlocking for PCM larger than the rebuffer window. Fixed in `src/player/engine.rs` by starting `stream.play()`/`Playing` before incremental decode (metadata populated after decode; decode errors stop/clear). Rebuilt `bin/l337-audio-server` (`--features backend,opus`). `90s_house_5.ogg` plays audibly in normal PipeWire mode (user confirmed, ~10s sufficient); mpv comparator OK.
+
+5. **Socket-mode multi-server/startup hardening** (2026-11-08, `src/main.rs`): stale-socket handling no longer removes on ambiguous connect failures. `classify_socket`/`ensure_socket_path_clear` treat active listeners and protected/ambiguous paths (symlink/non-socket, `PermissionDenied`, other errors) as unsafe to remove; only confirmed stale socket nodes (`ConnectionRefused`/`NotFound` on connect) are removed. Bind failures are reported (no `expect`) and startup refuses to hijack/intercept. Note: the global single-instance lock still enforces one normal instance; `L337_RUNTIME_DIR` isolation intentionally allows separate runtimes/endpoints for tests/side-by-side runs.
+
+### 📋 Remaining / Pending
+- **Single-instance lock scope vs isolated runtimes (design note):** `InstanceLock` on Linux also locks `/tmp/l337-audio-server-runtime/instance.lock` for cross-TMPDIR detection, except when `L337_RUNTIME_DIR` is set (isolated mode locks only that runtime). Correct for normal mode; operators/tests wanting a fully separate instance should set `L337_RUNTIME_DIR` consistently (and use matching runtime dirs).
+- **§9b**: TUI not launched; `/auth/challenge` + `/auth/redeem` not tested live.
+- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.
+- **CI build matrix:** `.github/workflows/build.yml` already builds PipeWire/ALSA variants with appropriate system deps and uses `--no-default-features` where needed (e.g. Windows/ARMv7/RISC-V/minimal targets). The earlier “default features need `libpipewire-0.3-dev`” note is addressed in CI; keep as build documentation for local/default-feature builds only.
+- **Play-stream response latency / metadata timing:** `/player/play/stream` (pushed file path) starts audible output before decode completes, but the HTTP request still blocks until full decode completes (`play_pushed` awaits `load_and_play`). Metadata (`duration_sec`/`codec`/`actual_kbps`) appears after decode. Consider decoupled ack/progress if clients need a fast response.
+- **`--token` / token source clarity (minor):** `--token` prints the persisted token file path (same path logic as generated/persisted tokens) but runs before config/env resolution; if `L337__SERVER__TOKEN` or `[server] token` is configured, that configured token is authoritative at runtime. Document/adjust output if this confuses operators.
+
+ 2026-11-08)
+
+### ✅ Fixed and Verified
+1. **AAC divide-by-zero bug** ( §6 ): Fix applied in `src/player/engine.rs` clamping `channels.max(1)`. Validated end-to-end: AAC files now play 6s with no panic; WAV playback unchanged. ✅ Merge approved.
+
+2. **Rust loglevel from `server.ini`** ( §11 ): `loglevel` key loaded and takes precedence over crate default. Verified on-device (2026-11-01). ✅ Implemented.
+
+3. **Pipelinepro install libs** ( §12 ): Installer now skips C runtime SONAMEs (`libc.so.6`, `libm.so.6`) refreshes `ldcache` before checking, and probes via `ldconfig -p`. Simulation + verified on Debian host. ✅ Fixed (simulation verified; real host pending).
+
+### 🟡 In Progress / Investigating
+1. **OGG/OPUS no-audio bug** ( §7 ): **confirmed reproducible in normal mode with sound card** (historical). `.ogg` files report `state: playing` but produce **no audio output** through speakers. Investigation needed in `opus.rs`, `engine.rs`, and audio output backends.
+
+2. **NEW — PipeWire backend stream errors / WAV silent (2026-11-08, blocks OGG repro):** `--features backend,opus` build, normal mode (`--transport=socket`, no `--dummy`, `PIPEWIRE_RUNTIME_DIR=/run/user/1002`). PipeWire connects but logs repeated `PipeWire stream entered error state: Connecting -> Unconnected`. WAV upload plays by API (`state: playing`, `audio_available: true`) but **no audible output** (user confirmed); `wpctl` shows l337 clients with **no active playback stream under Streams** to Speaker. Both WAV/OGG silent in this setup until PipeWire stream path is fixed. Likely: `src/platform/linux.rs` stream state/linking/target handling.
+
+3. **Lower-severity issues** ( §7 ):
+   - Stale binary in repo → binary replaced in CI but should be documented
+   - Single-instance lock path uses privileged path → needs `runtime_dir()` fix
+   - `token_file_path()` vs env token → minor assertion update
+
+### 📋 Remaining / Pending
+- **§9b**: TUI not launched; `/auth/challenge` + `/auth/redeem` not tested live
+- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect
+
+---
+
 # bug.md — Audio Server End-to-End Verification
 
 > **Executive summary:** The player → (Unix socket) → local audio server connection and playback
@@ -68,41 +114,41 @@ falls back to `/run/l337-audio-server`. The v0.1.0 binary predates that refactor
 `_check_systemd_audio_server_socket()` in l337-player hard-codes `/run/l337-audio-server/l337.sock`,
 so under `systemd` (the production path) there is no mismatch — they agree on `/run/l337-audio-server`.
 
-## 2. Building current `main` locally (resource findings)
+### Playback method (confirmed working, 2026-11-08)
 
-This environment is tight: **`nproc` = 1**, **5.8 GiB RAM / ~970 MiB free** at compile time, and
-**no root sudo** (so no extra swap). Two real blockers were discovered and worked around:
+**Backend:** PipeWire (`--features backend,opus` / `crate::platform::linux::PipeWireAudioBackend` using the `pipewire` Rust crate). Not the PulseAudio backend API.
 
-1. **Stale lock markers kill resume.** When a release build is OOM-killed mid-link, `build.sh`'s
-   `try_cargo` buffers cargo's output in a shell variable, so the failure is silent — the log just
-   *stops* at "Running: cargo build --release" with exit 0 reported by the wrapper, yet no binary
-   appears and `.fingerprint` freezes. **Fix:** delete the stale
-   `release/.cargo-lock`, `release/.cargo-build-lock`, `release/.cargo-artifact-lock` before
-   retrying, and run `cargo build` **directly** (not via `build.sh`) so output streams live and
-   progress is measurable via `ls release/deps | wc -l`.
-2. **`libspa-sys` requires `libpipewire-0.3-dev`.** The default feature set
-   (`default=["backend"] → backend=["pipewire","coreaudio-rs","wasapi"]`) pulls `pipewire`→
-   `libspa-sys`, whose `build.rs` runs
-   `pkg-config --libs --cflags libpipewire-0.3` and **panics** if the system library is absent
-   (`Cannot find libraries: PkgConfig(...)`). There is no `libpipewire-0.3.pc` here and no root to
-   `apt install libpipewire-0.3-dev`. **Fix for a dummy-only build:**
-   `cargo build --release --no-default-features` — this drops the `pipewire` backend entirely.
-   Dummy mode (`--dummy`) does not touch the audio-output backend, so the AAC **decode** path
-   (the subject of this bug) is still exercised and the resulting warnings about the missing
-   backend are harmless.
-
-### Working single-line build (this repo, dummy validation)
+**Build:**
 ```bash
-# Toolchain was bootstrapped once via scripts/build.sh into /tmp (rustup root /tmp/rustup, CARGO_HOME /tmp/cargo-home).
-RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo-home \
-  CARGO_TARGET_DIR=/tmp/l337-build \
-  /tmp/cargo-home/bin/cargo build --release --no-default-features --jobs 1
+CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/l337-build \
+  cargo build --release --features backend,opus --jobs 1
 cp -f /tmp/l337-build/release/l337-audio-server bin/l337-audio-server
 ```
-> ⚠️ Do **not** run this with default features in this environment — it will fail at `libspa-sys`
-> (missing `libpipewire-0.3-dev`). Install that system package (or build on a host that has it)
-> for a binary with a real audio backend. `--no-default-features` is suitable for validating
-> the decode path / dummy mode only.
+
+**Run (normal mode, socket, real output):**
+```bash
+rm -rf /tmp/l337-test/rt-oggtest && mkdir -p /tmp/l337-test/rt-oggtest
+setsid env L337__SERVER__TOKEN=test-token-xyz \
+  XDG_RUNTIME_DIR=/tmp/l337-test/rt-oggtest \
+  PIPEWIRE_RUNTIME_DIR=/run/user/1002 \
+  PULSE_SERVER=unix:/run/user/1002/pulse/native \
+  ./bin/l337-audio-server --transport=socket \
+  > /tmp/l337-test/server-pw.log 2>&1 < /dev/null &
+sleep 3
+```
+
+**Play WAV (curl):**
+```bash
+curl -s --unix-socket /tmp/l337-test/rt-oggtest/l337.sock \
+  -H "Authorization: Bearer test-token-xyz" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Track-Id: wav-fix-test" \
+  -H "X-Title: 120_K10_A WAV fix" \
+  --data-binary @/mnt/data2/music-work/Rendered/120_K10_A.wav \
+  "http://localhost/player/play/stream"
+```
+
+**Expected/observed:** `{"ok":true}`; status `state: playing`, `duration_sec: 4`, `codec: flac` (as reported), `audio_available: true`; server log shows `Connecting -> Paused -> Streaming`; **WAV heard on speaker** (user confirmed). `PIPEWIRE_RUNTIME_DIR`/`PULSE_SERVER` pointed at the user session’s PipeWire/Pulse compat socket in this test environment.
 
 ## 3. What the player can/cannot see against v0.1.0
 
@@ -241,6 +287,58 @@ curl --unix-socket ~/.cache/l337/l337-audio-server/l337.sock \
 # server.log -> "attempt to divide by zero"
 ```
 
+## OGG/OPUS NO-AUDIO BUG (separate from AAC divide-by-zero)
+
+> **2026-11-08 update (current session):** PipeWire playback path fixed in `src/platform/linux.rs`; **WAV now plays audibly** (user confirmed) using the **PipeWire backend** (`--features backend,opus`). The OGG/Opus no-audio issue can now be re-tested with real output.
+
+### Verification Method — Normal Mode (with Sound Card)
+This bug **cannot** be reproduced in dummy mode, as dummy mode sends audio to /dev/null and produces no audible output. The bug is confirmed **only in normal mode** with the laptop's sound card active.
+
+**Playback method (working baseline, 2026-11-08):** Use `bin/l337-audio-server` built with `--features backend,opus`, run with `--transport=socket`, `L337__SERVER__TOKEN=test-token-xyz`, isolated `XDG_RUNTIME_DIR`, and in this environment `PIPEWIRE_RUNTIME_DIR=/run/user/1002` (session PipeWire) plus `PULSE_SERVER=unix:/run/user/1002/pulse/native` present. Backend is **PipeWire** (Rust `pipewire` crate). Upload via curl to `/player/play/stream` with `Authorization: Bearer ...`, `X-Track-Id`, `Content-Type: application/octet-stream`. **Test policy:** when verifying WAV/OGG playback, only ~10 seconds of audible playback is required (stop/skip after confirmation).
+
+**Comparison Method (historical, when PipeWire stream was healthy):**
+1. Start the audio server in normal mode (not dummy):
+   `setsid env L337__SERVER__DUMMY=true L337__SERVER__TOKEN=test-token-xyz      XDG_RUNTIME_DIR=/tmp/l337-test/rt5      /home/tim/git/l337-audio-server/target/release/l337-audio-server --transport=socket &`
+2. Play a WAV file and observe:
+   - `state: playing` → `state: stopped` at EOS (confirmed audible)
+   - PipeWire streams: `output_FL > Speaker:playback_FL [active]`
+   - Speaker volume: 0.72
+   - User hears audio
+3. Play an OGG file and observe:
+   - `state: playing` (never stops at EOS)
+   - PipeWire streams: `output_FL > Speaker:playback_FL [active]` (streams ARE active)
+   - Speaker volume: 0.72 (SAME as WAV)
+   - User says: **NO audible audio** despite active streams
+4. **Measure data flow**: Use `wpctl monitor` or `wpctl inspect` to confirm
+   data is flowing to the speaker sink for BOTH formats, but only WAV produces audible output.
+
+**Evidence**
+- `.wav` (`120_K10_A.wav`, 387KB): Plays with audio output via l337 (PipeWire backend fix, 2026-11-08; user confirmed audible). Status shows `state=playing→stopped` at EOS (historical) / plays during window.
+- `.ogg` (`90s_house_5.ogg`, 2.2MB; `90s_house_8.ogg`, 11.3MB): Ogg Vorbis, stereo, 44100 Hz (ffprobe: `Audio: vorbis, 44100 Hz, stereo, fltp`). **l337:** silent (user confirmed, 2026-11-08). **mpv comparator (same file/device, PipeWire, 10s):** played fine (`mpv --no-config --no-video --ao=pipewire`).
+  - **Trace repro (2026-11-08, `RUST_LOG=trace`):** `POST /player/play/stream` for `90s_house_5.ogg` did **not** return a response to curl within 15–30s (curl RC 28 / timeout). `/player/status` during/after showed `state: stopped`, `duration_sec: null`, `codec: null`, `current_track: ogg-*`. Server trace logged Symphonia probing/ogg demux (`selected vorbis mapper`, `vorbis: leftover bits in setup head extra data`) but **no** `load_and_play` / `Playing (duration ...)` / decode completion / error lines after that. **Root cause (identified):** `load_and_play` decodes incrementally (`decode_file_incremental_blocking`, blocking) *before* calling `stream.play()`. The PipeWire process callback returns early when `playing=false`, so it never consumes PCM. For files whose decoded PCM exceeds `buffer_max_bytes` (rebuffer window, ~24 MiB default), the decoder hits `exceeds_window()` and sleeps/throttles forever waiting for consumption — **deadlock/hang**. WAV `120_K10_A.wav` (~4s, ~1.4 MiB decoded) stayed under the window so it completed before `stream.play()`; OGG Vorbis `90s_house_5.ogg` (4:21, ~92 MiB decoded) exceeds it and hangs. Same class of bug affects any long file on the incremental file-decode path. **Fix direction:** start playback/enable consumption before or during incremental decode (set `playing`/call `stream.play()` once enough priming data exists, or decouple decode throttling from the playback gate), while preserving state semantics and avoiding underruns.
+
+**Likely Cause**
+A bug in the audio server's Ogg/Opus decoding and output pipeline in `/mnt/private/data/home/tim/git/l337-audio-server/src/player/`:
+- The server has special-cased Opus decoding via direct libopus FFI (`opus.rs`) because Symphonia has no Opus decoder
+- The Ogg container demuxing via Symphania works (it can probe and hand off Opus packets)
+- But there may be an issue with how the decoded PCM data is output through PulseAudio/PipeWire, or with how the channel layout/default sample rate is handled for Opus-in-Ogg
+
+**Code Locations to Investigate**
+1. `/mnt/private/data/home/tim/git/l337-audio-server/src/player/opus.rs` - Opus FFI decoder
+2. `/mnt/private/data/home/tim/git/l337-audio-server/src/player/engine.rs` - `decode_to_pcm` function and `decode_file_incremental`
+3. `/mnt/private/data/home/tim/git/l337-audio-server/src/platform/pulseaudio.rs` or `pipewire.rs` - audio output backend
+4. Channel layout and sample rate handling for Opus-in-Ogg specifically
+
+**Relation to Existing Bugs**
+- **Not the AAC divide-by-zero bug** ( §6 ): AAC crashes the server with `attempt to divide by zero`; OGG files silently play with no audio
+- **Not the `_local_path()` bug** (fixed in l337-player): Both .wav and .ogg are correctly identified as local sources
+- **Separate bug** in the audio server's Ogg/Opus decode/output pipeline
+
+**Next Steps**
+1. Investigate `opus.rs` - check if the Opus decoder is correctly initialized and if decoded PCM is being sent to the audio output backend
+2. Investigate `engine.rs` - check `decode_to_pcm` and `decode_file_incremental` for Opus-in-Ogg handling
+3. Investigate the audio output backend (`pulseaudio.rs` / `pipewire.rs`) - check if PCM data is being correctly written to the audio sink
+4. Add a regression test that verifies .ogg files produce audio output (not just "playing" state)
 ## 7. Lower-severity issues observed
 
 - **Stale binary in repo.** `bin/l337-audio-server` is v0.1.0 (Sep 2026) and lacks `/version`,

@@ -96,28 +96,131 @@ fn socket_path() -> PathBuf {
     platform::common::runtime_dir().join("l337.sock")
 }
 
-/// Check whether a Unix socket at `path` is actively accepting connections.
+/// Classify a Unix socket path for safe takeover/removal.
+///
+/// - `Active`: a server is listening (or the endpoint is protected such that we
+///   must not interfere). Removing/binding over it would hijack or fail badly.
+/// - `Stale`: no listener; safe to remove the socket file before binding.
+/// - `Absent`: nothing to remove.
 #[cfg(unix)]
-fn socket_is_active(path: &std::path::Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketState {
+    Active,
+    Stale,
+    Absent,
+}
+
+#[cfg(unix)]
+fn classify_socket(path: &std::path::Path) -> SocketState {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream;
-    UnixStream::connect(path).is_ok()
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return SocketState::Absent,
+        Err(_) => return SocketState::Active,
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_socket() {
+        // Not a socket node we created; refuse to clobber arbitrary files/links.
+        return SocketState::Active;
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_stream) => SocketState::Active,
+        Err(e) => match e.kind() {
+            // No listener on this socket file.
+            ErrorKind::ConnectionRefused | ErrorKind::NotFound => SocketState::Stale,
+            // Cannot connect due to permissions or other access errors; assume a
+            // live/protected endpoint and never remove it (prevents hijack).
+            ErrorKind::PermissionDenied => SocketState::Active,
+            // Address/transport in use or transient states: treat as active.
+            ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable => SocketState::Active,
+            _ => {
+                // For any ambiguous OS error (e.g. ENOTSOCK after race, EACCES
+                // variants), prefer safety: do not remove.
+                SocketState::Active
+            }
+        },
+    }
 }
 
 /// Remove a stale Unix socket file if it exists and is not actively in use.
 ///
-/// Returns `true` if the file was removed, `false` if it was actively serving.
+/// Returns `Ok(())` when the path is clear for binding, or `Err(reason)` when an
+/// active/protected endpoint exists and must not be removed.
 #[cfg(unix)]
-fn remove_stale_socket(path: &std::path::Path) -> bool {
-    if path.exists() && socket_is_active(path) {
-        return false;
+fn ensure_socket_path_clear(path: &std::path::Path) -> Result<(), String> {
+    match classify_socket(path) {
+        SocketState::Absent => Ok(()),
+        SocketState::Active => Err(format!(
+            "Unix socket {} is already in use or protected; refusing to remove it",
+            path.display()
+        )),
+        SocketState::Stale => {
+            std::fs::remove_file(path).map_err(|e| {
+                format!(
+                    "failed to remove stale Unix socket {}: {e}",
+                    path.display()
+                )
+            })?;
+            Ok(())
+        }
     }
-    let _ = std::fs::remove_file(path);
-    true
 }
 
 #[cfg(not(unix))]
-fn remove_stale_socket(_path: &std::path::Path) -> bool {
-    true
+fn ensure_socket_path_clear(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Per-socket exclusive lock. Complements the global instance lock: it prevents
+/// two isolated processes (`L337_RUNTIME_DIR` set differently) from binding the
+/// same Unix socket path. Held for process lifetime.
+#[cfg(unix)]
+struct SocketBindLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketBindLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn acquire_socket_lock(socket_path: &std::path::Path) -> Result<SocketBindLock, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::AsRawFd;
+    let lock_path = socket_path.with_extension("sock.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create socket lock dir {}: {e}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o644)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot open socket lock {}: {e}", lock_path.display()))?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(format!(
+                "Unix socket {} is already in use by another running server (lock {})",
+                socket_path.display(),
+                lock_path.display()
+            ));
+        }
+        return Err(format!("socket lock flock failed for {}: {err}", lock_path.display()));
+    }
+    let _ = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes());
+    Ok(SocketBindLock { _file: file, path: lock_path })
 }
 
 fn parse_transport_cli() -> Option<String> {
@@ -549,17 +652,33 @@ async fn main() {
     #[cfg(unix)]
     if use_socket {
         let path = socket_path();
-        if !remove_stale_socket(&path) {
-            tracing::error!(
-                "Unix socket {} is actively in use by another server. \
-                 Refusing to remove it to prevent connection interception.",
-                path.display()
-            );
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::error!("Failed to create socket directory {}: {e}", parent.display());
+                std::process::exit(1);
+            }
+        }
+        // Per-socket lock prevents two processes from serving the same socket
+        // path even when global instance-lock scopes differ (e.g. isolated
+        // L337_RUNTIME_DIR tests). Held for process lifetime.
+        let _socket_guard = match acquire_socket_lock(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(reason) = ensure_socket_path_clear(&path) {
+            tracing::error!("{reason}. Refusing to start to prevent connection interception or port conflicts.");
             std::process::exit(1);
         }
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let listener =
-            std::os::unix::net::UnixListener::bind(&path).expect("Failed to bind Unix socket");
+        let listener = match std::os::unix::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind Unix socket {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
@@ -577,6 +696,7 @@ async fn main() {
             .serve(app.into_make_service())
             .await
             .unwrap();
+        drop(_socket_guard);
     } else {
         // TCP/HTTPS path (also used on non-Unix platforms)
         let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port)

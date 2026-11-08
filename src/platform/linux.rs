@@ -3,26 +3,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-struct PipeWireInner {
-    main_loop_thread: Option<std::thread::JoinHandle<()>>,
-    cmd_sender: Option<pipewire::channel::Sender<Command>>,
-}
-
 #[derive(Debug, Clone)]
 pub enum Command {
     SetActive(bool),
     Disconnect,
 }
 
-pub struct PipeWireAudioBackend {
-    inner: Arc<Mutex<PipeWireInner>>,
-}
-
-impl Default for PipeWireAudioBackend {
-    fn default() -> Self {
-        Self { inner: Arc::new(Mutex::new(PipeWireInner::default())) }
-    }
-}
+#[derive(Default)]
+pub struct PipeWireAudioBackend;
 
 pub struct PipeWireAudioOutputStream {
     playing: Arc<AtomicBool>,
@@ -30,16 +18,10 @@ pub struct PipeWireAudioOutputStream {
     cmd: pipewire::channel::Sender<Command>,
 }
 
-impl Default for PipeWireInner {
-    fn default() -> Self {
-        Self { main_loop_thread: None, cmd_sender: None }
-    }
-}
-
 fn terminal_pw_state(new: &pipewire::stream::StreamState) -> bool {
     matches!(
         new,
-        pipewire::stream::StreamState::Error(_) | pipewire::stream::StreamState::Unconnected
+        pipewire::stream::StreamState::Error(_)
     )
 }
 
@@ -60,243 +42,279 @@ impl AudioBackend for PipeWireAudioBackend {
         );
         pipewire::init();
 
-        let main_loop = Box::new(
-            pipewire::main_loop::MainLoopBox::new(None)
-                .map_err(|e| format!("Failed to create PipeWire main loop: {}", e))?,
-        );
-
-        let main_loop_leaked = Box::leak(main_loop);
-
-        let context = Box::new(
-            pipewire::context::ContextBox::new(&main_loop_leaked.loop_(), None)
-                .map_err(|e| format!("Failed to create PipeWire context: {}", e))?,
-        );
-
-        let context_leaked = Box::leak(context);
-
-        let core = Box::new(
-            context_leaked
-                .connect(None)
-                .map_err(|e| format!("Failed to connect to PipeWire: {}", e))?,
-        );
-
-        let core_leaked = Box::leak(core);
-
         let playing = Arc::new(AtomicBool::new(false));
         let backend_error = Arc::new(AtomicBool::new(false));
+        let (cmd_tx, cmd_rx) = pipewire::channel::channel::<Command>();
+        let cmd_tx_out = cmd_tx.clone();
 
-        let props = pipewire::properties::properties! {
-            *pipewire::keys::MEDIA_TYPE => "Audio",
-            *pipewire::keys::MEDIA_CATEGORY => "Playback",
-            *pipewire::keys::MEDIA_ROLE => "Music",
-            *pipewire::keys::NODE_NAME => name,
-            *pipewire::keys::NODE_DESCRIPTION => "L337 Audio Server",
-        };
-
-        let stream = pipewire::stream::StreamBox::new(&core_leaked, name, props)
-            .map_err(|e| format!("Failed to create PipeWire stream: {}", e))?;
-
+        let name_owned = name.to_string();
         let ab = audio_buffer.clone();
         let vol = volume.clone();
         let playing_cb = playing.clone();
+        let backend_error_cb = backend_error.clone();
         let channels_captured = channels;
 
-        let listener = stream
-            .add_local_listener_with_user_data((ab, vol, playing_cb, channels_captured))
-            .state_changed(|_stream, user_data, old, new| {
-                if terminal_pw_state(&new) {
-                    tracing::warn!(
-                        "PipeWire stream entered error state: {:?} -> {:?}",
-                        old,
-                        new
-                    );
-                    let (ab, _vol, playing_cb, _channels) = user_data;
-                    playing_cb.store(false, Ordering::SeqCst);
-                    if let Ok(mut buf) = ab.lock() {
-                        buf.backend_error.store(true, Ordering::SeqCst);
-                        buf.pcm.clear();
-                        buf.read_pos = 0;
-                        buf.consumed_total = 0;
-                    }
-                }
-            })
-            .process(move |stream, (ab, vol, playing_cb, channels)| {
-                let playing = playing_cb.load(Ordering::SeqCst);
-                if !playing {
+        std::thread::spawn(move || {
+            let main_loop = match pipewire::main_loop::MainLoopBox::new(None) {
+                Ok(ml) => ml,
+                Err(e) => {
+                    tracing::error!("Failed to create PipeWire main loop: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
                     return;
                 }
+            };
+            let main_loop: &'static pipewire::main_loop::MainLoopBox =
+                Box::leak(Box::new(main_loop));
 
-                let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
-
-                if buf.backend_error.load(Ordering::SeqCst) {
+            let context = match pipewire::context::ContextBox::new(&main_loop.loop_(), None) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to create PipeWire context: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
                     return;
                 }
+            };
+            let context: &'static pipewire::context::ContextBox = Box::leak(Box::new(context));
 
-                if buf.enters_over_window() {
-                    tracing::debug!("AudioBuffer over rebuffer window; draining (paced)");
+            let core = match context.connect(None) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to connect to PipeWire: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
+                    return;
                 }
+            };
+            let core: &'static pipewire::core::CoreBox = Box::leak(Box::new(core));
 
-                let available = buf.pcm.len().saturating_sub(buf.read_pos);
+            let props = pipewire::properties::properties! {
+                *pipewire::keys::MEDIA_TYPE => "Audio",
+                *pipewire::keys::MEDIA_CATEGORY => "Playback",
+                *pipewire::keys::MEDIA_ROLE => "Music",
+                *pipewire::keys::NODE_NAME => name_owned.as_str(),
+                *pipewire::keys::NODE_DESCRIPTION => "L337 Audio Server",
+            };
 
-                if available > 0 {
-                    let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(mut buffer) = stream.dequeue_buffer() {
-                        let datas = buffer.datas_mut();
-                        if datas.is_empty() {
-                            return;
-                        }
-
-                        let data = &mut datas[0];
-                        let slice = if let Some(s) = data.data() {
-                            s
-                        } else {
-                            return;
-                        };
-
-                        let f32_len = slice.len() / 4;
-                        if f32_len == 0 {
-                            return;
-                        }
-
-                        let f32_slice = unsafe {
-                            std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
-                        };
-
-                        let to_copy = f32_len.min(available);
-                        for (d, s) in f32_slice.iter_mut().zip(buf.pcm[buf.read_pos..].iter()) {
-                            *d = s * v;
-                        }
-                        buf.read_pos += to_copy;
-
-                        // Reclaim consumed samples at a checkpoint (G4).
-                        if buf.read_pos >= (1 << 20) {
-                            buf.reclaim_consumed();
-                        }
-
-                        for sample in &mut f32_slice[to_copy..] {
-                            *sample = 0.0;
-                        }
-
-                        let chunk = data.chunk_mut();
-                        *chunk.offset_mut() = 0;
-                        *chunk.stride_mut() = (*channels as i32) * 4;
-                        *chunk.size_mut() = (to_copy * 4) as u32;
-                    }
-                } else {
-                    drop(buf);
-                    if let Some(mut buffer) = stream.dequeue_buffer() {
-                        let datas = buffer.datas_mut();
-                        if datas.is_empty() {
-                            return;
-                        }
-
-                        let data = &mut datas[0];
-                        let slice = if let Some(s) = data.data() {
-                            s
-                        } else {
-                            return;
-                        };
-
-                        let f32_len = slice.len() / 4;
-                        if f32_len == 0 {
-                            return;
-                        }
-
-                        let f32_slice = unsafe {
-                            std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
-                        };
-
-                        for sample in f32_slice.iter_mut() {
-                            *sample = 0.0;
-                        }
-
-                        let chunk = data.chunk_mut();
-                        *chunk.offset_mut() = 0;
-                        *chunk.stride_mut() = (*channels as i32) * 4;
-                        *chunk.size_mut() = 0;
-                    }
+            let stream = match pipewire::stream::StreamBox::new(core, &name_owned, props) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to create PipeWire stream: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
+                    return;
                 }
-            })
-            .register()
-            .map_err(|e| format!("Failed to register stream listener: {}", e))?;
+            };
 
-        let stream_flags = pipewire::stream::StreamFlags::AUTOCONNECT
-            | pipewire::stream::StreamFlags::MAP_BUFFERS
-            | pipewire::stream::StreamFlags::RT_PROCESS;
+            let ab_cb = ab.clone();
+            let vol_cb = vol.clone();
+            let playing_cb2 = playing_cb.clone();
+            let be_cb2 = backend_error_cb.clone();
 
-        let mut audio_info = pipewire::spa::param::audio::AudioInfoRaw::new();
-        audio_info.set_format(pipewire::spa::param::audio::AudioFormat::F32LE);
-        audio_info.set_rate(sample_rate);
-        audio_info.set_channels(channels as u32);
-        let mut position = [0; pipewire::spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
-        if channels >= 1 {
-            position[0] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FL;
-        }
-        if channels >= 2 {
-            position[1] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FR;
-        }
-        audio_info.set_position(position);
+            let _listener = match stream
+                .add_local_listener_with_user_data((ab_cb, vol_cb, playing_cb2, channels_captured))
+                .state_changed(|_stream, user_data, old, new| {
+                    if terminal_pw_state(&new) {
+                        tracing::warn!(
+                            "PipeWire stream entered error state: {:?} -> {:?}",
+                            old,
+                            new
+                        );
+                        let (ab, _vol, playing_cb, _channels) = user_data;
+                        playing_cb.store(false, Ordering::SeqCst);
+                        if let Ok(mut buf) = ab.lock() {
+                            buf.backend_error.store(true, Ordering::SeqCst);
+                            buf.pcm.clear();
+                            buf.read_pos = 0;
+                            buf.consumed_total = 0;
+                        }
+                    } else if matches!(new, pipewire::stream::StreamState::Paused | pipewire::stream::StreamState::Streaming) {
+                        tracing::debug!("PipeWire stream state: {:?} -> {:?}", old, new);
+                    }
+                })
+                .process(move |stream, (ab, vol, playing_cb, channels)| {
+                    let playing = playing_cb.load(Ordering::SeqCst);
+                    if !playing {
+                        return;
+                    }
 
-        let values: Vec<u8> = pipewire::spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &pipewire::spa::pod::Value::Object(pipewire::spa::pod::Object {
-                type_: pipewire::spa::sys::SPA_TYPE_OBJECT_Format,
-                id: pipewire::spa::sys::SPA_PARAM_EnumFormat,
-                properties: audio_info.into(),
-            }),
-        )
-        .map_err(|e| format!("Failed to serialize audio format: {}", e))?
-        .0
-        .into_inner();
+                    let mut buf = ab.lock().unwrap_or_else(|e| e.into_inner());
 
-        let mut params = [pipewire::spa::pod::Pod::from_bytes(&values)
-            .ok_or("Failed to create Pod from bytes")?];
+                    if buf.backend_error.load(Ordering::SeqCst) {
+                        return;
+                    }
 
-        stream
-            .connect(
+                    if buf.enters_over_window() {
+                        tracing::debug!("AudioBuffer over rebuffer window; draining (paced)");
+                    }
+
+                    let available = buf.pcm.len().saturating_sub(buf.read_pos);
+
+                    if available > 0 {
+                        let v = *vol.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(mut buffer) = stream.dequeue_buffer() {
+                            let datas = buffer.datas_mut();
+                            if datas.is_empty() {
+                                return;
+                            }
+
+                            let data = &mut datas[0];
+                            let slice = if let Some(s) = data.data() {
+                                s
+                            } else {
+                                return;
+                            };
+
+                            let f32_len = slice.len() / 4;
+                            if f32_len == 0 {
+                                return;
+                            }
+
+                            let f32_slice = unsafe {
+                                std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
+                            };
+
+                            let to_copy = f32_len.min(available);
+                            for (d, s) in f32_slice.iter_mut().take(to_copy).zip(buf.pcm[buf.read_pos..].iter()) {
+                                *d = s * v;
+                            }
+                            buf.read_pos += to_copy;
+
+                            if buf.read_pos >= (1 << 20) {
+                                buf.reclaim_consumed();
+                            }
+
+                            for sample in &mut f32_slice[to_copy..] {
+                                *sample = 0.0;
+                            }
+
+                            let chunk = data.chunk_mut();
+                            *chunk.offset_mut() = 0;
+                            *chunk.stride_mut() = (*channels as i32) * 4;
+                            *chunk.size_mut() = (to_copy * 4) as u32;
+                        }
+                    } else {
+                        drop(buf);
+                        if let Some(mut buffer) = stream.dequeue_buffer() {
+                            let datas = buffer.datas_mut();
+                            if datas.is_empty() {
+                                return;
+                            }
+
+                            let data = &mut datas[0];
+                            let slice = if let Some(s) = data.data() {
+                                s
+                            } else {
+                                return;
+                            };
+
+                            let f32_len = slice.len() / 4;
+                            if f32_len == 0 {
+                                return;
+                            }
+
+                            let f32_slice = unsafe {
+                                std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, f32_len)
+                            };
+
+                            for sample in f32_slice.iter_mut() {
+                                *sample = 0.0;
+                            }
+
+                            let chunk = data.chunk_mut();
+                            *chunk.offset_mut() = 0;
+                            *chunk.stride_mut() = (*channels as i32) * 4;
+                            *chunk.size_mut() = 0;
+                        }
+                    }
+                })
+                .register()
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to register stream listener: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let stream_flags = pipewire::stream::StreamFlags::AUTOCONNECT
+                | pipewire::stream::StreamFlags::MAP_BUFFERS
+                | pipewire::stream::StreamFlags::RT_PROCESS;
+
+            let mut audio_info = pipewire::spa::param::audio::AudioInfoRaw::new();
+            audio_info.set_format(pipewire::spa::param::audio::AudioFormat::F32LE);
+            audio_info.set_rate(sample_rate);
+            audio_info.set_channels(channels as u32);
+            let mut position = [0u32; pipewire::spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
+            if channels >= 1 {
+                position[0] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FL;
+            }
+            if channels >= 2 {
+                position[1] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FR;
+            }
+            audio_info.set_position(position);
+
+            let values: Vec<u8> = match pipewire::spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &pipewire::spa::pod::Value::Object(pipewire::spa::pod::Object {
+                    type_: pipewire::spa::sys::SPA_TYPE_OBJECT_Format,
+                    id: pipewire::spa::sys::SPA_PARAM_EnumFormat,
+                    properties: audio_info.into(),
+                }),
+            ) {
+                Ok(v) => v.0.into_inner(),
+                Err(e) => {
+                    tracing::error!("Failed to serialize audio format: {}", e);
+                    backend_error_cb.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut params = match pipewire::spa::pod::Pod::from_bytes(&values) {
+                Some(p) => [p],
+                None => {
+                    tracing::error!("Failed to create Pod from bytes");
+                    backend_error_cb.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            if let Err(e) = stream.connect(
                 pipewire::spa::utils::Direction::Output,
                 None,
                 stream_flags,
                 &mut params,
-            )
-            .map_err(|e| format!("Failed to connect PipeWire stream: {}", e))?;
-        tracing::info!("PipeWire stream connected successfully");
-
-        stream
-            .set_active(true)
-            .map_err(|e| format!("Failed to activate PipeWire stream: {}", e))?;
-        tracing::info!("PipeWire stream activated successfully");
-
-        let _stream = unsafe {
-            std::mem::transmute::<
-                pipewire::stream::StreamBox<'_>,
-                pipewire::stream::StreamBox<'static>,
-            >(stream)
-        };
-
-        struct SendMainLoopPtr(*mut pipewire::sys::pw_main_loop);
-        unsafe impl Send for SendMainLoopPtr {}
-
-        impl SendMainLoopPtr {
-            unsafe fn run(self) {
-                let ml = unsafe { &*(self.0 as *const pipewire::main_loop::MainLoop) };
-                ml.run();
+            ) {
+                tracing::error!("Failed to connect PipeWire stream: {}", e);
+                backend_error_cb.store(true, Ordering::SeqCst);
+                return;
             }
-        }
+            tracing::info!("PipeWire stream connected successfully");
 
-        let main_loop_ptr = SendMainLoopPtr(main_loop_leaked.as_raw_ptr());
+            if let Err(e) = stream.set_active(true) {
+                tracing::error!("Failed to activate PipeWire stream: {}", e);
+                backend_error_cb.store(true, Ordering::SeqCst);
+                return;
+            }
+            tracing::info!("PipeWire stream activated successfully");
 
-        let _leaked_listener = Box::leak(Box::new(listener));
+            let loop_ref = main_loop.loop_();
+            let _receiver = cmd_rx.attach(loop_ref, move |cmd| match cmd {
+                    Command::SetActive(active) => {
+                        let _ = stream.set_active(active);
+                    }
+                    Command::Disconnect => {
+                        let _ = stream.disconnect();
+                        main_loop.quit();
+                    }
+                });
 
-        std::thread::spawn(move || unsafe {
-            main_loop_ptr.run();
+            main_loop.run();
+            // stream, listener, context, core, main_loop dropped here on main loop thread
         });
 
-        let (cmd_tx, _cmd_rx) = pipewire::channel::channel::<Command>();
         Ok(Box::new(PipeWireAudioOutputStream {
             playing,
             backend_error,
-            cmd: cmd_tx,
+            cmd: cmd_tx_out,
         }))
     }
 }
@@ -305,12 +323,14 @@ impl AudioOutputStream for PipeWireAudioOutputStream {
     fn play(&mut self) -> Result<(), String> {
         self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(true, Ordering::SeqCst);
+        let _ = self.cmd.send(Command::SetActive(true));
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
         self.backend_error.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
+        let _ = self.cmd.send(Command::SetActive(false));
         Ok(())
     }
 

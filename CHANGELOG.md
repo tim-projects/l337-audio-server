@@ -28,6 +28,17 @@ with the new version heading.
   no record of it. Startup logs the effective level and where it came from.
 
 ### Fixed
+- File playback no longer deadlocks/hangs for tracks whose decoded PCM exceeds the
+  rebuffer window (e.g. long OGG/Vorbis): `load_and_play` starts backend
+  consumption (`stream.play()`) before incremental decode so the decoder can
+  throttle on buffer space while audio drains, instead of blocking forever with
+  `playing=false`. Decode failures now stop/clear playback state.
+- Unix socket mode is hardened against same-path multi-server/hijack races:
+  startup classifies socket paths safely (only confirmed stale socket nodes are
+  removed; active/protected/ambiguous paths, including permission errors and
+  non-socket files/symlinks, are never clobbered), reports bind failures
+  cleanly, and takes a per-socket advisory lock (`<socket>.sock.lock`) held for
+  process lifetime so isolated lock scopes cannot serve the same socket path.
 - Streaming playback is now the **default** instead of downloading the whole
   track first: `POST /player/play` returns as soon as the container has been
   probed and decoding has started, rather than after the entire file has
