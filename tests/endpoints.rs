@@ -2,7 +2,7 @@ use reqwest::Client;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 fn write_minimal_wav(path: &PathBuf) {
     let sample_rate = 44100u32;
@@ -71,10 +71,7 @@ async fn spawn_server_inner(extra_path: Option<&PathBuf>) -> (u16, tokio::proces
     // the challenge token from (it never reads XDG_CONFIG_HOME).
     static SPAWN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let base_dir = std::env::temp_dir().join(format!(
-        "l337-test-{}-{seq}",
-        std::process::id()
-    ));
+    let base_dir = std::env::temp_dir().join(format!("l337-test-{}-{seq}", std::process::id()));
     let config_dir = base_dir.join("l337-audio-server");
     let _ = std::fs::create_dir_all(&config_dir);
 
@@ -193,9 +190,15 @@ async fn test_health_endpoint() {
     );
     // Opus is compile-time optional: advertised only when it is linked in.
     #[cfg(feature = "opus")]
-    assert!(codecs.contains(&"opus"), "opus is linked in but not advertised");
+    assert!(
+        codecs.contains(&"opus"),
+        "opus is linked in but not advertised"
+    );
     #[cfg(not(feature = "opus"))]
-    assert!(!codecs.contains(&"opus"), "opus is not linked in but is advertised");
+    assert!(
+        !codecs.contains(&"opus"),
+        "opus is not linked in but is advertised"
+    );
     assert_eq!(caps["quality"], true);
 
     let _ = child.kill().await;
@@ -263,7 +266,10 @@ async fn test_player_status_with_auth() {
         .expect("Failed to call /player/status with auth");
 
     assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.expect("Failed to parse /player/status JSON");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(body["state"], "stopped");
 
     let _ = child.kill().await;
@@ -300,7 +306,10 @@ async fn test_play_endpoint() {
         .expect("Failed to call /player/play");
 
     assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.expect("Failed to parse /player/play JSON");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("Failed to parse /player/play JSON");
     assert_eq!(body["ok"], true);
 
     let _ = child.kill().await;
@@ -456,7 +465,10 @@ async fn test_cache_lookup_endpoint() {
         .expect("Failed to call /player/cache/lookup");
 
     assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.expect("Failed to parse /player/cache/lookup JSON");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("Failed to parse /player/cache/lookup JSON");
     assert!(body["cached"].is_array());
 
     let _ = child.kill().await;
@@ -515,7 +527,10 @@ async fn test_seek_endpoint() {
         .await
         .expect("Failed to call /player/status");
     assert_eq!(status_resp.status(), 200);
-    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    let status_body: serde_json::Value = status_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(status_body["state"], "playing");
     assert!(status_body["position_sec"].is_number());
     assert!(status_body["duration_sec"].is_number());
@@ -558,9 +573,15 @@ async fn test_upload_stream_endpoint() {
         .await
         .expect("Failed to call /player/status");
     assert_eq!(status_resp.status(), 200);
-    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    let status_body: serde_json::Value = status_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(status_body["state"], "playing");
-    assert_eq!(status_body["current_track"]["track_id"], "stream-test-track");
+    assert_eq!(
+        status_body["current_track"]["track_id"],
+        "stream-test-track"
+    );
     assert_eq!(status_body["current_track"]["title"], "Stream Test");
     assert_eq!(status_body["audio_available"], true);
 
@@ -669,7 +690,10 @@ async fn test_speed_endpoint() {
         .await
         .expect("Failed to call /player/status");
     assert_eq!(status_resp.status(), 200);
-    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    let status_body: serde_json::Value = status_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(status_body["speed"], 1.5);
 
     let _ = child.kill().await;
@@ -723,7 +747,10 @@ async fn test_volume_endpoint() {
         .await
         .expect("Failed to call /player/status");
     assert_eq!(status_resp.status(), 200);
-    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    let status_body: serde_json::Value = status_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(status_body["volume"], 0.5);
 
     let _ = child.kill().await;
@@ -788,7 +815,10 @@ async fn test_cache_next_and_previous_endpoints() {
         .await
         .expect("Failed to call /player/status");
     assert_eq!(status_resp.status(), 200);
-    let status_body: serde_json::Value = status_resp.json().await.expect("Failed to parse /player/status JSON");
+    let status_body: serde_json::Value = status_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/status JSON");
     assert_eq!(status_body["next_cached"], true);
     assert_eq!(status_body["prev_cached"], true);
 
@@ -814,7 +844,10 @@ async fn test_cache_stream_upload_endpoints() {
     let prev_bytes = std::fs::read(&prev_audio).expect("Failed to read prev WAV bytes");
 
     let next_resp = client
-        .post(format!("https://127.0.0.1:{}/player/cache/next/stream", _port))
+        .post(format!(
+            "https://127.0.0.1:{}/player/cache/next/stream",
+            _port
+        ))
         .header("Authorization", format!("Bearer {}", token))
         .header("X-Track-Id", "cache-next-stream")
         .header("X-Title", "Cached Next")
@@ -825,7 +858,10 @@ async fn test_cache_stream_upload_endpoints() {
     assert_eq!(next_resp.status(), 200);
 
     let prev_resp = client
-        .post(format!("https://127.0.0.1:{}/player/cache/previous/stream", _port))
+        .post(format!(
+            "https://127.0.0.1:{}/player/cache/previous/stream",
+            _port
+        ))
         .header("Authorization", format!("Bearer {}", token))
         .header("X-Track-Id", "cache-prev-stream")
         .header("X-Title", "Cached Prev")
@@ -847,7 +883,10 @@ async fn test_cache_stream_upload_endpoints() {
         .await
         .expect("Failed to call /player/cache/lookup");
     assert_eq!(lookup_resp.status(), 200);
-    let lookup_body: serde_json::Value = lookup_resp.json().await.expect("Failed to parse /player/cache/lookup JSON");
+    let lookup_body: serde_json::Value = lookup_resp
+        .json()
+        .await
+        .expect("Failed to parse /player/cache/lookup JSON");
     let cached: Vec<String> = lookup_body["cached"]
         .as_array()
         .unwrap()
@@ -979,10 +1018,7 @@ exit 0
         fixture = fixture.display()
     );
     std::fs::write(dir.join("yt-dlp"), script).unwrap();
-    let _ = std::fs::set_permissions(
-        dir.join("yt-dlp"),
-        std::fs::Permissions::from_mode(0o755),
-    );
+    let _ = std::fs::set_permissions(dir.join("yt-dlp"), std::fs::Permissions::from_mode(0o755));
 }
 
 /// G2 / finding #4: after `POST /player/target {"target_kbps":64}` the
@@ -1016,7 +1052,10 @@ async fn test_cache_next_honors_runtime_target_ceiling() {
         .await
         .expect("Failed to call /player/target");
     assert_eq!(target_resp.status(), 200);
-    assert_eq!(target_resp.json::<serde_json::Value>().await.unwrap()["target_kbps"], 64);
+    assert_eq!(
+        target_resp.json::<serde_json::Value>().await.unwrap()["target_kbps"],
+        64
+    );
 
     // (No status check here: `PlayerStatus.target_kbps` is the *effective*
     // per-track ceiling, which is 0 until a track actually plays under the new
@@ -1132,6 +1171,75 @@ async fn test_cache_next_best_picks_highest_available() {
     let _ = child.wait().await;
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
+/// Test /player/session/connect and /player/session/disconnect: exercises
+/// session lifecycle used by the TUI player for warm-up/cool-down accounting.
+/// Also verifies status exposes warm/active_sessions fields.
+#[tokio::test]
+async fn test_session_connect_disconnect_and_status() {
+    let (_port, mut child, config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    let connect = client
+        .post(format!(
+            "https://127.0.0.1:{}/player/session/connect",
+            _port
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/session/connect");
+    assert_eq!(connect.status(), 200);
+    let connect_json = connect.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(connect_json["ok"], true);
+    assert!(connect_json["active_sessions"].as_u64().unwrap_or(0) >= 1);
+
+    let status_resp = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status");
+    assert_eq!(status_resp.status(), 200);
+    let status = status_resp.json::<serde_json::Value>().await.unwrap();
+    assert!(status.get("warm").is_some(), "status must expose warm");
+    assert!(
+        status.get("active_sessions").is_some(),
+        "status must expose active_sessions"
+    );
+    assert!(status["active_sessions"].as_u64().unwrap_or(0) >= 1);
+
+    let disconnect = client
+        .post(format!(
+            "https://127.0.0.1:{}/player/session/disconnect",
+            _port
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/session/disconnect");
+    assert_eq!(disconnect.status(), 200);
+    let disconnect_json = disconnect.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(disconnect_json["ok"], true);
+
+    let status2 = client
+        .get(format!("https://127.0.0.1:{}/player/status", _port))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to call /player/status")
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(status2["active_sessions"].as_u64().unwrap_or(99), 0);
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 /// — it is skipped and the server default applies (`resolve_ceiling` doc
 /// contract). Uploaded through the real endpoint against a real file source, so
 /// this covers the axum `Json` extractor's tolerant deserializer, not just the
@@ -1175,7 +1283,10 @@ async fn test_play_unknown_quality_falls_back_to_server_default() {
         .await
         .expect("Failed to call /player/status");
     let status = status_resp.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(status["target_kbps"], 0, "unknown quality must fall back to the server default");
+    assert_eq!(
+        status["target_kbps"], 0,
+        "unknown quality must fall back to the server default"
+    );
 
     let _ = child.kill().await;
     let _ = child.wait().await;

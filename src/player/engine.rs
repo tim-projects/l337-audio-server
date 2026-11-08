@@ -1,6 +1,7 @@
-use crate::api::models::{resolve_ceiling, PlayerStateLabel, PlayerStatus, Track};
-use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
+use crate::api::models::{PlayerStateLabel, PlayerStatus, Track, resolve_ceiling};
+use crate::platform::common::{AudioBackend, AudioBuffer, AudioOutputStream};
 use crate::player::storage::StorageManager;
+use pitch_shift;
 use rubato::Resampler;
 use rubato::SincFixedIn;
 use rubato::SincInterpolationParameters;
@@ -9,15 +10,14 @@ use rubato::WindowFunction;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tracing::{error, info};
 use wsola;
-use pitch_shift;
 
 struct StreamingPlayback {
     download_handle: Option<tokio::task::JoinHandle<()>>,
@@ -165,7 +165,11 @@ impl PlayerEngine {
     /// what the fallback still costs for a 5 MB file on a 32 KB/s link (~160 s).
     const STREAM_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
 
-    pub fn new(storage: StorageManager, buffer_max_bytes: u64, default_target_kbps: u32) -> Result<Self, String> {
+    pub fn new(
+        storage: StorageManager,
+        buffer_max_bytes: u64,
+        default_target_kbps: u32,
+    ) -> Result<Self, String> {
         let mut audio_buffer = AudioBuffer::new(48000, 0);
         audio_buffer.max_bytes = buffer_max_bytes as usize;
         let audio_buffer = Arc::new(Mutex::new(audio_buffer));
@@ -258,7 +262,11 @@ impl PlayerEngine {
     /// configured rebuffer window and default ceiling must still apply, or
     /// `[server] buffer_max_bytes` / `default_target_kbps` are silently ignored
     /// in the documented testing mode.
-    pub fn new_dummy(storage: StorageManager, buffer_max_bytes: u64, default_target_kbps: u32) -> Self {
+    pub fn new_dummy(
+        storage: StorageManager,
+        buffer_max_bytes: u64,
+        default_target_kbps: u32,
+    ) -> Self {
         let mut audio_buffer = AudioBuffer::new(48000, 0);
         audio_buffer.max_bytes = buffer_max_bytes as usize;
         Self {
@@ -332,9 +340,8 @@ impl PlayerEngine {
             return None;
         }
         let consumed_frames = (consumed_total as u64) / (buf.channels.max(1) as u64);
-        let orig_frames =
-            (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64 / buf.sample_rate as f64)
-                as u64;
+        let orig_frames = (consumed_frames as f64 * buf.file_sample_rate as f64 * buf.speed as f64
+            / buf.sample_rate as f64) as u64;
         Some(position_sec + orig_frames / buf.file_sample_rate as u64)
     }
 
@@ -378,8 +385,14 @@ impl PlayerEngine {
             let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             buf.sample_rate
         };
-        let playback_pcm =
-            stretch_and_resample(&pcm, channels, file_sample_rate, device_rate, self.speed, self.pitch);
+        let playback_pcm = stretch_and_resample(
+            &pcm,
+            channels,
+            file_sample_rate,
+            device_rate,
+            self.speed,
+            self.pitch,
+        );
 
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pcm = playback_pcm;
@@ -434,6 +447,7 @@ impl PlayerEngine {
     }
 
     pub async fn play_track(&mut self, track: Track) -> Result<(), EngineError> {
+        self.touch();
         if self.check_backend_error() {
             self.try_recover().map_err(EngineError::Other)?;
         }
@@ -443,11 +457,7 @@ impl PlayerEngine {
 
         // G2: resolve the bandwidth ceiling for this request and remember it (and
         // reset the observable bitrate/codec) so PlayerStatus reflects this play.
-        let ceiling = resolve_ceiling(
-            track.target_kbps,
-            track.quality,
-            self.runtime_target_kbps,
-        );
+        let ceiling = resolve_ceiling(track.target_kbps, track.quality, self.runtime_target_kbps);
         self.effective_target_kbps = ceiling;
         self.actual_kbps = None;
         self.codec_label = None;
@@ -467,7 +477,10 @@ impl PlayerEngine {
 
         if is_youtube_url(&track.stream_url) {
             info!("play_track: YouTube streaming for {}", track.stream_url);
-            match self.start_streaming_playback(&track.stream_url, ceiling).await {
+            match self
+                .start_streaming_playback(&track.stream_url, ceiling)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 // Resolution failed: the URL never produced a stream, so
                 // re-running yt-dlp through the downloader would only repeat
@@ -489,11 +502,16 @@ impl PlayerEngine {
                     }
                     error!("YouTube streaming failed, falling back to download: {}", e);
                     let path = self.storage.get_active_slot_path("current");
-                    if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await {
+                    if let Err(e) =
+                        download_stream(&self.http_client, &track.stream_url, &path, ceiling).await
+                    {
                         if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
                             return Err(EngineError::YouTube(yt_err.clone()));
                         }
-                        return Err(EngineError::Other(format!("Failed to download track: {}", e)));
+                        return Err(EngineError::Other(format!(
+                            "Failed to download track: {}",
+                            e
+                        )));
                     }
                     self.load_and_play("current").await;
                     self.persist_slot(&track.track_id, &path).await;
@@ -509,13 +527,20 @@ impl PlayerEngine {
             path.display()
         );
 
-        if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await {
+        if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await
+        {
             let err_box = e;
             if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
                 return Err(EngineError::YouTube(yt_err.clone()));
             }
-            error!("play_track: download failed for {}: {}", track.stream_url, err_box);
-            return Err(EngineError::Other(format!("Failed to download track: {}", err_box)));
+            error!(
+                "play_track: download failed for {}: {}",
+                track.stream_url, err_box
+            );
+            return Err(EngineError::Other(format!(
+                "Failed to download track: {}",
+                err_box
+            )));
         }
 
         match tokio::fs::metadata(&path).await {
@@ -526,7 +551,10 @@ impl PlayerEngine {
             ),
             Err(e) => {
                 error!("play_track: slot file missing after download: {}", e);
-                return Err(EngineError::Other(format!("Slot file missing after download: {}", e)));
+                return Err(EngineError::Other(format!(
+                    "Slot file missing after download: {}",
+                    e
+                )));
             }
         }
 
@@ -762,7 +790,11 @@ impl PlayerEngine {
         }
     }
 
-    async fn start_streaming_playback(&mut self, url: &str, ceiling: u32) -> Result<(), StreamStartError> {
+    async fn start_streaming_playback(
+        &mut self,
+        url: &str,
+        ceiling: u32,
+    ) -> Result<(), StreamStartError> {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -774,7 +806,10 @@ impl PlayerEngine {
             let now = std::time::Instant::now();
             let cached = {
                 let cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.get(&cache_key).filter(|(_, ts)| now.duration_since(*ts) < YT_DLP_CACHE_TTL).cloned()
+                cache
+                    .get(&cache_key)
+                    .filter(|(_, ts)| now.duration_since(*ts) < YT_DLP_CACHE_TTL)
+                    .cloned()
             };
             match cached {
                 Some((rs, _)) => (rs.url, rs.abr, rs.codec, rs.ext, rs.duration),
@@ -782,7 +817,19 @@ impl PlayerEngine {
                     Ok(v) => {
                         let (stream_url, abr, codec, ext, duration) = &v;
                         let mut cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
-                        cache.insert(cache_key, (ResolvedStream { url: stream_url.clone(), abr: *abr, codec: codec.clone(), ext: ext.clone(), duration: *duration }, now));
+                        cache.insert(
+                            cache_key,
+                            (
+                                ResolvedStream {
+                                    url: stream_url.clone(),
+                                    abr: *abr,
+                                    codec: codec.clone(),
+                                    ext: ext.clone(),
+                                    duration: *duration,
+                                },
+                                now,
+                            ),
+                        );
                         drop(cache);
                         v
                     }
@@ -822,18 +869,16 @@ impl PlayerEngine {
         let http_client = self.http_client.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let download_handle = tokio::spawn(async move {
-            let result = stream_http_to_file(&http_client, &direct_url, &dl_path, download_cancel).await;
+            let result =
+                stream_http_to_file(&http_client, &direct_url, &dl_path, download_cancel).await;
             let _ = tx.send(result);
         });
 
-        if let Ok(Ok(Err(e))) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rx,
-        )
-        .await
-        {
+        if let Ok(Ok(Err(e))) = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             download_handle.abort();
-            return Err(StreamStartError::Playback(format!("stream download failed: {}", e).into()));
+            return Err(StreamStartError::Playback(
+                format!("stream download failed: {}", e).into(),
+            ));
         }
 
         {
@@ -887,9 +932,14 @@ impl PlayerEngine {
                     "stream container could not be probed from a partial file; falling back to a whole-file download"
                 );
                 self.stop();
-                stream_http_to_file(&self.http_client, &fallback_url, &path, Arc::new(AtomicBool::new(false)))
-                    .await
-                    .map_err(StreamStartError::Playback)?;
+                stream_http_to_file(
+                    &self.http_client,
+                    &fallback_url,
+                    &path,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .map_err(StreamStartError::Playback)?;
                 {
                     let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                     buf.pcm.clear();
@@ -962,6 +1012,94 @@ impl PlayerEngine {
         self.runtime_target_kbps
     }
 
+    /// Record client activity and keep the engine marked warm. Safe to call on
+    /// authenticated player requests; does not change session counts.
+    pub fn touch(&mut self) {
+        self.last_client_contact = std::time::Instant::now();
+        self.warmth = ColdWarm::Warm;
+    }
+
+    /// Register an active client session and ensure an output stream exists.
+    pub fn warm_up(&mut self) -> Result<(), String> {
+        self.active_sessions = self.active_sessions.saturating_add(1);
+        self.touch();
+        self.ensure_warm()
+    }
+
+    /// Unregister an active client session. The idle reaper performs the actual
+    /// cool-down when no sessions remain and the engine is idle.
+    pub fn cool_down(&mut self) {
+        self.active_sessions = self.active_sessions.saturating_sub(1);
+        self.touch();
+    }
+
+    pub fn active_sessions(&self) -> u32 {
+        self.active_sessions
+    }
+
+    pub fn is_warm(&self) -> bool {
+        self.warmth == ColdWarm::Warm && self.stream.is_some()
+    }
+
+    /// Ensure the output stream is created. Only creates/reuses the stream handle;
+    /// it must not perform unsafe cross-thread teardown.
+    pub fn ensure_warm(&mut self) -> Result<(), String> {
+        self.touch();
+        if self.stream.is_some() {
+            self.warmth = ColdWarm::Warm;
+            return Ok(());
+        }
+        match self.backend.start_stream(
+            "l337-audio-server",
+            48000,
+            2,
+            self.audio_buffer.clone(),
+            self.volume.clone(),
+        ) {
+            Ok(stream) => {
+                self.audio_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .backend_error
+                    .store(false, Ordering::SeqCst);
+                self.stream = Some(stream);
+                self.warmth = ColdWarm::Warm;
+                Ok(())
+            }
+            Err(e) => {
+                error!("ensure_warm: backend start failed: {}", e);
+                self.audio_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .backend_error
+                    .store(true, Ordering::SeqCst);
+                self.warmth = ColdWarm::Cold;
+                self.state = PlayerStateLabel::Stopped;
+                Err(e)
+            }
+        }
+    }
+
+    /// Cool down local engine state when idle. Returns true when the engine
+    /// became cold. Stream handle disconnect is deferred to backend-safe control
+    /// paths (reaper/recovery) to avoid cross-thread PipeWire teardown.
+    pub fn try_warm_down(&mut self, now: std::time::Instant) -> bool {
+        if self.active_sessions > 0 || self.state != PlayerStateLabel::Stopped {
+            return false;
+        }
+        if now.duration_since(self.last_client_contact) < self.idle_grace {
+            return false;
+        }
+        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.pcm.clear();
+        buf.read_pos = 0;
+        buf.consumed_total = 0;
+        buf.backend_error.store(false, Ordering::SeqCst);
+        drop(buf);
+        self.warmth = ColdWarm::Cold;
+        true
+    }
+
     pub fn seek(&mut self, position: u64) {
         if self.check_backend_error() {
             let _ = self.try_recover();
@@ -1027,7 +1165,8 @@ impl PlayerEngine {
 
         self.position_sec = position;
         let remaining_frames = total_frames;
-        self.duration_sec = Some((remaining_frames as f64 / file_sample_rate as f64).round() as u64);
+        self.duration_sec =
+            Some((remaining_frames as f64 / file_sample_rate as f64).round() as u64);
         self.state = PlayerStateLabel::Playing;
     }
 
@@ -1072,6 +1211,7 @@ impl PlayerEngine {
     }
 
     pub async fn get_status(&mut self) -> PlayerStatus {
+        self.touch();
         if self.check_backend_error() {
             let _ = self.try_recover();
         }
@@ -1089,7 +1229,11 @@ impl PlayerEngine {
                 .as_ref()
                 .map_or(true, |s| s.decode_handle.is_finished());
             let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
-            (decode_done, unconsumed, Self::buffer_position_sec(&buf, self.position_sec))
+            (
+                decode_done,
+                unconsumed,
+                Self::buffer_position_sec(&buf, self.position_sec),
+            )
         };
         let mut position_sec = position_from_buffer;
 
@@ -1135,6 +1279,8 @@ impl PlayerEngine {
             target_kbps: self.effective_target_kbps,
             actual_kbps: self.actual_kbps,
             codec: self.codec_label.clone(),
+            warm: self.is_warm(),
+            active_sessions: self.active_sessions(),
         }
     }
 }
@@ -1307,9 +1453,9 @@ fn decode_file_incremental_blocking(
     let source = FileSource { file };
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let hint = Hint::new();
-    let probed =
-        symphonia::default::get_probe().format(&hint, mss, &Default::default(), &Default::default())
-            .map_err(|e| format!("format probe failed: {e}"))?;
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &Default::default(), &Default::default())
+        .map_err(|e| format!("format probe failed: {e}"))?;
 
     let mut format = probed.format;
     let track = format
@@ -1334,7 +1480,11 @@ fn decode_file_incremental_blocking(
     let codec = codec_label(codec_params.codec);
 
     let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+    let channels = codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2)
+        .max(1);
 
     {
         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -1385,13 +1535,18 @@ fn decode_file_incremental_blocking(
     let mut stretcher = if tempo != 1.0 {
         wsola::TimeStretch::new(file_sample_rate, channels)
             .ok()
-            .map(|mut ts| { ts.set_tempo(tempo); ts })
+            .map(|mut ts| {
+                ts.set_tempo(tempo);
+                ts
+            })
     } else {
         None
     };
 
     let mut shifter = if pitch != 1.0 {
-        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+        Some(pitch_shift::Shifter::new(Box::new(
+            [0.0f32; pitch_shift::TOTAL_F32],
+        )))
     } else {
         None
     };
@@ -1416,10 +1571,7 @@ fn decode_file_incremental_blocking(
             Ok(audio_buf) => {
                 let spec = *audio_buf.spec();
                 if sample_buf.is_none() {
-                    sample_buf = Some(SampleBuffer::<f32>::new(
-                        audio_buf.capacity() as u64,
-                        spec,
-                    ));
+                    sample_buf = Some(SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec));
                 }
 
                 if let Some(buf) = &mut sample_buf {
@@ -1506,8 +1658,7 @@ fn decode_file_incremental_blocking(
             }
             let resampled = resampler.process(&pulled);
             if !resampled.is_empty() {
-                let mut ab =
-                    audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 ab.pcm.extend_from_slice(&resampled);
                 ab.notify_data();
                 total_frames += (resampled.len() / channels as usize) as u64;
@@ -1545,18 +1696,18 @@ fn decode_from_position_blocking(
     device_rate: u32,
 ) -> Result<(Vec<f32>, u32, u16, Option<String>, u64), String> {
     use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::formats::{SeekMode, SeekTo};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::probe::Hint;
     use symphonia::core::units::Time;
-    use symphonia::core::formats::{SeekMode, SeekTo};
 
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let source = FileSource { file };
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let hint = Hint::new();
-    let probed =
-        symphonia::default::get_probe().format(&hint, mss, &Default::default(), &Default::default())
-            .map_err(|e| format!("format probe failed: {e}"))?;
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &Default::default(), &Default::default())
+        .map_err(|e| format!("format probe failed: {e}"))?;
 
     let mut format = probed.format;
     let track = format
@@ -1581,7 +1732,11 @@ fn decode_from_position_blocking(
     let codec = codec_label(codec_params.codec);
 
     let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+    let channels = codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2)
+        .max(1);
 
     let mut total_frames: u64 = 0;
 
@@ -1630,10 +1785,16 @@ fn decode_from_position_blocking(
                 total_frames += out_frames as u64;
             }
         }
-        return Ok((pcm, 48000, head.channels, Some("opus".to_string()), total_frames));
+        return Ok((
+            pcm,
+            48000,
+            head.channels,
+            Some("opus".to_string()),
+            total_frames,
+        ));
     }
 
-        // Non-Opus: use symphonia's container-level seek to jump to position_sec.
+    // Non-Opus: use symphonia's container-level seek to jump to position_sec.
     if position_sec > 0 {
         let _ = format.seek(
             SeekMode::Accurate,
@@ -1653,13 +1814,18 @@ fn decode_from_position_blocking(
     let mut stretcher = if tempo != 1.0 {
         wsola::TimeStretch::new(file_sample_rate, channels)
             .ok()
-            .map(|mut ts| { ts.set_tempo(tempo); ts })
+            .map(|mut ts| {
+                ts.set_tempo(tempo);
+                ts
+            })
     } else {
         None
     };
 
     let mut shifter = if pitch != 1.0 {
-        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+        Some(pitch_shift::Shifter::new(Box::new(
+            [0.0f32; pitch_shift::TOTAL_F32],
+        )))
     } else {
         None
     };
@@ -1686,10 +1852,7 @@ fn decode_from_position_blocking(
             Ok(audio_buf) => {
                 let spec = *audio_buf.spec();
                 if sample_buf.is_none() {
-                    sample_buf = Some(SampleBuffer::<f32>::new(
-                        audio_buf.capacity() as u64,
-                        spec,
-                    ));
+                    sample_buf = Some(SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec));
                 }
 
                 if let Some(buf) = &mut sample_buf {
@@ -1855,8 +2018,10 @@ impl InterleavedResampler {
         let mut consumed = 0;
         let base = self.pending_offset;
         while self.pending.len() - base - consumed >= chunk_samples {
-            let wave_in =
-                deinterleave(&self.pending[base + consumed..base + consumed + chunk_samples], self.channels);
+            let wave_in = deinterleave(
+                &self.pending[base + consumed..base + consumed + chunk_samples],
+                self.channels,
+            );
             if let Ok(planar) = resampler.process(&wave_in, None) {
                 output.extend_from_slice(&interleave(planar));
             }
@@ -2088,7 +2253,9 @@ pub async fn download_stream(
 
     if is_youtube_url(url) && !is_direct_stream_url(url) {
         if !yt_dlp_available() {
-            return Err("yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into());
+            return Err(
+                "yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into(),
+            );
         }
         return download_via_ytdlp(url, dest, ceiling)
             .await
@@ -2130,9 +2297,10 @@ pub async fn download_stream(
             let start = &chunk[0..5];
             if start == b"<!doc" || start == b"<html" || start == b"<?xml" {
                 let _ = tokio::fs::remove_file(dest).await;
-                return Err(
-                    format!("downloaded content for {url} appears to be markup, not audio").into(),
-                );
+                return Err(format!(
+                    "downloaded content for {url} appears to be markup, not audio"
+                )
+                .into());
             }
             first_chunk_checked = true;
         }
@@ -2416,8 +2584,7 @@ fn select_audio_format<'a>(
     let mut audio: Vec<&serde_json::Value> = formats
         .iter()
         .filter(|f| {
-            carries_audio(f)
-                && f.get("vcodec").and_then(serde_json::Value::as_str) == Some("none")
+            carries_audio(f) && f.get("vcodec").and_then(serde_json::Value::as_str) == Some("none")
         })
         .collect();
     if audio.is_empty() {
@@ -2467,7 +2634,16 @@ fn normalize_codec(acodec: &str) -> Option<String> {
 async fn resolve_youtube_stream_url(
     url: &str,
     ceiling: u32,
-) -> Result<(String, Option<u32>, Option<String>, Option<String>, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (
+        String,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let format = ytdlp_selection_json(url, ceiling).await?;
 
     // Record the delivered bitrate / codec / duration of the chosen stream.
@@ -2610,7 +2786,11 @@ fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &Ato
 /// Each no-growth spell is logged so a *permanent* wedge (the download finished
 /// or died while the demuxer keeps erroring) is visible instead of a frozen
 /// playhead with no explanation.
-fn wait_for_progress(path: &std::path::Path, last_file_size: &mut u64, stall_cycles: &mut u32) -> bool {
+fn wait_for_progress(
+    path: &std::path::Path,
+    last_file_size: &mut u64,
+    stall_cycles: &mut u32,
+) -> bool {
     const STALL_TOLERANCE: u32 = 3000;
     const STALL_LOG_EVERY: u32 = 100; // ~20 s between progress reports
     let current_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -2747,7 +2927,8 @@ fn reprobe_format(
         // stream, and the caller skips forward to where it left off.
         if let Ok(file) = std::fs::File::open(path) {
             let source = FileSource { file };
-            let mss = symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
+            let mss =
+                symphonia::core::io::MediaSourceStream::new(Box::new(source), Default::default());
             if let Ok(p) = symphonia::default::get_probe().format(
                 &symphonia::core::probe::Hint::new(),
                 mss,
@@ -2860,9 +3041,7 @@ fn streaming_decode_sync(
     let track = if let Some(t) = audio_track {
         t
     } else {
-        format
-            .default_track()
-            .ok_or("no default track in stream")?
+        format.default_track().ok_or("no default track in stream")?
     };
     track_id = track.id;
     codec_params = track.codec_params.clone();
@@ -3006,7 +3185,11 @@ fn streaming_decode_sync(
     }
 
     let file_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count() as u16).unwrap_or(2).max(1);
+    let channels = codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2)
+        .max(1);
 
     {
         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
@@ -3039,13 +3222,18 @@ fn streaming_decode_sync(
     let mut stretcher = if tempo != 1.0 {
         wsola::TimeStretch::new(file_sample_rate, channels)
             .ok()
-            .map(|mut ts| { ts.set_tempo(tempo); ts })
+            .map(|mut ts| {
+                ts.set_tempo(tempo);
+                ts
+            })
     } else {
         None
     };
 
     let mut shifter = if pitch != 1.0 {
-        Some(pitch_shift::Shifter::new(Box::new([0.0f32; pitch_shift::TOTAL_F32])))
+        Some(pitch_shift::Shifter::new(Box::new(
+            [0.0f32; pitch_shift::TOTAL_F32],
+        )))
     } else {
         None
     };
@@ -3113,7 +3301,9 @@ fn streaming_decode_sync(
                                 output = stretcher.pull(4096);
                             }
 
-                            if let (Some(ref mut shifter), Some(semitones)) = (shifter.as_mut(), shift_semitones) {
+                            if let (Some(ref mut shifter), Some(semitones)) =
+                                (shifter.as_mut(), shift_semitones)
+                            {
                                 let ch = channels as usize;
                                 let mut input_planar = vec![Vec::new(); ch];
                                 for frame in output.chunks(ch) {
@@ -3128,7 +3318,12 @@ fn streaming_decode_sync(
                                         for (i, &s) in chunk.iter().enumerate() {
                                             buf[i] = s;
                                         }
-                                        let result = shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                                        let result = shifter.shift(
+                                            &buf,
+                                            semitones,
+                                            128,
+                                            file_sample_rate as f32,
+                                        );
                                         pitched_planar[c].extend_from_slice(result);
                                     }
                                 }
@@ -3210,7 +3405,8 @@ fn streaming_decode_sync(
                                 if stall_cycles == 1 || stall_cycles.is_multiple_of(100) {
                                     tracing::warn!(error = ?e, ?stall_cycles, "streaming decode error, waiting for download");
                                 }
-                                if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                                if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles)
+                                {
                                     break;
                                 }
                             }
@@ -3233,7 +3429,11 @@ fn streaming_decode_sync(
                                     // The probe could not run (file vanished or
                                     // the user moved on): wait for the download
                                     // rather than abandoning the track.
-                                    if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                                    if !wait_for_progress(
+                                        &path,
+                                        &mut last_file_size,
+                                        &mut stall_cycles,
+                                    ) {
                                         break;
                                     }
                                 }
@@ -3310,7 +3510,8 @@ fn streaming_decode_sync(
                             error_cycles = 0;
                             error_start_size = current_size;
                             stall_cycles = 0;
-                        } else if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles) {
+                        } else if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles)
+                        {
                             // The probe could not run: wait for the download
                             // rather than abandoning the track.
                             break;
@@ -3326,11 +3527,11 @@ fn streaming_decode_sync(
     // writer underruns before `get_status` declares end-of-track. Skipped on
     // cancel, where the buffer is being torn down anyway.
     let tail = resampler.finish();
-        if !tail.is_empty() {
-            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            ab.pcm.extend_from_slice(&tail);
-            ab.notify_data();
-        }
+    if !tail.is_empty() {
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        ab.pcm.extend_from_slice(&tail);
+        ab.notify_data();
+    }
 
     Ok(())
 }
@@ -3380,9 +3581,9 @@ mod tests {
     fn test_select_audio_format_best_picks_highest_bitrate() {
         // YouTube's typical audio-only ladder, deliberately out of order.
         let formats = vec![
-            fmt("140", Some(129.0), "mp4a.40.2"),   // AAC m4a, the wrong pick
+            fmt("140", Some(129.0), "mp4a.40.2"), // AAC m4a, the wrong pick
             fmt("139", Some(49.0), "mp4a.40.5"),
-            fmt("251", Some(158.0), "opus"),        // highest available
+            fmt("251", Some(158.0), "opus"), // highest available
             fmt("250", Some(74.0), "opus"),
             fmt("249", Some(51.0), "opus"),
         ];
@@ -3407,23 +3608,38 @@ mod tests {
         // Nothing fits the ceiling except the lowest: deliver the lowest rather
         // than failing playback, and report it as the true actual_kbps.
         let chosen = select_audio_format(&formats, 60).expect("a format must be chosen");
-        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("139"));
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("139")
+        );
 
         // 130 admits 129 but not 158: the 129 kbps AAC is the highest that fits.
         let chosen = select_audio_format(&formats, 130).expect("a format must be chosen");
-        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("140"));
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("140")
+        );
 
         // 128 admits neither 129 nor 158, so the 74 kbps tier is the highest fit.
         let chosen = select_audio_format(&formats, 128).expect("a format must be chosen");
-        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("250"));
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("250")
+        );
 
         // Just above an Opus tier: that tier, not a lower one.
         let chosen = select_audio_format(&formats, 100).expect("a format must be chosen");
-        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("250"));
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("250")
+        );
 
         // Wide open ceiling behaves like best.
         let chosen = select_audio_format(&formats, 1024).expect("a format must be chosen");
-        assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("251"));
+        assert_eq!(
+            chosen.get("format_id").and_then(|v| v.as_str()),
+            Some("251")
+        );
     }
 
     #[test]
@@ -3464,8 +3680,8 @@ mod tests {
         // Audio-only ladder, out of order: the 158 k Opus must win over the 129 k
         // AAC that yt-dlp's own `bestaudio` ranking would have delivered.
         let formats = vec![
-            fmt("140", Some(129.0), "mp4a.40.2"),   // the wrong pick under yt-dlp's ranking
-            fmt("251", Some(158.0), "opus"),        // highest available
+            fmt("140", Some(129.0), "mp4a.40.2"), // the wrong pick under yt-dlp's ranking
+            fmt("251", Some(158.0), "opus"),      // highest available
             fmt("250", Some(74.0), "opus"),
             fmt("249", Some(51.0), "opus"),
         ];
@@ -3488,8 +3704,11 @@ mod tests {
             fmt("251", Some(158.0), "opus"),
         ];
         let best = select_audio_format(&with_video, 0).expect("some format must be chosen");
-        assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"),
-            "audio-only renditions win over higher-bitrate video+audio renditions");
+        assert_eq!(
+            best.get("format_id").and_then(|v| v.as_str()),
+            Some("251"),
+            "audio-only renditions win over higher-bitrate video+audio renditions"
+        );
     }
 
     #[test]
@@ -3508,7 +3727,10 @@ mod tests {
             detect_youtube_block("HTTP Error 429 Too Many Requests"),
             Some(YouTubeBlockType::RateLimit)
         );
-        assert_eq!(detect_youtube_block("yt-dlp: 429"), Some(YouTubeBlockType::RateLimit));
+        assert_eq!(
+            detect_youtube_block("yt-dlp: 429"),
+            Some(YouTubeBlockType::RateLimit)
+        );
     }
 
     #[test]
@@ -3560,14 +3782,8 @@ mod tests {
     #[test]
     fn test_yt_dlp_format_selector_fallback() {
         assert_eq!(yt_dlp_format_selector(0), "bestaudio");
-        assert_eq!(
-            yt_dlp_format_selector(128),
-            "bestaudio[abr<=128]/bestaudio"
-        );
-        assert_eq!(
-            yt_dlp_format_selector(48),
-            "bestaudio[abr<=48]/bestaudio"
-        );
+        assert_eq!(yt_dlp_format_selector(128), "bestaudio[abr<=128]/bestaudio");
+        assert_eq!(yt_dlp_format_selector(48), "bestaudio[abr<=48]/bestaudio");
         assert_eq!(
             yt_dlp_format_selector(1024),
             "bestaudio[abr<=1024]/bestaudio"
@@ -3772,7 +3988,9 @@ exit 1
         let _ = std::fs::set_permissions(&fake_ytdlp, std::fs::Permissions::from_mode(0o755));
 
         let original_path = std::env::var("PATH").unwrap_or_default();
-        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path)); }
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        }
         DOWNLOAD_STREAM_INVOKED.store(false, Ordering::SeqCst);
 
         let storage = StorageManager::new(500 * 1024 * 1024, Some(dir.clone())).await;
@@ -3790,7 +4008,9 @@ exit 1
 
         let result = engine.play_track(track).await;
 
-        unsafe { std::env::set_var("PATH", original_path); }
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -3835,7 +4055,10 @@ exit 1
         // Growth resets the episode counter.
         std::fs::write(&path, vec![0u8; 8]).unwrap();
         assert!(wait_for_progress(&path, &mut last_size, &mut stall_cycles));
-        assert_eq!(stall_cycles, 0, "a growing file must reset the stall counter");
+        assert_eq!(
+            stall_cycles, 0,
+            "a growing file must reset the stall counter"
+        );
         assert_eq!(last_size, 8);
 
         // A second no-growth spell starts from zero again, not from the old high.
@@ -3858,7 +4081,14 @@ exit 1
 
         // First wedge on a growing file: rebuild.
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                100,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Rebuild,
             "a wedged reader must be rebuilt the first time"
         );
@@ -3866,14 +4096,28 @@ exit 1
 
         // Same size, within the rate limit: wait, do not spin.
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                100,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Wait,
             "back-to-back rebuilds must be rate-limited"
         );
 
         // Not a wedge error: the caller's own error handling applies.
         assert_eq!(
-            wedge_action("mkv: something else entirely", 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                "mkv: something else entirely",
+                1,
+                true,
+                100,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::NotWedge,
             "an unrelated demux error must not trigger a rebuild"
         );
@@ -3882,7 +4126,14 @@ exit 1
         // waits, so a trickling download does not burn rebuilds.
         std::thread::sleep(REBUILD_MIN_INTERVAL);
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                100,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Wait,
             "a quiet file must not be re-probed before the grace elapses"
         );
@@ -3891,7 +4142,14 @@ exit 1
         // which is the only thing that lifts Symphonia's frozen length bound.
         std::thread::sleep(REBUILD_QUIET_GRACE);
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 100, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                100,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Rebuild,
             "a wedged reader on a quiet (finished) file must be rebuilt"
         );
@@ -3899,13 +4157,27 @@ exit 1
         // New bytes after the last rebuild are always worth another probe, but
         // never sooner than the rate limit allows.
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 4_000_000, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                4_000_000,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Wait,
             "the rate limit applies to growth-triggered rebuilds too"
         );
         std::thread::sleep(REBUILD_MIN_INTERVAL);
         assert_eq!(
-            wedge_action(PAST_MASTER, 1, true, 4_000_000, &mut size_at_last_rebuild, &mut last_rebuild_at),
+            wedge_action(
+                PAST_MASTER,
+                1,
+                true,
+                4_000_000,
+                &mut size_at_last_rebuild,
+                &mut last_rebuild_at
+            ),
             WedgeAction::Rebuild,
             "growth since the last rebuild must trigger one"
         );
@@ -3945,7 +4217,11 @@ exit 1
             std::fs::write(&path, vec![0u8; size as usize]).unwrap();
 
             // The append resets `wait_for_progress`'s counter every cycle.
-            assert!(wait_for_progress(&path, &mut last_file_size, &mut stall_cycles));
+            assert!(wait_for_progress(
+                &path,
+                &mut last_file_size,
+                &mut stall_cycles
+            ));
 
             // A wedged reader answers every next_packet with this error.
             error_cycles += 1;
@@ -4079,77 +4355,5 @@ exit 1
         }
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// Warmth state helpers ──────────────────────────────────────────────────
-    impl PlayerEngine {
-        /// Update last_client_contact so the server stays warm while a player
-        /// is active/polling. Idempotent; cheap (lock + Instant::now).
-        pub fn touch(&mut self) {
-            let _ = self.active_sessions.saturating_add(1);
-            self.last_client_contact = std::time::Instant::now();
-            self.warmth = ColdWarm::Warm;
-        }
-
-        /// Increment active_sessions and warm. Called when a new player session
-        /// connects (via /player/session/connect).
-        pub fn warm_up(&mut self) {
-            self.active_sessions += 1;
-            self.warmth = ColdWarm::Warm;
-            self.last_client_contact = std::time::Instant::now();
-        }
-
-        /// Decrement active_sessions. Called when a player session ends
-        /// (via /player/session/disconnect).
-        pub fn cool_down(&mut self) {
-            self.active_sessions = self.active_sessions.saturating_sub(1);
-        }
-
-        /// Try to warm down: if stopped+idle for > idle_grace and no sessions,
-        /// // disconnect the PipeWire stream on the mainloop thread.
-        /// Returns true if warm-down was performed.
-        pub fn try_warm_down(&mut self, now: std::time::Instant) -> bool {
-            if self.active_sessions > 0 {
-                return false;
-            }
-            if self.state != PlayerStateLabel::Stopped {
-                return false;
-            }
-            if now - self.last_client_contact < self.idle_grace {
-                return false;
-            }
-            // Perform local state teardown (pause + clear buffer).
-            // The actual PipeWire disconnect is deferred to the mainloop thread
-            // via a channel send (see server reaper in main.rs).
-            if let Some(stream) = self.stream.as_mut() {
-                let _ = stream.pause();
-            }
-            {
-                let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                buf.pcm.clear();
-                buf.read_pos = 0;
-                buf.consumed_total = 0;
-                buf.backend_error.store(false, Ordering::SeqCst);
-            }
-            self.position_sec = 0;
-            self.state = PlayerStateLabel::Stopped;
-            self.warmth = ColdWarm::Cold;
-            return true;
-        }
-
-        /// Ensure the PipeWire stream is warmed (connected/active). Called at every
-        /// playback entry point and on explicit session connect. If already warm
-        /// returns immediately; if cold, starts/connects the stream and marks warm.
-        pub fn ensure_warm(&mut self) {
-            if self.warmth == ColdWarm::Warm {
-                return;
-            }
-            self.backend
-                .start_stream("l337-audio-server", 48000, 2, self.audio_buffer.clone(), self.volume.clone())
-                .ok();
-            self.warmth = ColdWarm::Warm;
-            self.last_client_contact = std::time::Instant::now();
-            self.active_sessions = 1;
-        }
     }
 }

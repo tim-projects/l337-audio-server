@@ -1,19 +1,29 @@
-use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer, ensure_runtime_dir};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::platform::common::{AudioBackend, AudioBuffer, AudioOutputStream, ensure_runtime_dir};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct SendSyncStream(pipewire::stream::StreamBox<'static>);
 unsafe impl Send for SendSyncStream {}
 unsafe impl Sync for SendSyncStream {}
 
-#[derive(Debug, Clone)]enum Command {    SetActive(bool),    Disconnect,}struct PipeWireCommandSender {    sender: pipewire::channel::Sender<Command>,}impl PipeWireCommandSender {    fn set_active(&self, active: bool) {
+#[derive(Debug, Clone)]
+enum Command {
+    SetActive(bool),
+    Disconnect,
+}
+struct PipeWireCommandSender {
+    sender: pipewire::channel::Sender<Command>,
+}
+impl PipeWireCommandSender {
+    fn set_active(&self, active: bool) {
         let _ = self.sender.send(Command::SetActive(active));
     }
     fn disconnect(&self) {
         let _ = self.sender.send(Command::Disconnect);
     }
-}pub struct PipeWireAudioBackend;
+}
+pub struct PipeWireAudioBackend;
 
 pub struct PipeWireAudioOutputStream {
     playing: Arc<AtomicBool>,
@@ -24,8 +34,7 @@ pub struct PipeWireAudioOutputStream {
 fn terminal_pw_state(new: &pipewire::stream::StreamState) -> bool {
     matches!(
         new,
-        pipewire::stream::StreamState::Error(_)
-            | pipewire::stream::StreamState::Unconnected
+        pipewire::stream::StreamState::Error(_) | pipewire::stream::StreamState::Unconnected
     )
 }
 
@@ -38,21 +47,33 @@ impl AudioBackend for PipeWireAudioBackend {
         audio_buffer: Arc<Mutex<AudioBuffer>>,
         volume: Arc<Mutex<f32>>,
     ) -> Result<Box<dyn AudioOutputStream>, String> {
-        tracing::info!("Starting PipeWire stream: name={}, sample_rate={}, channels={}", name, sample_rate, channels);
+        tracing::info!(
+            "Starting PipeWire stream: name={}, sample_rate={}, channels={}",
+            name,
+            sample_rate,
+            channels
+        );
         pipewire::init();
 
-        let main_loop = Box::new(pipewire::main_loop::MainLoopBox::new(None)
-            .map_err(|e| format!("Failed to create PipeWire main loop: {}", e))?);
+        let main_loop = Box::new(
+            pipewire::main_loop::MainLoopBox::new(None)
+                .map_err(|e| format!("Failed to create PipeWire main loop: {}", e))?,
+        );
 
         let main_loop_leaked = Box::leak(main_loop);
 
-        let context = Box::new(pipewire::context::ContextBox::new(&main_loop_leaked.loop_(), None)
-            .map_err(|e| format!("Failed to create PipeWire context: {}", e))?);
+        let context = Box::new(
+            pipewire::context::ContextBox::new(&main_loop_leaked.loop_(), None)
+                .map_err(|e| format!("Failed to create PipeWire context: {}", e))?,
+        );
 
         let context_leaked = Box::leak(context);
 
-        let core = Box::new(context_leaked.connect(None)
-            .map_err(|e| format!("Failed to connect to PipeWire: {}", e))?);
+        let core = Box::new(
+            context_leaked
+                .connect(None)
+                .map_err(|e| format!("Failed to connect to PipeWire: {}", e))?,
+        );
 
         let core_leaked = Box::leak(core);
 
@@ -79,7 +100,11 @@ impl AudioBackend for PipeWireAudioBackend {
             .add_local_listener_with_user_data((ab, vol, playing_cb, channels_captured))
             .state_changed(|_stream, user_data, old, new| {
                 if terminal_pw_state(&new) {
-                    tracing::warn!("PipeWire stream entered error state: {:?} -> {:?}", old, new);
+                    tracing::warn!(
+                        "PipeWire stream entered error state: {:?} -> {:?}",
+                        old,
+                        new
+                    );
                     let (ab, _vol, playing_cb, _channels) = user_data;
                     playing_cb.store(false, Ordering::SeqCst);
                     if let Ok(mut buf) = ab.lock() {
@@ -238,7 +263,10 @@ impl AudioBackend for PipeWireAudioBackend {
         tracing::info!("PipeWire stream activated successfully");
 
         let stream = unsafe {
-            std::mem::transmute::<pipewire::stream::StreamBox<'_>, pipewire::stream::StreamBox<'static>>(stream)
+            std::mem::transmute::<
+                pipewire::stream::StreamBox<'_>,
+                pipewire::stream::StreamBox<'static>,
+            >(stream)
         };
 
         struct SendMainLoopPtr(*mut pipewire::sys::pw_main_loop);
@@ -255,10 +283,8 @@ impl AudioBackend for PipeWireAudioBackend {
 
         let _leaked_listener = Box::leak(Box::new(listener));
 
-        std::thread::spawn(move || {
-            unsafe {
-                main_loop_ptr.run();
-            }
+        std::thread::spawn(move || unsafe {
+            main_loop_ptr.run();
         });
 
         Ok(Box::new(PipeWireAudioOutputStream {

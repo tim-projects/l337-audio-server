@@ -3,8 +3,8 @@ mod auth_challenge;
 mod platform;
 mod player;
 mod rate_limit;
-mod security;
 mod secrets_fs;
+mod security;
 
 use crate::api::handlers::{self, AppState};
 use crate::auth_challenge::ChallengeState;
@@ -12,17 +12,16 @@ use crate::player::engine::PlayerEngine;
 use crate::player::storage::StorageManager;
 use crate::rate_limit::RateLimiter;
 use axum::{
-    Router,
+    Extension, Router,
     routing::{get, post, put},
-    Extension,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
+use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Deserialize, Default)]
@@ -94,8 +93,7 @@ fn socket_mode_from_settings(settings: &ServerSettings) -> u32 {
 
 /// Path to the Unix domain socket used for local IPC.
 fn socket_path() -> PathBuf {
-    platform::common::runtime_dir()
-        .join("l337.sock")
+    platform::common::runtime_dir().join("l337.sock")
 }
 
 /// Check whether a Unix socket at `path` is actively accepting connections.
@@ -192,11 +190,31 @@ fn resolve_log_level(loglevel: Option<&str>) -> ResolvedLogLevel {
         };
     };
     match level.to_ascii_lowercase().as_str() {
-        "error" => ResolvedLogLevel { level: "error", invalid: false, configured: true },
-        "warn" => ResolvedLogLevel { level: "warn", invalid: false, configured: true },
-        "info" => ResolvedLogLevel { level: "info", invalid: false, configured: true },
-        "debug" => ResolvedLogLevel { level: "debug", invalid: false, configured: true },
-        "trace" => ResolvedLogLevel { level: "trace", invalid: false, configured: true },
+        "error" => ResolvedLogLevel {
+            level: "error",
+            invalid: false,
+            configured: true,
+        },
+        "warn" => ResolvedLogLevel {
+            level: "warn",
+            invalid: false,
+            configured: true,
+        },
+        "info" => ResolvedLogLevel {
+            level: "info",
+            invalid: false,
+            configured: true,
+        },
+        "debug" => ResolvedLogLevel {
+            level: "debug",
+            invalid: false,
+            configured: true,
+        },
+        "trace" => ResolvedLogLevel {
+            level: "trace",
+            invalid: false,
+            configured: true,
+        },
         _ => ResolvedLogLevel {
             level: DEFAULT_LEVEL,
             invalid: true,
@@ -360,9 +378,7 @@ async fn main() {
     let buffer_max_bytes = settings.server.buffer_max_bytes.unwrap_or(24 * 1024 * 1024);
     let default_target_kbps = settings.server.default_target_kbps.unwrap_or(0);
     let engine = if dummy_mode {
-        tracing::warn!(
-            "Running in DUMMY output mode. No audio will be produced. Testing only."
-        );
+        tracing::warn!("Running in DUMMY output mode. No audio will be produced. Testing only.");
         PlayerEngine::new_dummy(storage, buffer_max_bytes, default_target_kbps)
     } else {
         match PlayerEngine::new(storage, buffer_max_bytes, default_target_kbps) {
@@ -388,12 +404,12 @@ async fn main() {
         loop {
             let idle_interval = Duration::from_secs(5);
             let active_interval = Duration::from_millis(500);
-            let sleep_for = {
+            let (sleep_for, should_try_warm_down) = {
                 let engine = recovery_state.0.lock().await;
                 if matches!(engine.state, crate::api::models::PlayerStateLabel::Stopped) {
-                    idle_interval
+                    (idle_interval, true)
                 } else {
-                    active_interval
+                    (active_interval, false)
                 }
             };
             tokio::time::sleep(sleep_for).await;
@@ -401,14 +417,16 @@ async fn main() {
                 break;
             }
             let mut engine = recovery_state.0.lock().await;
+            if should_try_warm_down && engine.try_warm_down(std::time::Instant::now()) {
+                tracing::info!("Idle reaper marked engine cold after inactivity");
+            }
             if engine.check_backend_error() {
                 if let Err(e) = engine.try_recover() {
                     tracing::error!("Backend recovery failed: {}", e);
                 }
             }
         }
-        // Idle reaper: warm down the PipeWire stream if stopped+idle for > idle_grace
-});
+    });
 
     // Resolve the auth token: reuse configured value, else load/persist a stable
     // generated token so the client only needs to copy it once.
@@ -460,7 +478,7 @@ async fn main() {
                 .join("l337-audio-server")
         });
     let challenge_state = Arc::new(ChallengeState::new(challenge_dir));
-#[cfg(feature = "qr")]
+    #[cfg(feature = "qr")]
     if std::env::args().any(|a| a == "--qr" || a == "--print-pairing-qr") {
         if let Err(e) = challenge_state.issue().await {
             eprintln!("failed to issue challenge: {e}");
@@ -504,13 +522,19 @@ async fn main() {
         .route("/player/volume", post(handlers::set_volume))
         .route("/player/seek", post(handlers::seek))
         .route("/player/target", post(handlers::set_target))
+        .route("/player/session/connect", post(handlers::session_connect))
+        .route(
+            "/player/session/disconnect",
+            post(handlers::session_disconnect),
+        )
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
         .route("/auth/challenge", post(handlers::auth_challenge))
         .route("/auth/redeem", post(handlers::auth_redeem));
-#[cfg(feature = "qr")]
+    #[cfg(feature = "qr")]
     let app = app.route("/auth/challenge/qr", get(handlers::auth_challenge_qr));
-    let mut app = app.with_state(shared_state)
+    let mut app = app
+        .with_state(shared_state)
         .layer(Extension(challenge_state.clone()))
         .layer(Extension(auth_layer.clone()))
         .layer(Extension(socket_mode))
@@ -544,7 +568,10 @@ async fn main() {
                 let _ = std::fs::set_permissions(&path, perms);
             }
         }
-        tracing::info!("L337 Audio Server listening on Unix socket {}", path.display());
+        tracing::info!(
+            "L337 Audio Server listening on Unix socket {}",
+            path.display()
+        );
         axum_server::from_unix(listener)
             .expect("Failed to create axum server from Unix listener")
             .serve(app.into_make_service())
@@ -670,7 +697,8 @@ fn ensure_config_file() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
+                    let _ =
+                        std::fs::set_permissions(etc_path, std::fs::Permissions::from_mode(0o600));
                 }
                 eprintln!(
                     "INFO: No server.ini found; created a default at {}",
@@ -797,7 +825,10 @@ mod tests {
             ("trace", "trace"),
         ] {
             let r = resolve_log_level(Some(input));
-            assert_eq!(r.level, expected, "loglevel {input:?} must resolve to {expected:?}");
+            assert_eq!(
+                r.level, expected,
+                "loglevel {input:?} must resolve to {expected:?}"
+            );
             assert!(!r.invalid && r.configured);
         }
     }

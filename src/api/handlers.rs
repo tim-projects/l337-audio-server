@@ -1,5 +1,8 @@
-use crate::api::models::{AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload, TargetPayload, Track, VolumePayload};
-use crate::player::engine::{download_stream, PlayerEngine};
+use crate::api::models::{
+    AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload,
+    TargetPayload, Track, VolumePayload,
+};
+use crate::player::engine::{PlayerEngine, download_stream};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Json, State},
@@ -84,7 +87,9 @@ pub async fn auth_challenge(
     match challenge_state.issue().await {
         Ok(()) => (
             StatusCode::ACCEPTED,
-            Json(AuthChallengeResponse { expires_in: crate::auth_challenge::CHALLENGE_TTL.as_secs() }),
+            Json(AuthChallengeResponse {
+                expires_in: crate::auth_challenge::CHALLENGE_TTL.as_secs(),
+            }),
         )
             .into_response(),
         Err(e) => {
@@ -126,7 +131,10 @@ pub async fn auth_redeem(
             .into_response();
     }
 
-    let presented = match headers.get("X-L337-Challenge").and_then(|v| v.to_str().ok()) {
+    let presented = match headers
+        .get("X-L337-Challenge")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v,
         None => {
             return (
@@ -140,11 +148,7 @@ pub async fn auth_redeem(
     match challenge_state.verify_and_consume(presented).await {
         Ok(token) => {
             auth_layer.update_token(token);
-            (
-                StatusCode::OK,
-                Json(AuthRedeemResponse { ok: true }),
-            )
-                .into_response()
+            (StatusCode::OK, Json(AuthRedeemResponse { ok: true })).into_response()
         }
         Err(crate::auth_challenge::ChallengeError::Io(e)) => {
             tracing::error!("Challenge redeem IO error: {}", e);
@@ -154,13 +158,11 @@ pub async fn auth_redeem(
             )
                 .into_response()
         }
-        Err(_) => {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid_or_expired_challenge"})),
-            )
-                .into_response()
-        }
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid_or_expired_challenge"})),
+        )
+            .into_response(),
     }
 }
 
@@ -204,13 +206,11 @@ pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> im
                 )
                     .into_response()
             }
-            crate::player::engine::EngineError::Other(msg) => {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"ok": false, "error": msg})),
-                )
-                    .into_response()
-            }
+            crate::player::engine::EngineError::Other(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": msg})),
+            )
+                .into_response(),
         },
     }
 }
@@ -339,10 +339,16 @@ pub async fn set_speed(
     State(state): State<AppState>,
     Json(payload): Json<SpeedPayload>,
 ) -> impl IntoResponse {
-    if payload.speed.is_nan() || payload.speed.is_infinite() || payload.pitch.is_nan() || payload.pitch.is_infinite() {
+    if payload.speed.is_nan()
+        || payload.speed.is_infinite()
+        || payload.pitch.is_nan()
+        || payload.pitch.is_infinite()
+    {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok": false, "error": "speed and pitch must be finite numbers"})),
+            Json(
+                serde_json::json!({"ok": false, "error": "speed and pitch must be finite numbers"}),
+            ),
         )
             .into_response();
     }
@@ -392,6 +398,34 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(status).into_response()
 }
 
+pub async fn session_connect(State(state): State<AppState>) -> impl IntoResponse {
+    let mut engine = state.0.lock().await;
+    match engine.warm_up() {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "warm": engine.is_warm(),
+            "active_sessions": engine.active_sessions(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn session_disconnect(State(state): State<AppState>) -> impl IntoResponse {
+    let mut engine = state.0.lock().await;
+    engine.cool_down();
+    Json(serde_json::json!({
+        "ok": true,
+        "warm": engine.is_warm(),
+        "active_sessions": engine.active_sessions(),
+    }))
+    .into_response()
+}
+
 pub async fn set_settings(
     State(state): State<AppState>,
     Json(settings): Json<PoolSettings>,
@@ -428,7 +462,8 @@ pub async fn health() -> impl IntoResponse {
             "codecs": codecs,
             "quality": true,
         }
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Streaming upload of raw audio bytes into an active slot. The client pushes
@@ -501,14 +536,25 @@ pub async fn upload_stream(
 
     if let Err(e) = result {
         error!("Stream upload to {}.stream failed: {}", slot, e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": "upload failed"}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": "upload failed"})),
+        )
+            .into_response();
     }
 
     let mut engine = state.0.lock().await;
     if slot == "current" {
-        if let Err(e) = engine.play_pushed(&track_id, "current", title, artist).await {
+        if let Err(e) = engine
+            .play_pushed(&track_id, "current", title, artist)
+            .await
+        {
             error!("play_pushed failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "error": e}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response();
         }
     } else {
         // next/prev are precached; record access so eviction accounts for them.
@@ -562,20 +608,12 @@ pub async fn auth_challenge_qr(
         .map(|ConnectInfo(a)| a)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     if let Err(_) = rate_limiter.check(addr) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-        )
-            .into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     let token = match challenge_state.current_token().await {
         Some(t) => t,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                "no active challenge",
-            )
-                .into_response();
+            return (StatusCode::NOT_FOUND, "no active challenge").into_response();
         }
     };
     let code = qrcode::QrCode::new(token.as_bytes()).unwrap();
@@ -584,5 +622,10 @@ pub async fn auth_challenge_qr(
         .quiet_zone(true)
         .module_dimensions(2, 1)
         .build();
-    (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], s).into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        s,
+    )
+        .into_response()
 }

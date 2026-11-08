@@ -68,7 +68,11 @@ where
 /// best (no ceiling). Precedence: explicit `target_kbps > 0` wins; else a
 /// `quality` label through the ladder; else the server `default_target_kbps`;
 /// else best (0). An unknown/absent `quality` never errors — it is skipped.
-pub fn resolve_ceiling(target_kbps: Option<u32>, quality: Option<Quality>, server_default: u32) -> u32 {
+pub fn resolve_ceiling(
+    target_kbps: Option<u32>,
+    quality: Option<Quality>,
+    server_default: u32,
+) -> u32 {
     if let Some(kbps) = target_kbps {
         if kbps > 0 {
             return kbps;
@@ -179,6 +183,12 @@ pub struct PlayerStatus {
     /// known. `None` when unknown.
     #[serde(default)]
     pub codec: Option<String>,
+    /// True when the engine has an active/warm output stream for a client session.
+    #[serde(default)]
+    pub warm: bool,
+    /// Number of active client sessions reported via session connect/disconnect.
+    #[serde(default)]
+    pub active_sessions: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
