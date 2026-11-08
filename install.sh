@@ -24,20 +24,20 @@ ok()   { echo -e "\033[1;32m[OK]\033[0m   $*"; }
 INSTALL_PRERELEASE=false
 UNINSTALL_REQUESTED=false
 FORCE=false
+DRY_RUN=false
+REMOVE_DATA=false
 ORIGINAL_ARGS=("$@")
 FORWARD_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
         --force|-f)                 FORCE=true; shift ;;
-        --uninstall|-u)
-            UNINSTALL_REQUESTED=true
-            shift ;;
-        --pipewire-user)
-            FORWARD_ARGS+=("--pipewire-user")
-            shift ;;
+        --uninstall|-u)             UNINSTALL_REQUESTED=true; shift ;;
+        --dry-run)                  DRY_RUN=true; FORWARD_ARGS+=("--dry-run"); shift ;;
+        --remove-data)              REMOVE_DATA=true; shift ;;
+        --pipewire-user)            FORWARD_ARGS+=("--pipewire-user"); shift ;;
         -h|--help)
-            echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall"
+            echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall [--dry-run] [--remove-data]"
             echo ""
             echo "Resolves the newest GitHub release that publishes a binary for this"
             echo "platform, downloads it, and runs the platform installer on it."
@@ -46,11 +46,12 @@ while [ $# -gt 0 ]; do
             echo "  --pre-release       Install the newest prerelease instead of the newest stable release"
             echo "  --force, -f         Reinstall even if the installed version already matches"
             echo "  --no-install-deps   Do not auto-install missing system packages (Linux only)"
+            echo "  --dry-run           Show what would happen without making changes (install and uninstall)"
+            echo "  --uninstall, -u     Uninstall (runs before install; only --dry-run and --remove-data forwarded)"
+            echo "  --remove-data       With --uninstall: also remove configuration/data directories"
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
             echo "--pre-release and --force are not forwarded to the platform installer."
-            echo "  --uninstall, -u     Uninstall (runs before install; other flags ignored)"
-            echo "Install-only options (--dry-run, --no-audio, --user, --prefix, --pipewire-user [legacy]) are ignored with --uninstall."
             exit 0 ;;
         *) FORWARD_ARGS+=("$1"); shift ;;
     esac
@@ -130,7 +131,7 @@ else
 fi
 
 # Uninstall runs before the install path. Only `--uninstall`/`-u` triggers it;
-# all other flags are ignored so `install.sh --uninstall <anything>` uninstalls.
+# only --dry-run and --remove-data are forwarded to the platform uninstaller.
 if [ "$UNINSTALL_REQUESTED" = true ]; then
     SCRIPT_TAG="${SCRIPT_TAG:-main}"
     SCRIPT_PATH=""
@@ -150,8 +151,11 @@ if [ "$UNINSTALL_REQUESTED" = true ]; then
         fi
         chmod 755 "$SCRIPT_PATH"
     fi
-    info "Running ${SCRIPT_NAME}.sh --uninstall"
-    exec bash "$SCRIPT_PATH" --uninstall
+    uninstall_args=(--uninstall)
+    [ "$DRY_RUN" = true ] && uninstall_args+=(--dry-run)
+    [ "$REMOVE_DATA" = true ] && uninstall_args+=(--remove-data)
+    info "Running ${SCRIPT_NAME}.sh ${uninstall_args[*]}"
+    exec bash "$SCRIPT_PATH" "${uninstall_args[@]}"
 fi
 
 # --- Version helpers (CalVer-style: date-N, e.g. 2026.10.29-7) ---
