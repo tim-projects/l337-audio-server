@@ -285,6 +285,10 @@ configure_alsa_dmix() {
     fi
     DMIX_PCM="dmix:CARD=${card_name},DEV=${device_num}"
 
+    # Export detected card/device for use by PipeWire config
+    export L337_DETECTED_CARD="${card_name}"
+    export L337_DETECTED_DEVICE="${device_num}"
+
     # Read existing config
     local existing=""
     if [ -f "$asound_conf" ]; then
@@ -945,7 +949,7 @@ if [ -n "$TARGET_USER" ]; then
     if ! id "$TARGET_USER" &>/dev/null; then
         fail "User not found: $TARGET_USER"
     fi
-    configure_user_pipewire_dmix "$TARGET_USER" "$card_name" "$device_num"
+    configure_user_pipewire_dmix "$TARGET_USER" "${L337_DETECTED_CARD}" "${L337_DETECTED_DEVICE}"
     setup_user_pipewire_services "$TARGET_USER"
     setup_systemd_user "$BINARY_INPUT" "$TARGET_USER"
 else
@@ -953,7 +957,7 @@ else
     if ! id "$USER_NAME" &>/dev/null; then
         fail "Dedicated service user '$USER_NAME' does not exist. Run install.sh (recommended) or create '$USER_NAME' first."
     fi
-    configure_user_pipewire_dmix "$USER_NAME" "$card_name" "$device_num"
+    configure_user_pipewire_dmix "$USER_NAME" "${L337_DETECTED_CARD}" "${L337_DETECTED_DEVICE}"
     setup_user_pipewire_services "$USER_NAME"
     setup_systemd_user "$BINARY_INPUT" "$USER_NAME"
 fi

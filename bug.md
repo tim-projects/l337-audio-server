@@ -580,3 +580,84 @@ not report `libopus.so.0`/`libm.so.6` missing, `ok "Runtime libraries present: �
 install + recheck) must be printed, and the server must start. If it still fails there, capture
 `ldconfig -p | grep opus`, `dpkg -L libopus0 | grep '\.so'` and `ldd` on the installed binary
 to see which of the two probes (cache vs. directory) disagrees.
+
+---
+
+## 13. Installer and Multi-User PipeWire Fixes (2026-11-09)
+
+### 13.1 Installer Improvements
+
+**Version check order** — `install.sh` now checks local binary version FIRST before hitting GitHub API. If already at target version, exits with clear message: "The downloaded release (X.Y.Z) is already installed on this system. If you want to re-install, use --force". Saves API calls and network round-trips.
+
+**Network error handling** — `fetch_release_rows_api()` maps curl exit codes to specific errors:
+- `6` → DNS resolution failure
+- `7` → Failed to connect to host
+- `28` → Connection timeout
+- Other → generic with exit code
+Fails immediately on network errors; fallback to web method ONLY on HTTP 403 (rate limit).
+
+**`--force` flag propagation** — `install.sh` now forwards `--force` to platform installers. Platform installers (`install-linux-pipewire.sh`, `install-linux-alsa.sh`) export `FORCE_INSTALL` which makes `install_packages()` in `lib-distro.sh` skip the "already installed" check and reinstall packages.
+
+**Idempotent package installation** — `lib-distro.sh` added `check_packages_installed()` that queries the package manager (apt/dnf/pacman/zypper/apk) to detect already-installed packages. `install_packages()` now skips installation if all packages present (unless `FORCE_INSTALL=true`).
+
+**`pipewire-alsa` package** — Added to pacman package list for PipeWire backend. Provides `libspa-alsa.so` SPA plugin for ALSA device handling via WirePlumber.
+
+### 13.2 ALSA dmix Configuration Fixes
+
+**Card/device detection** — Fixed `awk` regex for `/proc/asound/cards` parsing (was `^ \[.*\]/`, now `\[.*\]/`) to correctly detect `sofhdadsp` card.
+
+**Deepbuffer device detection** — Added detection of device 31 (deepbuffer) for `sof-hda-dsp` analog speakers by checking `/proc/asound/devices`. Now uses `dmix:CARD=sofhdadsp,DEV=31` instead of hardcoded `PCH/DEV=0`.
+
+**Duplicate prevention** — `configure_alsa_dmix()` now uses `awk` for multi-line pattern matching to detect existing dmix config, and removes old L337 sections before writing new config (instead of appending).
+
+### 13.3 Multi-User Socket Access (PipeWire)
+
+**`--group-access` flag** — Added to both `install.sh` and `install-linux-pipewire.sh`. When enabled:
+- Creates shared runtime directory `/run/l337-audio-server/` (group=audio, mode 0770)
+- Sets `L337_RUNTIME_DIR=/run/l337-audio-server` in systemd service environment
+- Adds service user (`l337`) and invoking user (`SUDO_USER`) to `audio` group
+- Socket created at `/run/l337-audio-server/l337.sock` accessible by all users in `audio` group
+
+**XDG directory ownership** — Fixed `chown -R` to include parent XDG directories (`.config`, `.cache`, `.local/state`), not just the `l337-audio-server` subdirectories. `mkdir -p` as root was creating parent dirs owned by root.
+
+**Uninstall cleanup** — Removes shared runtime directory `/run/l337-audio-server/` on uninstall.
+
+### 13.4 PipeWire dmix Configuration for Arch Linux
+
+**Problem** — `libpipewire-module-alsa` factory doesn't exist on Arch. ALSA devices are handled by WirePlumber via `libspa-alsa.so` SPA plugin.
+
+**Fix** — Don't disable WirePlumber ALSA monitor. Instead, configure WirePlumber component to use dmix device from system-wide `/etc/asound.conf`:
+
+```lua
+wireplumber.components = {
+  alsa_monitor = {
+    alsa = {
+      defaults = {
+        pcm = "dmix:CARD=sofhdadsp,DEV=31"
+        ctl = "hw:CARD=sofhdadsp"
+      }
+    }
+  }
+}
+```
+
+**Exported card/device** — `configure_alsa_dmix()` exports `L337_DETECTED_CARD` and `L337_DETECTED_DEVICE` for use by PipeWire config function.
+
+### 13.5 Commits
+
+- `d1bca2c` — ALSA card/device detection fix for sof-hda-dsp
+- `d1833e4` — Improve 'up-to-date' message clarity
+- `d6eeba5` — Simplify 'up-to-date' message
+- `aff9346` — Network error handling with specific curl exit codes
+- `2b03011` — Cache dir ownership and asound.conf duplicate prevention
+- `7c7bb89` — Parent XDG directory ownership fix
+- `bd7e101` — `--group-access` for multi-user socket access
+- `99223b5` — Add pipewire-alsa to pacman package list
+- `f7de206` — PipeWire dmix config fix for Arch (WirePlumber component config)
+
+### 13.6 Remaining
+
+- **WAV playback test** — Pending user confirmation of audible output through speakers
+- **OGG playback test** — Pending verification after fixes
+- **Real Debian host test** — pipelinepro verification still pending (libopus0/ldconfig fix)
+```
