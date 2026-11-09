@@ -471,7 +471,7 @@ ensure_audio_libs() {
         pipewire)
             if   command -v apt-get &>/dev/null; then pkgs=("libpipewire-0.3-0" "libopus0" "libpulse0")
             elif command -v dnf &>/dev/null;      then pkgs=("pipewire-libs" "opus" "pulseaudio-libs")
-            elif command -v pacman &>/dev/null;   then pkgs=("pipewire" "opus" "libpulse")
+            elif command -v pacman &>/dev/null;   then pkgs=("pipewire" "pipewire-alsa" "opus" "libpulse")
             elif command -v zypper &>/dev/null;   then pkgs=("libpipewire-0-3" "libopus0" "libpulse0")
             elif command -v apk &>/dev/null;      then pkgs=("pipewire" "libopus" "pulseaudio")
             fi
