@@ -320,10 +320,33 @@ _pkg_search_fallback() {
 # Installation wrapper
 # ---------------------------------------------------------------------------
 
+# Check if packages are already installed. Returns list of missing packages.
+# Usage: check_packages_installed <pkg1> <pkg2> ...
+check_packages_installed() {
+    [ $# -gt 0 ] || { echo ""; return 0; }
+    local pm missing=() pkg
+    if ! pm=$(pkg_manager); then
+        warn "No supported package manager found (apt-get, dnf, pacman, zypper, apk)."
+        printf '%s\n' "$@"
+        return 1
+    fi
+    for pkg in "$@"; do
+        case "$pm" in
+            apt-get) dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || missing+=("$pkg") ;;
+            dnf)     rpm -q "$pkg" >/dev/null 2>&1 || missing+=("$pkg") ;;
+            pacman)  pacman -Q "$pkg" >/dev/null 2>&1 || missing+=("$pkg") ;;
+            zypper)  rpm -q "$pkg" >/dev/null 2>&1 || missing+=("$pkg") ;;
+            apk)     apk info -e "$pkg" >/dev/null 2>&1 || missing+=("$pkg") ;;
+        esac
+    done
+    printf '%s\n' "${missing[@]}"
+}
+
 # install_packages: install a list of resolved package names using the detected
 # PM. Runs pkg_update_prefix before pkg_install_prefix. Respects AUTO_INSTALL_DEPS
-# (prints instructions instead of installing when false) and DRY_RUN (prints what
-# would be installed without running anything). Returns 1 on failure.
+# (prints instructions instead of installing when false), DRY_RUN (prints what
+# would be installed without running anything), and FORCE_INSTALL (skips
+# already-installed check). Returns 1 on failure.
 install_packages() {
     [ $# -gt 0 ] || return 0
 
@@ -340,6 +363,17 @@ install_packages() {
         warn "Cannot determine install command for $pm."
         return 1
     }
+
+    # Check already-installed unless FORCE_INSTALL=true
+    if [ "${FORCE_INSTALL:-false}" != "true" ]; then
+        local missing
+        missing=$(check_packages_installed "${pkgs[@]}")
+        if [ -z "$missing" ]; then
+            ok "Already installed: ${pkgs[*]}"
+            return 0
+        fi
+        pkgs=($missing)
+    fi
 
     if [ "$AUTO_INSTALL_DEPS" = false ]; then
         echo "The following packages are required:" >&2

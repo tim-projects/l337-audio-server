@@ -45,6 +45,7 @@ REMOVE_DATA=false
 NO_AUDIO=false
 TARGET_USER=""
 AUTO_INSTALL_DEPS=true
+FORCE_INSTALL=false
 # Binary handed over by install.sh (which owns release lookup and the download).
 BINARY_INPUT="${L337_BINARY_PATH:-}"
 RELEASE_TAG="${L337_RELEASE_TAG:-}"
@@ -425,6 +426,7 @@ while [ $# -gt 0 ]; do
         --no-audio) NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
+        --force) FORCE_INSTALL=true; shift ;;
         -h|--help)
             cat <<EOF
 Usage: $0 [OPTIONS] --binary <path>
@@ -445,6 +447,7 @@ Options:
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
+  --force                Force reinstall of audio libraries even if already present
   -h, --help             Show this help message
 EOF
             exit 0 ;;
@@ -826,6 +829,8 @@ fi
 
 require_root
 check_dependencies
+
+export FORCE_INSTALL
 
 info "Installing ${BINARY_INPUT} (release ${RELEASE_TAG:-unknown})"
 

@@ -31,7 +31,7 @@ FORWARD_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --pre-release|--prerelease) INSTALL_PRERELEASE=true; shift ;;
-        --force|-f)                 FORCE=true; shift ;;
+        --force|-f)                 FORCE=true; FORWARD_ARGS+=("--force"); shift ;;
         --uninstall|-u)             UNINSTALL_REQUESTED=true; shift ;;
         --dry-run)                  DRY_RUN=true; FORWARD_ARGS+=("--dry-run"); shift ;;
         --remove-data)              REMOVE_DATA=true; shift ;;
@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
             echo "  --remove-data       With --uninstall: also remove configuration/data directories"
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
-            echo "--pre-release and --force are not forwarded to the platform installer."
+            echo "--pre-release is not forwarded to the platform installer."
             exit 0 ;;
         *) FORWARD_ARGS+=("$1"); shift ;;
     esac
