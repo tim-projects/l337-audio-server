@@ -626,24 +626,21 @@ Fails immediately on network errors; fallback to web method ONLY on HTTP 403 (ra
 
 **Problem** — `libpipewire-module-alsa` factory doesn't exist on Arch. ALSA devices are handled by WirePlumber via `libspa-alsa.so` SPA plugin.
 
-**Fix** — Don't disable WirePlumber ALSA monitor. Instead, configure WirePlumber component to use dmix device from system-wide `/etc/asound.conf`:
+**First attempt (failed)** — Configured WirePlumber component with `alsa_monitor.defaults.pcm/ctl`. This caused WirePlumber SEGV crashes on startup (`wp_spa_json_is_array` assertion failure in `libwireplumber-0.5.so.0`). The config format was invalid for the installed WirePlumber version.
 
-```lua
-wireplumber.components = {
-  alsa_monitor = {
-    alsa = {
-      defaults = {
-        pcm = "dmix:CARD=sofhdadsp,DEV=31"
-        ctl = "hw:CARD=sofhdadsp"
-      }
-    }
-  }
-}
-```
+**Fix** — Don't add any WirePlumber config. Rely on system-wide `/etc/asound.conf` dmix configuration. WirePlumber auto-detects ALSA devices from the default pcm set in asound.conf. Removed all `99-l337-alsa-dmix.conf` generation. Updated uninstall to clean up old config files from previous versions.
 
-**Exported card/device** — `configure_alsa_dmix()` exports `L337_DETECTED_CARD` and `L337_DETECTED_DEVICE` for use by PipeWire config function.
+**Exported card/device** — `configure_alsa_dmix()` exports `L337_DETECTED_CARD` and `L337_DETECTED_DEVICE` for use by PipeWire config function (kept for future use).
 
-### 13.5 Commits
+### 13.5 Installer Timeout Increases
+
+**Web fallback curl timeouts** — Increased timeouts for slow GitHub responses:
+- `fetch_tags_web`: connect 30s, max 120s (was 15/60)
+- `is_prerelease_tag_web`: connect 30s, max 60s (was 15/30)
+- `tag_has_asset_web`: connect 30s, max 120s (was 15/60)
+- `release-info.json` download: connect 30s, max 60s (was 15/30)
+
+### 13.6 Commits
 
 - `d1bca2c` — ALSA card/device detection fix for sof-hda-dsp
 - `d1833e4` — Improve 'up-to-date' message clarity
@@ -653,9 +650,11 @@ wireplumber.components = {
 - `7c7bb89` — Parent XDG directory ownership fix
 - `bd7e101` — `--group-access` for multi-user socket access
 - `99223b5` — Add pipewire-alsa to pacman package list
-- `f7de206` — PipeWire dmix config fix for Arch (WirePlumber component config)
+- `f7de206` — PipeWire dmix config fix for Arch (WirePlumber component config) [REVERTED]
+- `786ccc1` — Remove WirePlumber dmix config to prevent SEGV crashes
+- `5dd11b6` — Increase web fallback curl timeouts
 
-### 13.6 Remaining
+### 13.7 Remaining
 
 - **WAV playback test** — Pending user confirmation of audible output through speakers
 - **OGG playback test** — Pending verification after fixes
