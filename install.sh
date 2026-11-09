@@ -262,8 +262,14 @@ fetch_release_rows_api() {
     http_code=$(curl -sS -L --connect-timeout 15 --max-time 60 \
         -o "$response" -w '%{http_code}' \
         "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
+        local curl_exit=$?
         rm -f "$response"
-        fail "Failed to contact GitHub Releases API. Check network connectivity or proxy settings."
+        case $curl_exit in
+            6)  fail "Could not resolve host (DNS error). Check network connectivity." ;;
+            7)  fail "Failed to connect to host. Check network connectivity." ;;
+            28) fail "Connection timed out. Check network connectivity or proxy settings." ;;
+            *)  fail "Failed to contact GitHub Releases API (curl exit $curl_exit). Check network connectivity or proxy settings." ;;
+        esac
     }
 
     if [ "$http_code" = "403" ]; then
