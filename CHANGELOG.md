@@ -89,6 +89,12 @@ with the new version heading.
   yt-dlp's full format list, so it is observable via
   `PlayerStatus.actual_kbps`/`codec`, and a ceiling that admits nothing falls
   back to the lowest available rendition rather than failing playback.
+- Linux pipewire install exposes hardware audio sinks for the dedicated user:
+  `install-linux-pipewire.sh` seeds `~/.local/state/wireplumber/{default-profile,default-nodes}`
+  with the ALSA card detected at install time (`seed_wireplumber_state()`) so
+  WirePlumber creates sink nodes for l337's session; `--uninstall --remove-data`
+  removes the seeded state. `--uninstall --remove-data` also removes these files
+  so a clean reinstall does not carry stale per-user state.
 
 ### Changed
 - Performance optimizations (OPT-1, OPT-2, OPT-4, OPT-5, OPT-6, OPT-7, OPT-8,

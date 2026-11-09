@@ -413,6 +413,66 @@ setup_user_pipewire_services() {
     else
         warn "PipeWire services may not be fully ready for $user (continuing anyway)"
     fi
+
+    # Seed WirePlumber state with the detected ALSA card so l337's session
+    # exposes hardware sinks on new installs. Without this, WirePlumber may
+    # start before ALSA devices are enumerated and never create sink nodes.
+    seed_wireplumber_state "$user"
+}
+
+# Seed WirePlumber user state with the ALSA card detected on this machine so
+# that l337's session exposes hardware audio sinks. Works generically: it
+# auto-detects the card name from aplay/pw-cli and writes default-profile /
+# default-nodes state files that WirePlumber reads on restart.
+seed_wireplumber_state() {
+    local user="$1"
+    local user_home
+    user_home=$(eval echo "~${user}")
+    local state_dir="${user_home}/.local/state/wireplumber"
+    local card_name=""
+    local profile_name=""
+    local waited=0
+
+    # Wait for ALSA card to appear (udev may not have settled yet)
+    while [ $waited -lt 30 ]; do
+        card_name=$(run_as_user "$user" -- aplay -l 2>/dev/null \
+            | awk '/^card [0-9]+:/ {print $2; exit}')
+        [ -n "$card_name" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ -z "$card_name" ]; then
+        warn "No ALSA card detected for $user; WirePlumber state not seeded"
+        return 0
+    fi
+
+    # Detect a playback sink node name from PipeWire graph
+    profile_name=$(run_as_user "$user" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$user")" \
+        timeout 5 pw-cli list-objects 2>/dev/null | awk -v card="alsa_card.${card_name}" '
+            $0 ~ "device\\.name = \"" card "\"" { in_card=1 }
+            in_card && /media\\.class = "Audio\/Device"/ { found=1 }
+            found && /node\\.name = "alsa_output[^"]*"/ {
+                print; exit
+            }
+        ' | head -1 | sed 's/.*node\\.name = "\([^"]*\)".*/\1/')
+
+    mkdir -p "$state_dir"
+
+    # default-profile: map the detected card to the HiFi profile
+    printf '[default-profile]\nalsa_card.%s=HiFi\n' "$card_name" > "$state_dir/default-profile"
+
+    # default-nodes: map default sink to the detected playback node (if found)
+    if [ -n "$profile_name" ]; then
+        printf '[default-nodes]\ndefault.configured.audio.sink=%s\n' "$profile_name" > "$state_dir/default-nodes"
+    fi
+
+    chown -R "${user}:${user}" "$state_dir"
+    ok "WirePlumber state seeded for $user (card: ${card_name})"
+
+    # Restart WirePlumber so it picks up the seeded state
+    run_as_user "$user" -- systemctl --user restart wireplumber.service 2>/dev/null || true
+    sleep 3
 }
 
 # ---------------------------------------------------------------------------
@@ -815,6 +875,13 @@ uninstall_user_service() {
             rm -rf "$user_config_dir" \
                   "$user_cache_dir" \
                   "$user_state_dir"
+
+            # Remove WirePlumber state seeded by this installer for the user
+            local user_wireplumber_state_dir="${XDG_STATE_HOME:-$real_home/.local/state}/wireplumber"
+            rm -f "$user_wireplumber_state_dir/default-profile" \
+                  "$user_wireplumber_state_dir/default-nodes" \
+                  "$user_wireplumber_state_dir/default-routes"
+
             ok "Data removed for $user"
         else
             warn "User data retained for $user:"

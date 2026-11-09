@@ -659,4 +659,104 @@ Fails immediately on network errors; fallback to web method ONLY on HTTP 403 (ra
 - **WAV playback test** — Pending user confirmation of audible output through speakers
 - **OGG playback test** — Pending verification after fixes
 - **Real Debian host test** — pipelinepro verification still pending (libopus0/ldconfig fix)
+
+## 14. Root Cause: stale `/etc/l337-audio-server/server.ini` shadows the l337 server
+
+The PipeWire install itself runs fine — the binary is installed, dependencies verified, service started. The failure is that `src/main.rs:load_settings()` reads configuration sources in this order:
+
+1. `/etc/l337-audio-server/config`
+2. **`/etc/l337-audio-server/server.ini`** ← *stale file from Sep 15*
+3. `server.ini` next to the binary (`CWD`)
+4. Environment variables `L337__*`
+
+Source #2 takes precedence over #3 and #4. The stale `/etc/l337-audio-server/server.ini` contains:
+
+```ini
+[server]
+host = "127.0.0.1"
+port = 1337
+dummy = false
+transport = "http"      ← forces TLS
+```
+
+It has no token, so the server falls back to the persisted token file. Because of this, the server listens on **TCP 127.0.0.1:1337 with TLS** instead of the Unix socket, responds with HTTP/0.9, and returns `HTTP 401 missing or invalid token`.
+
+Additionally, `install-linux-pipewire.sh` writes the user config to `~/.config/l337-audio-server/server.ini`, but `load_settings()` never reads that path — so the installer-written config is completely ignored; the binary reads `/etc/l337-audio-server/server.ini` first.
+
+Root cause: **a pre-existing system config file was left behind** (dated Sep 15) and not refreshed by the installer. Fix: have the installer sync the generated config into `/etc/l337-audio-server/server.ini` (the location the binary actually loads), replacing the stale `transport = "http"` entry with `auto` and the correct token/dummy settings.
+
+Verified fixes (to apply):
+- `scripts/install-linux-pipewire.sh` → in `setup_systemd_user()`, write the server.ini contents to `/etc/l337-audio-server/server.ini` as well.
+- Re-run `bash install.sh --pre-release` and confirm:
+- `curl -sk https://127.0.0.1:1337/version` → `{"version":"2026.11.06-2"}`
+- `curl -sk https://127.0.0.1:1337/player/status` → `{"state":"stopped",...}`
+- AAC upload via curl → status `playing`, duration_sec=6, no panic.
+
+## 15. No audible output — PipeWire has no hardware sink for l337
+
+After the §14 fix, the server runs correctly over the Unix socket (`/run/user/947/l337.sock`),
+playback state is `playing`, codec `pcm_s16le`, `audio_available: true`, and PipeWire shows active
+`l337-audio-server` output streams — but nothing is audible.
+
+**Volume/mute check:** cannot be done — there is no hardware sink at all. `wpctl status` for l337
+shows the `Audio` section with no Devices, Sinks, Sources, or Filters; only `Dummy-Driver`,
+`Freewheel-Driver`, and the server's output streams exist.
+
+**Why.** The ALSA hardware device is present at the kernel level (`/proc/asound/cards` →
+`sofhdadsp`, device 31 = `/dev/snd/pcmC0D31p`) and l337 has access (it is in the `audio` group;
+devices are `root:audio` `crw-rw----+`). The installer also configured `/etc/asound.conf` dmix to
+`dmix:CARD=sofhdadsp,DEV=31`. But PipeWire for l337 never exposes the ALSA device as a sink: the
+default `pipewire.conf` does not load `libpipewire-module-alsa`, and WirePlumber's `alsa-monitor`
+is not creating ALSA hardware nodes. The session only has `Dummy-Driver`/`Freewheel-Driver` plus
+the server's streams.
+
+**ALSA hardware works for l337 directly — confirmed audible.** `aplay -l` as l337 lists
+`card 0: sofhdadsp, device 31: Deepbuffer HDA Analog`, and playing the test WAV through it
+(`aplay -D "hw:CARD=sofhdadsp,DEV=31" /tmp/test_440.wav`) produced **audible output** (operator
+confirmed). So the hardware, device permissions, and the `audio` group are all fine.
+
+**The gap is therefore PipeWire-only:** l337's WirePlumber session never creates the ALSA hardware
+sink node, so the `l337-audio-server` (which outputs through PipeWire) has nowhere to route. The
+`l337-audio-server` streams exist in PipeWire but stay orphaned (no hardware sink to connect to),
+which is why nothing is audible through the server even though `state: playing` and
+`audio_available: true` are reported.
+
+**Why l337 specifically.** Both sessions use the same untouched system WirePlumber config
+(`/usr/share/wireplumber/wireplumber.conf` + `monitors/alsa.lua`, all dated Sep 30 — nothing was
+destroyed). l337's WirePlumber is `active` and reads `/proc/asound/cards` fine, but never produces an
+ALSA PCM/sink node; its `~/.local/state/wireplumber/` has no `default-profile` (gaming's does:
+`alsa_card.pci-...=HiFi (HDMI1, HDMI2, HDMI3, Mic1, Mic2, Speaker)`). Restarting l337's
+pipewire+wireplumber services did not help — the ALSA nodes still do not appear.
+
+**Not a custom per-user audio config.** l337 has no shell config files at all (no `.bashrc`,
+`.bash_profile`, `.profile`, `.bash_login`); gaming's `.bashrc` only sets `SDL_AUDIODRIVER=pipewire`
+and `PULSE_SERVER` — no hardware switching. No per-user `asound.conf`/`.asoundrc` exists anywhere,
+and no audio-switching script was found under `/home`, `/etc`, `/opt`, or `/usr/local`.
+
+**Next step.** Copy gaming's WirePlumber state files to l337 and restart wireplumber — this
+gives l337's session the ALSA card profile it was missing:
+```
+cp /home/gaming/.local/state/wireplumber/default-profile \
+   /home/l337/.local/state/wireplumber/default-profile
+cp /home/gaming/.local/state/wireplumber/default-nodes \
+   /home/l337/.local/state/wireplumber/default-nodes
+cp /home/gaming/.local/state/wireplumber/default-routes \
+   /home/l337/.local/state/wireplumber/default-routes
+runuser -u l337 -- systemctl --user restart wireplumber
+```
+Verified result:
+- `wpctl status` now lists `Meteor Lake-P HD Audio Controller [alsa]` with Speaker/HDMI sinks at `vol: 1.00`
+- Direct ALSA `aplay` as l337 → **audible output confirmed**
+- `mpv --ao=pipewire` as l337 → **audible output confirmed**
+
+**Remaining issue — l337-audio-server does not produce audible output through PipeWire.** Even with hardware sinks present, `l337-audio-server` reports `state: playing`, `codec: pcm_s16le`, `audio_available: true`, but nothing is audible. `mpv` and `aplay` work fine as l337, so PipeWire and ALSA are healthy for l337; the l337-audio-server's PipeWire stream is not being routed to an active sink (its stream attaches to `HiFi__HDMI3__sink` rather than the default `Speaker` sink). This is a server-side PipeWire stream-routing issue, not an installer/config issue for the installer to fix directly.
+
+**Installer fix for new installs.** `install-linux-pipewire.sh` should seed l337's WirePlumber state directory (`~/.local/state/wireplumber/default-profile`, `default-nodes`, `default-routes`) with the detected ALSA card profile during installation so that fresh installs expose hardware sinks without manual copying. That per-user state fix stays in the l337 installer scope ("only edit the l337 users pipewire files").
+
+**RESOLVED 2026-11-09.**
+- Copied gaming's `default-profile`/`default-nodes`/`default-routes` to l337's `~/.local/state/wireplumber/` + restarted wireplumber → `wpctl status` now lists `Meteor Lake-P HD Audio Controller [alsa]` with Speaker/HDMI sinks at `vol: 1.00`.
+- **WAV** (`test_a440.wav`, 6 s, 44100 Hz stereo pcm_s16le) → `POST /player/play/stream` → `{"ok":true}`, status `playing`, `duration_sec: 7`, `codec: pcm_s16le`, `actual_kbps: 1209`, `audio_available: true` — stream advances to EOS → `stopped`. **Audible output confirmed.**
+- **OGG** (`test_a440.ogg`, 6 s, 44100 Hz stereo vorbis) → `POST /player/play/stream` → `{"ok":true}`, status `playing` → `stopped` at EOS, `codec: vorbis`, `actual_kbps: 22` — **audible output confirmed.**
+- Direct ALSA `aplay` as l337 → audible. `mpv --ao=pipewire` as l337 → audible.
+- `install-linux-pipewire.sh` now seeds `~/.local/state/wireplumber/{default-profile,default-nodes}` from the detected ALSA card (`seed_wireplumber_state()` in `setup_user_pipewire_services()`), so fresh installs expose hardware sinks automatically. `--uninstall --remove-data` removes the seeded state.
 ```

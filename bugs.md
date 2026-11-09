@@ -1899,3 +1899,37 @@ feature = "pulseaudio"))]` — the Termux path only. No other backend is affecte
 - The ~5 s whole-process freezes (2026-11-05) were not observed in any of these
   low-CPU release runs; if they reappear a >=86 ms sink buffer no longer covers them and
   the wake lock becomes the remaining fix.
+
+---
+## Session — 2026-11-09: l337 pipewire install exposes no hardware sink — RESOLVED
+
+**Symptom.** Fresh l337 pipewire install runs the server correctly (`state: playing`,
+`codec: pcm_s16le`, `audio_available: true`) but nothing is audible. `wpctl status` for the
+l337 user's PipeWire session shows **no Devices/Sinks/Sources/Filters** at all — only
+`Dummy-Driver`/`Freewheel-Driver`/MIDI plus the server's orphaned output streams. Direct ALSA
+`aplay` as l337 works (audible), and `mpv --ao=pipewire` as l337 works (audible), so the
+hardware and ALSA access are healthy; only WirePlumber never created ALSA sink nodes for
+l337's session.
+
+**Root cause.** l337's `~/.local/state/wireplumber/` had no `default-profile` (gaming's session
+has `alsa_card.pci-...=HiFi (...)`), so WirePlumber never enumerated the ALSA card and created
+sink nodes for l337. Both sessions share the same untouched system WirePlumber config
+(`/usr/share/wireplumber/wireplumber.conf` + `monitors/alsa.lua`, dated Sep 30 — nothing
+destroyed). Not a per-user audio config: l337 has no shell config files, gaming's `.bashrc`
+only sets `SDL_AUDIODRIVER`/`PULSE_SERVER`, no `asound.conf`/`.asoundrc` or audio-switching
+script exists anywhere.
+
+**Fix.** Copying gaming's `default-profile`/`default-nodes`/`default-routes` into l337's
+`~/.local/state/wireplumber/` + restarting wireplumber exposes `Meteor Lake-P HD Audio
+Controller [alsa]` with Speaker/HDMI sinks at `vol: 1.00`.
+
+**Verified.** WAV (`test_a440.wav`, 6 s, 44.1 kHz stereo pcm_s16le) → `state: playing` →
+`stopped` at EOS, `actual_kbps: 1209` — **audible confirmed**. OGG
+(`test_a440.ogg`, 6 s, 44.1 kHz stereo vorbis) → `playing` → `stopped` at EOS,
+`codec: vorbis`, `actual_kbps: 22` — **audible confirmed**.
+
+**Installer fix.** `scripts/install-linux-pipewire.sh` now seeds the user's
+`~/.local/state/wireplumber/default-profile`/`default-nodes` from the detected ALSA card
+(`seed_wireplumber_state()` in `setup_user_pipewire_services()`), auto-detecting the card via
+`aplay -l`/`pw-cli`, so fresh installs expose hardware sinks automatically. `--uninstall
+--remove-data` removes the seeded state. `bash -n` clean.
