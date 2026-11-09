@@ -292,31 +292,51 @@ configure_alsa_dmix() {
         info "Backed up existing $asound_conf to $backup_conf"
     fi
 
-    # Check if dmix config already exists
-    if echo "$existing" | grep -qE 'pcm\.!default.*dmix' && echo "$existing" | grep -qE 'ctl\.!default.*hw'; then
+    # Check if dmix config already exists for this card/device
+    # Use awk to check across lines (grep is line-based)
+    local has_dmix=0
+    local has_ctl=0
+    if echo "$existing" | awk '/pcm\.!default[[:space:]]*{/{flag=1} flag && /dmix/{has_dmix=1} /^[[:space:]]*}/{flag=0} END{exit has_dmix?0:1}'; then
+        has_dmix=1
+    fi
+    if echo "$existing" | awk '/ctl\.!default[[:space:]]*{/{flag=1} flag && /hw/{has_ctl=1} /^[[:space:]]*}/{flag=0} END{exit has_ctl?0:1}'; then
+        has_ctl=1
+    fi
+    if [ "$has_dmix" -eq 1 ] && [ "$has_ctl" -eq 1 ]; then
         ok "ALSA dmix already configured in $asound_conf"
         return 0
     fi
 
-    # Build new config - preserve existing content, add dmix defaults
-    {
-        if [ -n "$existing" ]; then
-            echo "$existing"
-            echo ""
-            echo "# --- L337 Audio Server dmix configuration (added by installer) ---"
-        else
-            echo "# ALSA configuration for L337 Audio Server (dmix for shared access)"
-        fi
-        echo "pcm.!default {"
-        echo "    type plug"
-        echo "    slave.pcm \"${DMIX_PCM}\""
-        echo "}"
-        echo ""
-        echo "ctl.!default {"
-        echo "    type hw"
-        echo "    card ${card_name}"
-        echo "}"
-    } > "$asound_conf"
+    # Build new config - replace any existing L337 dmix sections, preserve other content
+    local new_config=""
+    if [ -n "$existing" ]; then
+        # Remove any existing L337 dmix sections
+        new_config=$(echo "$existing" | awk '
+            BEGIN { in_l337=0; buffer="" }
+            /# --- L337 Audio Server dmix configuration/ { in_l337=1; next }
+            in_l337 && /^# ---/ && !/L337 Audio Server/ { in_l337=0 }
+            in_l337 { next }
+            { print }
+        ')
+        new_config="${new_config}
+# --- L337 Audio Server dmix configuration (added by installer) ---"
+    else
+        new_config="# ALSA configuration for L337 Audio Server (dmix for shared access)
+# --- L337 Audio Server dmix configuration (added by installer) ---"
+    fi
+
+    new_config="${new_config}
+pcm.!default {
+    type plug
+    slave.pcm \"${DMIX_PCM}\"
+}
+
+ctl.!default {
+    type hw
+    card ${card_name}
+}"
+
+    echo "$new_config" > "$asound_conf"
 
     ok "ALSA dmix configured: default pcm -> ${DMIX_PCM}"
 }
@@ -552,6 +572,8 @@ setup_systemd_user() {
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
     mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_service_dir"
+    chown -R "${real_user}:${real_user}" "$user_config_dir" "$user_cache_dir" "$user_state_dir"
+    chmod 0700 "$user_config_dir" "$user_cache_dir" "$user_state_dir"
     if [ -d "$user_runtime_dir" ]; then
         chown "${real_user}:${real_user}" "$user_runtime_dir"
         chmod 0700 "$user_runtime_dir"
