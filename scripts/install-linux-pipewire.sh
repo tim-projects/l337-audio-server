@@ -31,6 +31,11 @@ PREFIX_INSTALL_DIR=""
 USER_NAME="l337"
 GROUP_NAME="l337"
 
+# ALSA dmix configuration (shared hardware access for multiple PipeWire instances)
+ALSA_CARD="PCH"
+ALSA_DEVICE="0"
+DMIX_PCM="dmix:CARD=${ALSA_CARD},DEV=${ALSA_DEVICE}"
+
 # ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
@@ -221,14 +226,188 @@ run_as_user() {
         local user_uid
         user_uid=$(id -u "$user" 2>/dev/null || echo "")
         if [ -n "$user_uid" ]; then
-            sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$user_uid" "$@"
+            sudo -u "$user" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
+                "$@"
         else
             sudo -u "$user" "$@"
         fi
     elif command -v runuser &>/dev/null; then
-        runuser -u "$user" -- "$@"
+        local user_uid
+        user_uid=$(id -u "$user" 2>/dev/null || echo "")
+        if [ -n "$user_uid" ]; then
+            runuser -u "$user" -- env \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
+                "$@"
+        else
+            runuser -u "$user" -- "$@"
+        fi
     else
         su - "$user" -c "$*"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# ALSA dmix configuration (system-wide, enables shared hardware access)
+# ---------------------------------------------------------------------------
+configure_alsa_dmix() {
+    local asound_conf="/etc/asound.conf"
+    local backup_conf="${asound_conf}.l337-backup.$(date +%s)"
+
+    info "Configuring ALSA dmix for shared hardware access..."
+
+    # Detect the actual card if PCH is not found
+    local card_name="${ALSA_CARD}"
+    if ! grep -q "\[${card_name}\]" /proc/asound/cards 2>/dev/null; then
+        # Try to find the first non-HDMI/non-MIDI card
+        local detected_card
+        detected_card=$(awk '/^ \[.*\]/ {gsub(/[\[\]]/,"",$2); print $2}' /proc/asound/cards 2>/dev/null | grep -viE 'hdmi|midi|thinkpad|loopback' | head -1 || true)
+        if [ -n "$detected_card" ]; then
+            card_name="$detected_card"
+            DMIX_PCM="dmix:CARD=${card_name},DEV=${ALSA_DEVICE}"
+            info "Using detected ALSA card: ${card_name}"
+        else
+            warn "Could not auto-detect ALSA card; using default: ${card_name}"
+        fi
+    fi
+
+    # Read existing config
+    local existing=""
+    if [ -f "$asound_conf" ]; then
+        existing=$(cat "$asound_conf")
+        cp "$asound_conf" "$backup_conf"
+        info "Backed up existing $asound_conf to $backup_conf"
+    fi
+
+    # Check if dmix config already exists
+    if echo "$existing" | grep -qE 'pcm\.!default.*dmix' && echo "$existing" | grep -qE 'ctl\.!default.*hw'; then
+        ok "ALSA dmix already configured in $asound_conf"
+        return 0
+    fi
+
+    # Build new config - preserve existing content, add dmix defaults
+    {
+        if [ -n "$existing" ]; then
+            echo "$existing"
+            echo ""
+            echo "# --- L337 Audio Server dmix configuration (added by installer) ---"
+        else
+            echo "# ALSA configuration for L337 Audio Server (dmix for shared access)"
+        fi
+        echo "pcm.!default {"
+        echo "    type plug"
+        echo "    slave.pcm \"${DMIX_PCM}\""
+        echo "}"
+        echo ""
+        echo "ctl.!default {"
+        echo "    type hw"
+        echo "    card ${card_name}"
+        echo "}"
+    } > "$asound_conf"
+
+    ok "ALSA dmix configured: default pcm -> ${DMIX_PCM}"
+}
+
+# ---------------------------------------------------------------------------
+# Per-user PipeWire dmix configuration
+# ---------------------------------------------------------------------------
+configure_user_pipewire_dmix() {
+    local user="$1"
+    local real_home
+    real_home=$(eval echo "~${user}")
+
+    info "Configuring PipeWire dmix for user $user..."
+
+    # Disable ALSA monitor in WirePlumber (so it doesn't grab hw devices directly)
+    local wp_conf_dir="$real_home/.config/wireplumber/wireplumber.conf.d"
+    local wp_disable_alsa="$wp_conf_dir/99-l337-disable-alsa-monitor.conf"
+    mkdir -p "$wp_conf_dir"
+    cat > "$wp_disable_alsa" <<EOF
+# Added by L337 Audio Server installer
+# Disable WirePlumber ALSA monitor so it doesn't claim hardware devices directly
+# We use dmix devices instead for shared access
+wireplumber.profiles = {
+  main = {
+    monitor.alsa = disabled
+  }
+}
+EOF
+    chown "$user" "$wp_disable_alsa" 2>/dev/null || true
+
+    # Configure PipeWire to use dmix sink
+    local pw_conf_dir="$real_home/.config/pipewire/pipewire.conf.d"
+    local pw_dmix_conf="$pw_conf_dir/99-l337-alsa-dmix.conf"
+    mkdir -p "$pw_conf_dir"
+    cat > "$pw_dmix_conf" <<EOF
+# Added by L337 Audio Server installer
+# Create ALSA dmix sink for shared hardware access
+context.objects = [
+  {   factory = libpipewire-module-alsa
+      args = {
+          # Create dmix playback sink
+          node.name = "alsa-dmix-output"
+          media.class = "Audio/Sink"
+          api.alsa.path = "${DMIX_PCM}"
+          api.alsa.period-size = 1024
+          api.alsa.period-num = 2
+          api.alsa.headroom = 0
+          api.alsa.start-delay = 0
+      }
+  }
+]
+EOF
+    chown "$user" "$pw_dmix_conf" 2>/dev/null || true
+
+    ok "PipeWire dmix configured for $user (dmix sink: ${DMIX_PCM})"
+}
+
+# ---------------------------------------------------------------------------
+# Enable linger and start PipeWire user services for a user
+# ---------------------------------------------------------------------------
+setup_user_pipewire_services() {
+    local user="$1"
+    local user_uid
+    user_uid=$(id -u "$user" 2>/dev/null || echo "")
+
+    if [ -z "$user_uid" ]; then
+        fail "User $user not found"
+    fi
+
+    info "Enabling linger for $user (persistent user manager)..."
+    loginctl enable-linger "$user" 2>/dev/null || warn "loginctl enable-linger failed (may need manual setup)"
+
+    info "Starting PipeWire user services for $user..."
+    # Start the user manager if not running
+    run_as_user "$user" -- systemctl --user daemon-reload 2>/dev/null || true
+
+    # Enable and start pipewire.socket (activates pipewire.service on demand)
+    run_as_user "$user" -- systemctl --user enable pipewire.socket 2>/dev/null || true
+    run_as_user "$user" -- systemctl --user start pipewire.socket 2>/dev/null || true
+
+    # Enable and start wireplumber.service (session manager)
+    run_as_user "$user" -- systemctl --user enable wireplumber.service 2>/dev/null || true
+    run_as_user "$user" -- systemctl --user start wireplumber.service 2>/dev/null || true
+
+    # Enable and start pipewire-pulse.socket (PulseAudio compatibility)
+    run_as_user "$user" -- systemctl --user enable pipewire-pulse.socket 2>/dev/null || true
+    run_as_user "$user" -- systemctl --user start pipewire-pulse.socket 2>/dev/null || true
+
+    # Wait for PipeWire to be ready
+    local ready=0
+    for i in {1..30}; do
+        if run_as_user "$user" -- systemctl --user is-active --quiet pipewire.service 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ready" -eq 1 ]; then
+        ok "PipeWire user services started for $user"
+    else
+        warn "PipeWire services may not be fully ready for $user (continuing anyway)"
     fi
 }
 
@@ -252,7 +431,7 @@ Usage: $0 [OPTIONS] --binary <path>
 
 Linux PipeWire installer for L337 Audio Server.
 Installs a downloaded binary as a systemd user service for the dedicated
-PipeWire user (default: l337). Per-login-user installs are intentionally disabled.
+PipeWire user (default: l337) with ALSA dmix for shared hardware access.
 Release lookup/download live in install.sh.
 
 
@@ -531,6 +710,11 @@ uninstall_user_service() {
         local user_service_dir="$real_home/.config/systemd/user"
         local user_service_file="$user_service_dir/l337-audio-server.service"
 
+        # Remove PipeWire dmix config files
+        local wp_disable_alsa="$real_home/.config/wireplumber/wireplumber.conf.d/99-l337-disable-alsa-monitor.conf"
+        local pw_dmix_conf="$real_home/.config/pipewire/pipewire.conf.d/99-l337-alsa-dmix.conf"
+        rm -f "$wp_disable_alsa" "$pw_dmix_conf"
+
         if [ ! -f "$user_service_file" ]; then
             continue
         fi
@@ -584,6 +768,10 @@ Stop it and re-run:  kill ${pids}"
     # The binary install.sh downloads lands in TMPDIR; tidy it on uninstall.
     rm -f "${L337_BINARY_PATH:-}" "/tmp/l337-audio-server-download"
 
+    # Note: We don't remove /etc/asound.conf changes on uninstall as they may be
+    # shared with other applications. Manual cleanup if needed.
+    info "Note: /etc/asound.conf dmix configuration was not removed (may be shared)."
+
     ok "User service uninstallation complete"
 }
 
@@ -595,8 +783,10 @@ if [ "$DRY_RUN" = true ]; then
     if [ "$UNINSTALL" = true ]; then
         info "  Scan all users for installed l337-audio-server.service files"
         info "  For each user: stop, disable, remove service and runtime dir"
+        info "  Remove PipeWire dmix config files (~/.config/wireplumber/, ~/.config/pipewire/)"
         info "  Refuse if a manually started instance is still running"
         info "  Remove the shared binary at $INSTALL_DIR"
+        info "  Note: /etc/asound.conf dmix configuration is NOT removed (may be shared)"
         if [ "$REMOVE_DATA" = true ]; then
             info "  Remove configuration, cache and state directories per user"
         fi
@@ -604,12 +794,17 @@ if [ "$DRY_RUN" = true ]; then
         info "  Query GitHub for latest release"
         info "  Download the latest PipeWire binary for $OS_TYPE/$ARCH_TYPE"
         info "  Install to: $INSTALL_DIR/l337-audio-server"
+        info "  Configure system-wide ALSA dmix in /etc/asound.conf (shared hardware access)"
         if [ -n "$TARGET_USER" ]; then
+            info "  Configure PipeWire dmix for user: $TARGET_USER"
+            info "  Enable linger and start PipeWire user services for: $TARGET_USER"
             info "  Install systemd user service for: $TARGET_USER"
             info "  Config: ~/.config/l337-audio-server/server.ini"
         else
-            info "  Auto-install systemd user service for all PipeWire users"
-            info "  Config per user: ~/.config/l337-audio-server/server.ini"
+            info "  Configure PipeWire dmix for user: $USER_NAME"
+            info "  Enable linger and start PipeWire user services for: $USER_NAME"
+            info "  Install systemd user service for: $USER_NAME"
+            info "  Config: ~/.config/l337-audio-server/server.ini"
         fi
     fi
     exit 0
@@ -640,22 +835,24 @@ info "Installing ${BINARY_INPUT} (release ${RELEASE_TAG:-unknown})"
 ensure_audio_libs pipewire
 ensure_runtime_dependencies "$BINARY_INPUT"
 
+# Configure system-wide ALSA dmix for shared hardware access
+configure_alsa_dmix
+
+# Configure PipeWire dmix and start services for the l337 user
 if [ -n "$TARGET_USER" ]; then
     if ! id "$TARGET_USER" &>/dev/null; then
         fail "User not found: $TARGET_USER"
     fi
-    if ! user_has_pipewire "$TARGET_USER"; then
-        fail "User $TARGET_USER does not have an active PipeWire session"
-    fi
+    configure_user_pipewire_dmix "$TARGET_USER"
+    setup_user_pipewire_services "$TARGET_USER"
     setup_systemd_user "$BINARY_INPUT" "$TARGET_USER"
 else
     # Single dedicated service user only. Do not install per-login-user units.
     if ! id "$USER_NAME" &>/dev/null; then
         fail "Dedicated service user '$USER_NAME' does not exist. Run install.sh (recommended) or create '$USER_NAME' first."
     fi
-    if ! user_has_pipewire "$USER_NAME"; then
-        warn "User $USER_NAME does not appear to have an active PipeWire session; continuing (service may require PipeWire access)."
-    fi
+    configure_user_pipewire_dmix "$USER_NAME"
+    setup_user_pipewire_services "$USER_NAME"
     setup_systemd_user "$BINARY_INPUT" "$USER_NAME"
 fi
 
@@ -668,10 +865,12 @@ if [ -n "$TARGET_USER" ]; then
     echo "Next steps for $TARGET_USER:"
     echo "  Check status:    su - $TARGET_USER -c 'systemctl --user status l337-audio-server.service'"
     echo "  View logs:       su - $TARGET_USER -c 'journalctl --user -u l337-audio-server -f'"
+    echo "  PipeWire status: su - $TARGET_USER -c 'systemctl --user status pipewire wireplumber pipewire-pulse'"
     echo "  Configuration:   ~/.config/l337-audio-server/server.ini"
 else
     echo "Next steps:"
     echo "  Check status:    systemctl --user status l337-audio-server.service"
     echo "  View logs:       journalctl --user -u l337-audio-server -f"
+    echo "  PipeWire status: systemctl --user status pipewire wireplumber pipewire-pulse"
     echo "  Configuration:   ~/.config/l337-audio-server/server.ini"
 fi
