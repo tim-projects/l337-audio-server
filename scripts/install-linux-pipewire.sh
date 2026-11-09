@@ -360,31 +360,9 @@ configure_user_pipewire_dmix() {
 
     # On Arch Linux (and others), libpipewire-module-alsa doesn't exist.
     # ALSA devices are handled by WirePlumber via libspa-alsa.so.
-    # We DON'T disable the ALSA monitor - let WirePlumber auto-detect the dmix device
-    # from the system-wide /etc/asound.conf configuration.
-    #
-    # The asound.conf sets dmix:CARD=sofhdadsp,DEV=31 as default pcm,
-    # so WirePlumber will see it as a regular ALSA device.
-
-    # Configure WirePlumber to ensure dmix is preferred
-    local wp_conf_dir="$real_home/.config/wireplumber/wireplumber.conf.d"
-    local wp_dmix_conf="$wp_conf_dir/99-l337-alsa-dmix.conf"
-    mkdir -p "$wp_conf_dir"
-    cat > "$wp_dmix_conf" <<EOF
-# Added by L337 Audio Server installer
-# Ensure dmix device is used for shared hardware access
-wireplumber.components = {
-  alsa_monitor = {
-    alsa = {
-      defaults = {
-        pcm = "dmix:CARD=${card_name},DEV=${device_num}"
-        ctl = "hw:CARD=${card_name}"
-      }
-    }
-  }
-}
-EOF
-    chown "$user" "$wp_dmix_conf" 2>/dev/null || true
+    # We DON'T add any WirePlumber config - let it auto-detect the dmix device
+    # from the system-wide /etc/asound.conf (which sets dmix as default pcm).
+    # Adding custom config can cause WirePlumber crashes (SEGV) on some versions.
 
     ok "PipeWire dmix configured for $user (using system dmix: dmix:CARD=${card_name},DEV=${device_num})"
 }
@@ -807,10 +785,11 @@ uninstall_user_service() {
         local user_service_dir="$real_home/.config/systemd/user"
         local user_service_file="$user_service_dir/l337-audio-server.service"
 
-        # Remove PipeWire dmix config files
+        # Remove PipeWire dmix config files (from old installer versions)
         local wp_disable_alsa="$real_home/.config/wireplumber/wireplumber.conf.d/99-l337-disable-alsa-monitor.conf"
+        local wp_dmix_conf="$real_home/.config/wireplumber/wireplumber.conf.d/99-l337-alsa-dmix.conf"
         local pw_dmix_conf="$real_home/.config/pipewire/pipewire.conf.d/99-l337-alsa-dmix.conf"
-        rm -f "$wp_disable_alsa" "$pw_dmix_conf"
+        rm -f "$wp_disable_alsa" "$wp_dmix_conf" "$pw_dmix_conf"
 
         if [ ! -f "$user_service_file" ]; then
             continue
