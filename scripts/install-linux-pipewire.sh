@@ -572,6 +572,10 @@ setup_systemd_user() {
     local user_service_file="$user_service_dir/l337-audio-server.service"
 
     mkdir -p "$INSTALL_DIR" "$user_config_dir" "$user_cache_dir" "$user_state_dir" "$user_service_dir"
+    # Ensure parent XDG dirs are owned by the user (mkdir -p as root creates them root-owned)
+    chown -R "${real_user}:${real_user}" "${XDG_CONFIG_HOME:-$real_home/.config}" \
+        "${XDG_CACHE_HOME:-$real_home/.cache}" \
+        "${XDG_STATE_HOME:-$real_home/.local/state}" 2>/dev/null || true
     chown -R "${real_user}:${real_user}" "$user_config_dir" "$user_cache_dir" "$user_state_dir"
     chmod 0700 "$user_config_dir" "$user_cache_dir" "$user_state_dir"
     if [ -d "$user_runtime_dir" ]; then
