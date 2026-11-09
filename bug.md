@@ -760,3 +760,18 @@ Verified result:
 - Direct ALSA `aplay` as l337 → audible. `mpv --ao=pipewire` as l337 → audible.
 - `install-linux-pipewire.sh` now seeds `~/.local/state/wireplumber/{default-profile,default-nodes}` from the detected ALSA card (`seed_wireplumber_state()` in `setup_user_pipewire_services()`), so fresh installs expose hardware sinks automatically. `--uninstall --remove-data` removes the seeded state.
 ```
+
+## 16. Socket mode permissions — player cannot connect to system socket
+
+**Problem.** The audio server now binds the single system socket at `/run/l337-audio-server/l337.sock` (single `l337` user, PipeWire), but binds it with mode `0600` owned by `l337:l337`. The parent directory `/run/l337-audio-server/` is `0770 l337:audio`, so users in the `audio` group can traverse the directory but cannot connect to the socket itself:
+
+```
+PermissionError: [Errno 13] Permission denied
+connecting to /run/l337-audio-server/l337.sock
+```
+
+Player-side startup now correctly probes `/run/l337-audio-server/l337.sock` (see `l337-player` commit `cbe1caa`, branch `99-task-audio-server-single-socket`), but connection is rejected because the socket file is not group-accessible. The player's own user (`tim`, uid 1002) is in the `audio` group yet gets `EACCES` on connect.
+
+**Scope.** Server-side fix in `l337-audio-server`: after binding the Unix socket, `chmod 0660` and `chgrp audio` the socket path so all `audio` group members can connect. Do not weaken the socket to `0666` — group access via `audio` is sufficient and matches the directory's existing group model.
+
+**Player-side status.** Socket path discovery works (`os.path.exists('/run/l337-audio-server/l337.sock')` → true). The remaining blocker is purely the socket file's `0600` owner-only mode. Once the server binds with group access, the player startup should reach "audio server connection: ok" without manual token entry (token is discovered via `/setup` on the socket).
