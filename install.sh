@@ -36,6 +36,7 @@ while [ $# -gt 0 ]; do
         --dry-run)                  DRY_RUN=true; FORWARD_ARGS+=("--dry-run"); shift ;;
         --remove-data)              REMOVE_DATA=true; shift ;;
         --pipewire-user)            FORWARD_ARGS+=("--pipewire-user"); shift ;;
+        --group-access)             FORWARD_ARGS+=("--group-access"); shift ;;
         -h|--help)
             echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall [--dry-run] [--remove-data]"
             echo ""
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
             echo "  --dry-run           Show what would happen without making changes (install and uninstall)"
             echo "  --uninstall, -u     Uninstall (runs before install; only --dry-run and --remove-data forwarded)"
             echo "  --remove-data       With --uninstall: also remove configuration/data directories"
+            echo "  --group-access      Add local users to audio group for Unix socket access (PipeWire)"
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
             echo "--pre-release is not forwarded to the platform installer."
@@ -508,7 +510,36 @@ resolve_installable_release() {
 }
 
 
-# --- Resolve the release to install ---
+# --- Check installed version FIRST (before hitting GitHub) ---
+# This avoids API calls when the binary is already present and --force not used.
+INSTALLED_VERSION=""
+INSTALLED_BIN=""
+case "$OS_VARIANT" in
+    termux)
+        INSTALLED_BIN="${HOME}/.local/share/l337-player/bin/l337-audio-server" ;;
+    *)
+        INSTALLED_BIN="/opt/l337-audio-server/l337-audio-server" ;;
+esac
+
+if [ -n "$INSTALLED_BIN" ] && [ -f "$INSTALLED_BIN" ] && [ -x "$INSTALLED_BIN" ]; then
+    if [ "$OS_VARIANT" = "termux" ]; then
+        INSTALLED_VERSION=$(LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$INSTALLED_BIN" --version 2>/dev/null | awk "{print \$NF}" || true)
+    else
+        INSTALLED_VERSION=$("$INSTALLED_BIN" --version 2>/dev/null | awk "{print \$NF}" || true)
+    fi
+    if [ -n "$INSTALLED_VERSION" ] && \
+       ! printf '%s' "$INSTALLED_VERSION" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]+$'; then
+        warn "Installed version '${INSTALLED_VERSION}' is not a release tag; will reinstall"
+        INSTALLED_VERSION=""
+    fi
+    if [ -n "$INSTALLED_VERSION" ]; then
+        info "Existing installation found at: $INSTALLED_BIN"
+        info "Installed version: $INSTALLED_VERSION"
+    fi
+fi
+
+# --- Resolve the release to install (hits GitHub) ---
 if ! resolve_installable_release; then
     if [ "$INSTALL_PRERELEASE" = true ]; then
         fail "No prerelease for ${REPO} publishes a ${BINARY_ASSET} that runs on this system. Check https://github.com/${REPO}/releases."
@@ -526,65 +557,37 @@ fi
 SCRIPT_TAG="$TAG"
 info "Selected release: ${TAG}"
 
-# --- Already-installed version check ---
-# If the installed binary reports the same version as the release being
-# installed, stop unless --force was given: a pointless download/replace cycle
-# otherwise. The platform installers no longer do this check themselves.
-INSTALLED_VERSION=""
-INSTALLED_BIN=""
-case "$OS_VARIANT" in
-    termux)
-        INSTALLED_BIN="${HOME}/.local/share/l337-player/bin/l337-audio-server" ;;
-    *)
-        INSTALLED_BIN="/opt/l337-audio-server/l337-audio-server" ;;
-esac
-
-if [ -n "$INSTALLED_BIN" ] && [ -f "$INSTALLED_BIN" ] && [ -x "$INSTALLED_BIN" ]; then
-    # The Android build has no DT_RUNPATH, so libpulse.so is only resolved via
-    # LD_LIBRARY_PATH — without it the binary cannot even run --version.
-    if [ "$OS_VARIANT" = "termux" ]; then
-        INSTALLED_VERSION=$(LD_LIBRARY_PATH="${PREFIX:-/data/data/com.termux/files/usr}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-            "$INSTALLED_BIN" --version 2>/dev/null | awk "{print \$NF}" || true)
-    else
-        INSTALLED_VERSION=$("$INSTALLED_BIN" --version 2>/dev/null | awk "{print \$NF}" || true)
-    fi
-    # Only a well-formed release tag can be compared: an unparseable string
-    # would otherwise compare as "newer than release" above and silently block
-    # every future update.
-    if [ -n "$INSTALLED_VERSION" ] && \
-       ! printf '%s' "$INSTALLED_VERSION" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]+$'; then
-        warn "Installed version '${INSTALLED_VERSION}' is not a release tag; will reinstall"
-        INSTALLED_VERSION=""
-    fi
-    if [ -n "$INSTALLED_VERSION" ]; then
-        info "Existing installation found at: $INSTALLED_BIN"
-        info "Installed version: $INSTALLED_VERSION"
-        if [ "$INSTALLED_VERSION" = "$SCRIPT_TAG" ]; then
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested for the same version ($INSTALLED_VERSION) — re-downloading"
-            else
-                ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
-                echo
-                echo "The downloaded release ($SCRIPT_TAG) is already installed on this system."
-                echo "If you want to re-install, use --force:"
-                echo "  $0 --force$([ "$INSTALL_PRERELEASE" = true ] && echo ' --pre-release')"
-                exit 0
-            fi
-        elif version_gt "$SCRIPT_TAG" "$INSTALLED_VERSION"; then
-            info "Update available ($INSTALLED_VERSION -> $SCRIPT_TAG)"
+# --- Compare versions (if we have an installed version) ---
+if [ -n "$INSTALLED_VERSION" ]; then
+    if [ "$INSTALLED_VERSION" = "$SCRIPT_TAG" ]; then
+        if [ "$FORCE" = true ]; then
+            info "Force reinstall requested for the same version ($INSTALLED_VERSION) — re-downloading"
         else
-            if [ "$FORCE" = true ]; then
-                info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($SCRIPT_TAG) — re-downloading"
-            else
-                ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($SCRIPT_TAG)"
-                echo
-                echo "To reinstall anyway, run with --force:"
-                echo "  $0 --force$([ "$INSTALL_PRERELEASE" = true ] && echo ' --pre-release')"
-                exit 0
-            fi
+            ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
+            echo
+            echo "The downloaded release ($SCRIPT_TAG) is already installed on this system."
+            echo "If you want to re-install, use --force:"
+            echo "  $0 --force$([ "$INSTALL_PRERELEASE" = true ] && echo ' --pre-release')"
+            exit 0
         fi
+    elif version_gt "$SCRIPT_TAG" "$INSTALLED_VERSION"; then
+        info "Update available ($INSTALLED_VERSION -> $SCRIPT_TAG)"
     else
-        warn "Could not determine installed version; will reinstall"
+        if [ "$FORCE" = true ]; then
+            info "Force reinstall requested even though installed ($INSTALLED_VERSION) is newer than release ($SCRIPT_TAG) — re-downloading"
+        else
+            ok "Installed binary ($INSTALLED_VERSION) is newer than latest release ($SCRIPT_TAG)"
+            echo
+            echo "To reinstall anyway, run with --force:"
+            echo "  $0 --force$([ "$INSTALL_PRERELEASE" = true ] && echo ' --pre-release')"
+            exit 0
+        fi
+    fi
+else
+    if [ "$FORCE" = true ]; then
+        info "Force reinstall requested — downloading"
+    else
+        info "No existing installation found — installing $SCRIPT_TAG"
     fi
 fi
 

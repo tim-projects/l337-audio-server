@@ -46,6 +46,7 @@ NO_AUDIO=false
 TARGET_USER=""
 AUTO_INSTALL_DEPS=true
 FORCE_INSTALL=false
+GROUP_ACCESS=false
 # Binary handed over by install.sh (which owns release lookup and the download).
 BINARY_INPUT="${L337_BINARY_PATH:-}"
 RELEASE_TAG="${L337_RELEASE_TAG:-}"
@@ -457,6 +458,7 @@ while [ $# -gt 0 ]; do
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         --force) FORCE_INSTALL=true; shift ;;
+        --group-access) GROUP_ACCESS=true; shift ;;
         -h|--help)
             cat <<EOF
 Usage: $0 [OPTIONS] --binary <path>
@@ -478,6 +480,7 @@ Options:
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   --force                Force reinstall of audio libraries even if already present
+  --group-access         Add local users to the audio group for Unix socket access
   -h, --help             Show this help message
 EOF
             exit 0 ;;
@@ -567,6 +570,9 @@ setup_systemd_user() {
     local user_config_dir="${XDG_CONFIG_HOME:-$real_home/.config}/l337-audio-server"
     local user_cache_dir="${XDG_CACHE_HOME:-$real_home/.cache}/l337-audio-server"
     local user_state_dir="${XDG_STATE_HOME:-$real_home/.local/state}/l337-audio-server"
+    
+    # Shared runtime directory for multi-user socket access
+    local shared_runtime_dir="/run/l337-audio-server"
     local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$real_user")}/l337-audio-server"
     local user_service_dir="$real_home/.config/systemd/user"
     local user_service_file="$user_service_dir/l337-audio-server.service"
@@ -581,6 +587,26 @@ setup_systemd_user() {
     if [ -d "$user_runtime_dir" ]; then
         chown "${real_user}:${real_user}" "$user_runtime_dir"
         chmod 0700 "$user_runtime_dir"
+    fi
+
+    # Configure shared runtime directory for multi-user access
+    if [ "$GROUP_ACCESS" = true ]; then
+        info "Configuring shared runtime directory for multi-user socket access: $shared_runtime_dir"
+        mkdir -p "$shared_runtime_dir"
+        chown "${real_user}:audio" "$shared_runtime_dir"
+        chmod 0770 "$shared_runtime_dir"
+        # Add service user to audio group for PipeWire/ALSA access
+        if ! groups "$real_user" 2>/dev/null | grep -qw "audio"; then
+            info "Adding $real_user to audio group"
+            usermod -aG audio "$real_user" || warn "Failed to add $real_user to audio group"
+        fi
+        # Add invoking user (sudo user) to audio group
+        if [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" &>/dev/null; then
+            if ! groups "${SUDO_USER}" 2>/dev/null | grep -qw "audio"; then
+                info "Adding ${SUDO_USER} to audio group (socket access)"
+                usermod -aG audio "${SUDO_USER}" || warn "Failed to add ${SUDO_USER} to audio group"
+            fi
+        fi
     fi
 
     local config_file="$user_config_dir/server.ini"
@@ -633,7 +659,44 @@ EOF
     ok "Configuration ready at $config_file"
 
     info "Writing systemd user unit: $user_service_file"
-    cat > "$user_service_file" <<EOF
+    if [ "$GROUP_ACCESS" = true ]; then
+        cat > "$user_service_file" <<EOF
+[Unit]
+Description=L337 Audio Server (user service, PipeWire, multi-user)
+Documentation=https://github.com/${REPO}
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${real_user}
+Group=${real_user}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/l337-audio-server
+Restart=on-failure
+RestartSec=2
+
+# Use shared runtime directory for multi-user socket access
+Environment=L337_RUNTIME_DIR=/run/l337-audio-server
+RuntimeDirectory=l337-audio-server
+RuntimeDirectoryMode=0770
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=false
+ProtectKernelTunables=false
+RestrictNamespaces=false
+RestrictRealtime=false
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=default.target
+EOF
+    else
+        cat > "$user_service_file" <<EOF
 [Unit]
 Description=L337 Audio Server (user service, PipeWire)
 Documentation=https://github.com/${REPO}
@@ -666,6 +729,7 @@ MemoryDenyWriteExecute=false
 [Install]
 WantedBy=default.target
 EOF
+    fi
 
     chown "$real_user" "$user_service_file" 2>/dev/null || true
     chmod 0644 "$user_service_file"
@@ -801,6 +865,13 @@ Stop it and re-run:  kill ${pids}"
 
     rm -rf "$INSTALL_DIR"
     ok "Shared binary removed"
+
+    # Remove shared runtime directory if it exists (for --group-access)
+    local shared_runtime_dir="/run/l337-audio-server"
+    if [ -d "$shared_runtime_dir" ]; then
+        rm -rf "$shared_runtime_dir"
+        ok "Shared runtime removed: $shared_runtime_dir"
+    fi
 
     # A download that fell back to /tmp leaves the whole binary there.
     # A download that fell back to /tmp leaves the whole binary there.
