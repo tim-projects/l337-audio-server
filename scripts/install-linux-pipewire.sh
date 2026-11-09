@@ -347,52 +347,42 @@ ctl.!default {
 # ---------------------------------------------------------------------------
 configure_user_pipewire_dmix() {
     local user="$1"
+    local card_name="$2"
+    local device_num="$3"
     local real_home
     real_home=$(eval echo "~${user}")
 
     info "Configuring PipeWire dmix for user $user..."
 
-    # Disable ALSA monitor in WirePlumber (so it doesn't grab hw devices directly)
+    # On Arch Linux (and others), libpipewire-module-alsa doesn't exist.
+    # ALSA devices are handled by WirePlumber via libspa-alsa.so.
+    # We DON'T disable the ALSA monitor - let WirePlumber auto-detect the dmix device
+    # from the system-wide /etc/asound.conf configuration.
+    #
+    # The asound.conf sets dmix:CARD=sofhdadsp,DEV=31 as default pcm,
+    # so WirePlumber will see it as a regular ALSA device.
+
+    # Configure WirePlumber to ensure dmix is preferred
     local wp_conf_dir="$real_home/.config/wireplumber/wireplumber.conf.d"
-    local wp_disable_alsa="$wp_conf_dir/99-l337-disable-alsa-monitor.conf"
+    local wp_dmix_conf="$wp_conf_dir/99-l337-alsa-dmix.conf"
     mkdir -p "$wp_conf_dir"
-    cat > "$wp_disable_alsa" <<EOF
+    cat > "$wp_dmix_conf" <<EOF
 # Added by L337 Audio Server installer
-# Disable WirePlumber ALSA monitor so it doesn't claim hardware devices directly
-# We use dmix devices instead for shared access
-wireplumber.profiles = {
-  main = {
-    monitor.alsa = disabled
+# Ensure dmix device is used for shared hardware access
+wireplumber.components = {
+  alsa_monitor = {
+    alsa = {
+      defaults = {
+        pcm = "dmix:CARD=${card_name},DEV=${device_num}"
+        ctl = "hw:CARD=${card_name}"
+      }
+    }
   }
 }
 EOF
-    chown "$user" "$wp_disable_alsa" 2>/dev/null || true
+    chown "$user" "$wp_dmix_conf" 2>/dev/null || true
 
-    # Configure PipeWire to use dmix sink
-    local pw_conf_dir="$real_home/.config/pipewire/pipewire.conf.d"
-    local pw_dmix_conf="$pw_conf_dir/99-l337-alsa-dmix.conf"
-    mkdir -p "$pw_conf_dir"
-    cat > "$pw_dmix_conf" <<EOF
-# Added by L337 Audio Server installer
-# Create ALSA dmix sink for shared hardware access
-context.objects = [
-  {   factory = libpipewire-module-alsa
-      args = {
-          # Create dmix playback sink
-          node.name = "alsa-dmix-output"
-          media.class = "Audio/Sink"
-          api.alsa.path = "${DMIX_PCM}"
-          api.alsa.period-size = 1024
-          api.alsa.period-num = 2
-          api.alsa.headroom = 0
-          api.alsa.start-delay = 0
-      }
-  }
-]
-EOF
-    chown "$user" "$pw_dmix_conf" 2>/dev/null || true
-
-    ok "PipeWire dmix configured for $user (dmix sink: ${DMIX_PCM})"
+    ok "PipeWire dmix configured for $user (using system dmix: dmix:CARD=${card_name},DEV=${device_num})"
 }
 
 # ---------------------------------------------------------------------------
@@ -955,7 +945,7 @@ if [ -n "$TARGET_USER" ]; then
     if ! id "$TARGET_USER" &>/dev/null; then
         fail "User not found: $TARGET_USER"
     fi
-    configure_user_pipewire_dmix "$TARGET_USER"
+    configure_user_pipewire_dmix "$TARGET_USER" "$card_name" "$device_num"
     setup_user_pipewire_services "$TARGET_USER"
     setup_systemd_user "$BINARY_INPUT" "$TARGET_USER"
 else
@@ -963,7 +953,7 @@ else
     if ! id "$USER_NAME" &>/dev/null; then
         fail "Dedicated service user '$USER_NAME' does not exist. Run install.sh (recommended) or create '$USER_NAME' first."
     fi
-    configure_user_pipewire_dmix "$USER_NAME"
+    configure_user_pipewire_dmix "$USER_NAME" "$card_name" "$device_num"
     setup_user_pipewire_services "$USER_NAME"
     setup_systemd_user "$BINARY_INPUT" "$USER_NAME"
 fi
