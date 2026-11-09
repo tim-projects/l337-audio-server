@@ -261,18 +261,28 @@ configure_alsa_dmix() {
 
     # Detect the actual card if PCH is not found
     local card_name="${ALSA_CARD}"
+    local device_num="${ALSA_DEVICE}"
     if ! grep -q "\[${card_name}\]" /proc/asound/cards 2>/dev/null; then
         # Try to find the first non-HDMI/non-MIDI card
         local detected_card
-        detected_card=$(awk '/^ \[.*\]/ {gsub(/[\[\]]/,"",$2); print $2}' /proc/asound/cards 2>/dev/null | grep -viE 'hdmi|midi|thinkpad|loopback' | head -1 || true)
+        detected_card=$(awk '/\[.*\]/ {gsub(/[\[\]]/,"",$2); print $2}' /proc/asound/cards 2>/dev/null | grep -viE 'hdmi|midi|thinkpad|loopback' | head -1 || true)
         if [ -n "$detected_card" ]; then
             card_name="$detected_card"
-            DMIX_PCM="dmix:CARD=${card_name},DEV=${ALSA_DEVICE}"
             info "Using detected ALSA card: ${card_name}"
         else
             warn "Could not auto-detect ALSA card; using default: ${card_name}"
         fi
     fi
+
+    # Detect deepbuffer device for the detected card (usually 31 for sof-hda-dsp)
+    # Check /proc/asound/devices for device 31 on the card index
+    local card_index
+    card_index=$(awk -v card="$card_name" '/\[.*\]/ {gsub(/[\[\]]/,"",$2); if ($2 == card) {gsub(/[\[\]]/,"",$1); print $1}}' /proc/asound/cards 2>/dev/null | head -1)
+    if [ -n "$card_index" ] && grep -q "\[ ${card_index}-31\]" /proc/asound/devices 2>/dev/null; then
+        device_num="31"
+        info "Using deepbuffer device 31 for card ${card_name}"
+    fi
+    DMIX_PCM="dmix:CARD=${card_name},DEV=${device_num}"
 
     # Read existing config
     local existing=""
