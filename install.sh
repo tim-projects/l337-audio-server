@@ -559,8 +559,18 @@ if [ -n "$INSTALLED_BIN" ] && [ -f "$INSTALLED_BIN" ] && [ -x "$INSTALLED_BIN" ]
             else
                 ok "Installed binary is up-to-date ($INSTALLED_VERSION)"
                 echo
-                echo "To reinstall anyway, run with --force:"
+                echo "==========================================="
+                echo " No changes applied — binary version matches"
+                echo "==========================================="
+                echo
+                echo "The installed binary ($INSTALLED_VERSION) matches the"
+                echo "selected release ($SCRIPT_TAG). The platform installer"
+                echo "(which applies config, services, ALSA/PipeWire setup)"
+                echo "was NOT run."
+                echo
+                echo "To reinstall anyway (e.g. to apply installer updates):"
                 echo "  $0 --force$([ "$INSTALL_PRERELEASE" = true ] && echo ' --pre-release')"
+                echo
                 exit 0
             fi
         elif version_gt "$SCRIPT_TAG" "$INSTALLED_VERSION"; then
