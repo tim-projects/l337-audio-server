@@ -46,7 +46,7 @@ NO_AUDIO=false
 TARGET_USER=""
 AUTO_INSTALL_DEPS=true
 FORCE_INSTALL=false
-GROUP_ACCESS=false
+GROUP_ACCESS=true
 # Binary handed over by install.sh (which owns release lookup and the download).
 BINARY_INPUT="${L337_BINARY_PATH:-}"
 RELEASE_TAG="${L337_RELEASE_TAG:-}"
@@ -490,7 +490,8 @@ while [ $# -gt 0 ]; do
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         --force) FORCE_INSTALL=true; shift ;;
-        --group-access) GROUP_ACCESS=true; shift ;;
+        --no-group-access) GROUP_ACCESS=false; shift ;;
+        --group-access) : ;;  # group access is the default; flag kept for compatibility
         -h|--help)
             cat <<EOF
 Usage: $0 [OPTIONS] --binary <path>
@@ -512,7 +513,10 @@ Options:
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   --force                Force reinstall of audio libraries even if already present
-  --group-access         Add local users to the audio group for Unix socket access
+  --group-access         Multi-user Unix socket access is the default on Linux PipeWire installs
+                          (shared /run/l337-audio-server, group=audio). Kept for compatibility.
+  --no-group-access      Disable shared /run/l337-audio-server; each user gets their own socket
+                          under /run/user/<uid>/l337.sock instead.
   -h, --help             Show this help message
 EOF
             exit 0 ;;

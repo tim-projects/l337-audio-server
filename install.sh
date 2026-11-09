@@ -37,6 +37,7 @@ while [ $# -gt 0 ]; do
         --remove-data)              REMOVE_DATA=true; shift ;;
         --pipewire-user)            FORWARD_ARGS+=("--pipewire-user"); shift ;;
         --group-access)             FORWARD_ARGS+=("--group-access"); shift ;;
+        --no-group-access)          FORWARD_ARGS+=("--no-group-access"); shift ;;
         -h|--help)
             echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall [--dry-run] [--remove-data]"
             echo ""
@@ -50,7 +51,10 @@ while [ $# -gt 0 ]; do
             echo "  --dry-run           Show what would happen without making changes (install and uninstall)"
             echo "  --uninstall, -u     Uninstall (runs before install; only --dry-run and --remove-data forwarded)"
             echo "  --remove-data       With --uninstall: also remove configuration/data directories"
-            echo "  --group-access      Add local users to audio group for Unix socket access (PipeWire)"
+            echo "  --group-access      Multi-user Unix socket access is the default on PipeWire installs"
+            echo "                      (shared /run/l337-audio-server, group=audio). Kept for compatibility."
+            echo "  --no-group-access   Disable shared /run/l337-audio-server; per-user socket under"
+            echo "                      /run/user/<uid>/l337.sock instead."
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
             echo "--pre-release is not forwarded to the platform installer."
