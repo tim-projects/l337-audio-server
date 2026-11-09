@@ -297,7 +297,7 @@ fetch_release_rows_api() {
 fetch_tags_web() {
     local atom http
     atom=$(mktemp "${TMPDIR:-/tmp}/l337-atom.XXXXXX") || fail "mktemp failed"
-    http=$(curl -sS -L --connect-timeout 15 --max-time 60 -o "$atom" -w '%{http_code}' \
+    http=$(curl -sS -L --connect-timeout 30 --max-time 120 -o "$atom" -w '%{http_code}' \
         "https://github.com/${REPO}/releases.atom") || { rm -f "$atom"; fail "Failed to fetch releases.atom"; }
     if [ "$http" != "200" ]; then
         rm -f "$atom"
@@ -310,7 +310,7 @@ fetch_tags_web() {
 is_prerelease_tag_web() {
     local tag="$1" page http
     page=$(mktemp "${TMPDIR:-/tmp}/l337-tag.XXXXXX") || return 1
-    http=$(curl -sS -L --connect-timeout 15 --max-time 30 -o "$page" -w '%{http_code}' \
+    http=$(curl -sS -L --connect-timeout 30 --max-time 60 -o "$page" -w '%{http_code}' \
         "https://github.com/${REPO}/releases/tag/${tag}") || { rm -f "$page"; return 1; }
     if [ "$http" != "200" ]; then rm -f "$page"; return 1; fi
     if grep -qiE 'Pre-release|Label--warning[^>]*>[^<]*Pre|class="[^"]*prerelease' "$page"; then
@@ -322,7 +322,7 @@ is_prerelease_tag_web() {
 tag_has_asset_web() {
     local tag="$1" asset="$2" html http
     html=$(mktemp "${TMPDIR:-/tmp}/l337-assets.XXXXXX") || return 1
-    http=$(curl -sS -L --connect-timeout 15 --max-time 60 -o "$html" -w '%{http_code}' \
+    http=$(curl -sS -L --connect-timeout 30 --max-time 120 -o "$html" -w '%{http_code}' \
         "https://github.com/${REPO}/releases/expanded_assets/${tag}") || { rm -f "$html"; return 1; }
     if [ "$http" != "200" ]; then rm -f "$html"; return 1; fi
     if grep -qF "/releases/download/${tag}/${asset}" "$html"; then
@@ -463,7 +463,7 @@ resolve_installable_release_web() {
         tag_has_asset_web "$tag" "release-info.json" || { info "skip $tag (no release-info.json)"; continue; }
 
         info_file=$(mktemp "${TMPDIR:-/tmp}/l337-info.XXXXXX") || continue
-        http=$(curl -sS -L --connect-timeout 15 --max-time 30 -o "$info_file" -w '%{http_code}' \
+        http=$(curl -sS -L --connect-timeout 30 --max-time 60 -o "$info_file" -w '%{http_code}' \
             "https://github.com/${REPO}/releases/download/${tag}/release-info.json") || { rm -f "$info_file"; continue; }
         if [ "$http" != "200" ]; then
             rm -f "$info_file"
