@@ -106,6 +106,12 @@ with the new version heading.
   `/run/user/<uid>/l337.sock` sockets.
 
 ### Changed
+- Installers no longer provision auth tokens (removed mixed-case unhyphenated
+  32-char generation from Linux/macOS/Windows installers and deleted
+  `scripts/generate-token.sh`). The server now generates a single standard token
+  on first start (`src/auth_challenge.rs:generate_token()`: uppercase
+  `A-Z0-9`, hyphenated groups of 4, e.g. `XXXX-XXXX-XXXX-XXXX-XXXX`) and
+  persists it to `server_token.txt` (`src/main.rs:load_or_create_token()`).
 - Performance optimizations (OPT-1, OPT-2, OPT-4, OPT-5, OPT-6, OPT-7, OPT-8,
   OPT-10, OPT-11, OPT-12, OPT-13, OPT-15, OPT-16, OPT-18, OPT-21, OPT-22):
   shared `reqwest::Client` via `Arc` (fewer TLS handshakes), incremental cache

@@ -175,7 +175,7 @@ function Download-Binary {
 }
 
 function New-ServiceWrapper {
-    param([string]$InstallDir, [string]$Token)
+    param([string]$InstallDir)
     $wrapperPath = Join-Path $InstallDir $WrapperName
     $exePath = Join-Path $InstallDir "l337-audio-server.exe"
     $logPath = Join-Path $DataDir "$ServiceName.log"
@@ -183,7 +183,6 @@ function New-ServiceWrapper {
 @echo off
 set L337__SERVER__HOST=0.0.0.0
 set L337__SERVER__PORT=1337
-set L337__SERVER__TOKEN=$Token
 set L337__SERVER__DUMMY=false
 set L337__SERVER__TRANSPORT=auto
 cd /d "%~dp0"
@@ -219,7 +218,11 @@ function Uninstall-Service {
 }
 
 function New-DefaultToken {
-    -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})
+    $chars = (48..57) + (65..90)
+    $parts = 1..5 | ForEach-Object {
+        -join ((1..4) | ForEach-Object { [char]((Get-Random -Minimum 0 -Maximum $chars.Count) ) })
+    }
+    $parts -join '-'
 }
 
 function New-ArpEntry {
@@ -409,8 +412,7 @@ if (-not (Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 }
 
-$token = New-DefaultToken
-$wrapper = New-ServiceWrapper -InstallDir $InstallDir -Token $token
+$wrapper = New-ServiceWrapper -InstallDir $InstallDir
 
 Install-Service -WrapperPath $wrapper
 New-ArpEntry -Version $tag
