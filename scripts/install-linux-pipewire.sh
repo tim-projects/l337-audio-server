@@ -631,6 +631,7 @@ setup_systemd_user() {
         mkdir -p "$shared_runtime_dir"
         chown "${real_user}:audio" "$shared_runtime_dir"
         chmod 0770 "$shared_runtime_dir"
+        chmod g+s "$shared_runtime_dir"
         # Add service user to audio group for PipeWire/ALSA access
         if ! groups "$real_user" 2>/dev/null | grep -qw "audio"; then
             info "Adding $real_user to audio group"

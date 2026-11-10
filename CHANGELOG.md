@@ -96,13 +96,14 @@ with the new version heading.
   removes the seeded state. `--uninstall --remove-data` also removes these files
   so a clean reinstall does not carry stale per-user state.
 - Unix socket permissions: `src/main.rs` defaults socket mode to `0o660` (was `0o600`)
-  and sets the socket group to `audio` via `libc::chown`/`fchown` after binding,
   so any member of the `audio` group can connect to `/run/l337-audio-server/l337.sock`.
+  The installer sets the setgid bit on `/run/l337-audio-server/` so new socket files
+  inherit the `audio` group automatically.
 - Linux PipeWire installer now enables multi-user socket access by default
   (`--group-access` implied): creates `/run/l337-audio-server/` as `l337:audio`
-  mode `0770`, sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server` and
-  `SupplementaryGroups=audio` in the systemd unit. Use `--no-group-access` to
-  restore per-user `/run/user/<uid>/l337.sock` sockets.
+  mode `0770` with the setgid bit set, sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server`
+  in the systemd unit. Use `--no-group-access` to restore per-user
+  `/run/user/<uid>/l337.sock` sockets.
 
 ### Changed
 - Performance optimizations (OPT-1, OPT-2, OPT-4, OPT-5, OPT-6, OPT-7, OPT-8,

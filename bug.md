@@ -773,18 +773,16 @@ connecting to /run/l337-audio-server/l337.sock
 
 Player-side startup now correctly probes `/run/l337-audio-server/l337.sock` (see `l337-player` commit `cbe1caa`, branch `99-task-audio-server-single-socket`), but connection is rejected because the socket file is not group-accessible. The player's own user (`tim`, uid 1002) is in the `audio` group yet gets `EACCES` on connect.
 
-**Fix applied.** Two changes:
+**Fix applied.** Two changes work together:
 
-1. **`src/main.rs`**: `socket_mode_from_settings` default changed from `0o600` to `0o660`; after binding, socket permissions set to `0o660` and group changed to `audio` via `libc::fchown`. This works when the server is run directly as `l337`. When run via systemd user service, `fchown` may not take effect (systemd user service context) — see workaround below.
+1. **`src/main.rs`**: `socket_mode_from_settings` default changed from `0o600` to `0o660`; after binding, socket permissions set to `0o660` via `std::fs::set_permissions`. Group is set to `audio` via the directory's setgid bit (see below) rather than `fchown`, which does not reliably take effect inside a systemd user service context.
 
-2. **`scripts/install-linux-pipewire.sh`**: `--group-access` is now the default (not opt-in). The installer creates `/run/l337-audio-server/` as `l337:audio` mode `0770`, sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server` and `SupplementaryGroups=audio` in the systemd unit, and seeds `~/.local/state/wireplumber/` with the detected ALSA card profile. Use `--no-group-access` to disable shared socket access.
+2. **`scripts/install-linux-pipewire.sh`**: `--group-access` is now the default (not opt-in). The installer creates `/run/l37-audio-server/` as `l337:audio` with the setgid bit (`chmod g+s`) so any new socket file automatically inherits the `audio` group. Sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server` in the systemd unit. Use `--no-group-access` to disable shared socket access.
 
-**Workaround for systemd user service:** If the socket group remains `l337:l337` (not `l337:audio`) under systemd, manually run:
-```
-chgrp audio /run/l337-audio-server/l337.sock
-```
-as `l337` (or root) after the service starts. This is needed because `fchown` inside the systemd user service context may not change group ownership.
+**Verified:**
+- Socket: `660 l337:audio` — group read/write, group `audio`
+- Directory: `2770 l337:audio` — setgid bit set, so new socket files inherit `audio` group automatically
+- Tim (uid 1002, member of `audio` group) can `curl` the socket and stream WAV/OGG with audible output
+- `curl http://localhost/player/play/stream` over Unix socket → `{"ok":true}`, `state: playing` → `stopped` at EOS
 
-**Player-side status.** Socket path discovery works (`os.path.exists('/run/l337-audio-server/l337.sock')` → true). Token is discovered via `/setup` on the socket. With socket mode `0o660` and group `audio`, players running as any `audio` group member can connect without `EACCES`.
-
-**RESOLVED 2026-11-09.**
+**RESOLVED 2026-11-10.**
