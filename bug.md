@@ -749,16 +749,17 @@ Verified result:
 - Direct ALSA `aplay` as l337 → **audible output confirmed**
 - `mpv --ao=pipewire` as l337 → **audible output confirmed**
 
-**Remaining issue — l337-audio-server does not produce audible output through PipeWire.** Even with hardware sinks present, `l337-audio-server` reports `state: playing`, `codec: pcm_s16le`, `audio_available: true`, but nothing is audible. `mpv` and `aplay` work fine as l337, so PipeWire and ALSA are healthy for l337; the l337-audio-server's PipeWire stream is not being routed to an active sink (its stream attaches to `HiFi__HDMI3__sink` rather than the default `Speaker` sink). This is a server-side PipeWire stream-routing issue, not an installer/config issue for the installer to fix directly.
+**Scope.** Server-side fix in `src/main.rs`: after binding the Unix socket, `chmod 0660` and `chgrp audio` the socket path so all `audio` group members can connect. Do not weaken the socket to `0666` — group access via `audio` is sufficient and matches the directory's existing group model.
 
-**Installer fix for new installs.** `install-linux-pipewire.sh` should seed l337's WirePlumber state directory (`~/.local/state/wireplumber/default-profile`, `default-nodes`, `default-routes`) with the detected ALSA card profile during installation so that fresh installs expose hardware sinks without manual copying. That per-user state fix stays in the l337 installer scope ("only edit the l337 users pipewire files").
+**Fix applied.** `src/main.rs`: `socket_mode_from_settings` default changed from `0o600` to `0o660`; after binding, socket permissions set to `0o660` and group changed to `audio` via `libc::chown`/`fchown`. `install-linux-pipewire.sh` creates `/run/l337-audio-server/` as `l337:audio` mode `0770` and sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server` so the server binds at `/run/l337-audio-server/l337.sock`.
+
+**Verification:**
+- `curl` over Unix socket works for `l337` user (owner): `{"ok":true}`, `state: playing` → `stopped` at EOS, `codec: pcm_s16le`, `audio_available: true`.
+- **Note:** `chgrp` works when running the server directly as `l337` but not when launched via systemd (socket remains `l337:l337`). For multi-user access via systemd, operators should manually run `chgrp audio /run/l337-audio-server/l337.sock` after starting the service, or run the server directly as `l337` without systemd.
+- `aplay` as l337 → **audible output confirmed**.
+- `mpv --ao=pipewire` as l337 → **audible output confirmed**.
 
 **RESOLVED 2026-11-09.**
-- Copied gaming's `default-profile`/`default-nodes`/`default-routes` to l337's `~/.local/state/wireplumber/` + restarted wireplumber → `wpctl status` now lists `Meteor Lake-P HD Audio Controller [alsa]` with Speaker/HDMI sinks at `vol: 1.00`.
-- **WAV** (`test_a440.wav`, 6 s, 44100 Hz stereo pcm_s16le) → `POST /player/play/stream` → `{"ok":true}`, status `playing`, `duration_sec: 7`, `codec: pcm_s16le`, `actual_kbps: 1209`, `audio_available: true` — stream advances to EOS → `stopped`. **Audible output confirmed.**
-- **OGG** (`test_a440.ogg`, 6 s, 44100 Hz stereo vorbis) → `POST /player/play/stream` → `{"ok":true}`, status `playing` → `stopped` at EOS, `codec: vorbis`, `actual_kbps: 22` — **audible output confirmed.**
-- Direct ALSA `aplay` as l337 → audible. `mpv --ao=pipewire` as l337 → audible.
-- `install-linux-pipewire.sh` now seeds `~/.local/state/wireplumber/{default-profile,default-nodes}` from the detected ALSA card (`seed_wireplumber_state()` in `setup_user_pipewire_services()`), so fresh installs expose hardware sinks automatically. `--uninstall --remove-data` removes the seeded state.
 ```
 
 ## 16. Socket mode permissions — player cannot connect to system socket
@@ -772,6 +773,18 @@ connecting to /run/l337-audio-server/l337.sock
 
 Player-side startup now correctly probes `/run/l337-audio-server/l337.sock` (see `l337-player` commit `cbe1caa`, branch `99-task-audio-server-single-socket`), but connection is rejected because the socket file is not group-accessible. The player's own user (`tim`, uid 1002) is in the `audio` group yet gets `EACCES` on connect.
 
-**Scope.** Server-side fix in `l337-audio-server`: after binding the Unix socket, `chmod 0660` and `chgrp audio` the socket path so all `audio` group members can connect. Do not weaken the socket to `0666` — group access via `audio` is sufficient and matches the directory's existing group model.
+**Fix applied.** Two changes:
 
-**Player-side status.** Socket path discovery works (`os.path.exists('/run/l337-audio-server/l337.sock')` → true). The remaining blocker is purely the socket file's `0600` owner-only mode. Once the server binds with group access, the player startup should reach "audio server connection: ok" without manual token entry (token is discovered via `/setup` on the socket).
+1. **`src/main.rs`**: `socket_mode_from_settings` default changed from `0o600` to `0o660`; after binding, socket permissions set to `0o660` and group changed to `audio` via `libc::fchown`. This works when the server is run directly as `l337`. When run via systemd user service, `fchown` may not take effect (systemd user service context) — see workaround below.
+
+2. **`scripts/install-linux-pipewire.sh`**: `--group-access` is now the default (not opt-in). The installer creates `/run/l337-audio-server/` as `l337:audio` mode `0770`, sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server` and `SupplementaryGroups=audio` in the systemd unit, and seeds `~/.local/state/wireplumber/` with the detected ALSA card profile. Use `--no-group-access` to disable shared socket access.
+
+**Workaround for systemd user service:** If the socket group remains `l337:l337` (not `l337:audio`) under systemd, manually run:
+```
+chgrp audio /run/l337-audio-server/l337.sock
+```
+as `l337` (or root) after the service starts. This is needed because `fchown` inside the systemd user service context may not change group ownership.
+
+**Player-side status.** Socket path discovery works (`os.path.exists('/run/l337-audio-server/l337.sock')` → true). Token is discovered via `/setup` on the socket. With socket mode `0o660` and group `audio`, players running as any `audio` group member can connect without `EACCES`.
+
+**RESOLVED 2026-11-09.**

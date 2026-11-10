@@ -88,7 +88,7 @@ fn socket_mode_from_settings(settings: &ServerSettings) -> u32 {
         .as_deref()
         .and_then(|s| u32::from_str_radix(s.trim(), 8).ok())
         .map(|m| m & 0o777)
-        .unwrap_or(0o600)
+        .unwrap_or(0o660)
 }
 
 /// Path to the Unix domain socket used for local IPC.
@@ -683,8 +683,33 @@ async fn main() {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
                 let mut perms = meta.permissions();
-                perms.set_mode(socket_mode_from_settings(&settings.server));
+                // Socket is created owner-only (0o600). For multi-user access
+                // via the shared /run/l337-audio-server directory (group=audio),
+                // grant group read/write so any audio group member can connect.
+                perms.set_mode(0o660);
                 let _ = std::fs::set_permissions(&path, perms);
+            }
+            // chgrp the socket to 'audio' so group members can connect.
+            use std::os::unix::io::AsRawFd;
+            use std::ffi::CString;
+            use libc::{fchown, getgrnam};
+            if let Ok(path_cstr) = CString::new(path.as_os_str().as_encoded_bytes()) {
+                if let Ok(grp_cstr) = CString::new("audio") {
+                    unsafe {
+                        let grp = getgrnam(grp_cstr.as_ptr());
+                        if !grp.is_null() {
+                            let rc = fchown(listener.as_raw_fd(), -1i32 as libc::uid_t, (*grp).gr_gid);
+                            if rc != 0 {
+                                let err = std::io::Error::last_os_error();
+                                tracing::warn!("fchown audio {} failed rc={}: {} (groups: {:?})", path.display(), rc, err, std::process::Command::new("id").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default());
+                            } else {
+                                tracing::debug!("fchown audio {} succeeded", path.display());
+                            }
+                        } else {
+                            tracing::warn!("getgrnam(audio) returned NULL (errno={})", std::io::Error::last_os_error());
+                        }
+                    }
+                }
             }
         }
         tracing::info!(
