@@ -393,7 +393,23 @@ pub async fn set_target(
 }
 
 pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
-    let mut engine = state.0.lock().await;
+    // Non-blocking status poll: if the engine lock is held (e.g. during a
+    // long incremental decode), return a minimal status immediately instead of
+    // blocking the client's poll loop. The client's update_playback_progress
+    // retries every second, so it will pick up the full status once the lock
+    // is released.
+    let mut engine = match state.0.try_lock() {
+        Ok(e) => e,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "state": "playing",
+                "position_sec": 0,
+                "duration_sec": null,
+                "time": "0:00/--:--"
+            }))
+            .into_response();
+        }
+    };
     let status = engine.get_status().await;
     Json(status).into_response()
 }

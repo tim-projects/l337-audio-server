@@ -520,6 +520,25 @@ impl PlayerEngine {
             }
         }
 
+        // If stream_url is a local file path (bare absolute path or file:// URL)
+        // that exists on this machine, play it directly without downloading.
+        // This avoids unnecessary client-side uploads when server and client
+        // share the same filesystem.
+        let local_src = track.stream_url.strip_prefix("file://");
+        let local_path = local_src
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&track.stream_url));
+        if local_path.is_absolute() && local_path.exists() {
+            info!("play_track: local file hit for {}", local_path.display());
+            let slot = self.storage.get_active_slot_path("current");
+            fs::copy(&local_path, &slot)
+                .await
+                .map_err(|e| EngineError::Other(format!("failed to copy local file: {e}")))?;
+            self.load_and_play("current").await;
+            self.persist_slot(&track.track_id, &local_path).await;
+            return Ok(());
+        }
+
         let path = self.storage.get_active_slot_path("current");
         info!(
             "play_track: downloading {} -> {}",
