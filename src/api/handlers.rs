@@ -227,7 +227,7 @@ pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
-    engine.stop();
+    engine.stop().await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 

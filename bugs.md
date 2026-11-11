@@ -1933,3 +1933,105 @@ Controller [alsa]` with Speaker/HDMI sinks at `vol: 1.00`.
 (`seed_wireplumber_state()` in `setup_user_pipewire_services()`), auto-detecting the card via
 `aplay -l`/`pw-cli`, so fresh installs expose hardware sinks automatically. `--uninstall
 --remove-data` removes the seeded state. `bash -n` clean.
+
+---
+
+## NF-13 — Concurrent playback / `stop()` race (2026-11-11, `src/player/engine.rs`)
+
+**Reported symptom:** The audio server appeared able to play 2 files at the same time — the user
+heard what seemed like the same track played twice, and the buffer jumped between two streams.
+The server should only play one file at a time.
+
+**Root cause:** `PlayerEngine::stop()` was synchronous — it *aborted* the background streaming
+download/decode tasks without awaiting them. `play_track()` called `stop()` then immediately
+started a new decode, so the old decode task could still be running and appending PCM to the shared
+`AudioBuffer` while the new track's decode also wrote to it. Two producers writing to one buffer
+caused the same track to be heard twice and the buffer to "jump between the two streams."
+
+**Fix:** Made `stop()` async. It now sets the cancel flag, aborts *and awaits* the download
+handle, then awaits the decode handle with a 5-second timeout. This guarantees the old producer
+has fully stopped writing to the shared buffer before a new playback begins — enforcing
+single-track playback.
+
+**Call sites updated to `.await`:**
+- `play_track` (engine.rs:455)
+- `play_pushed` (engine.rs:592)
+- `load_and_play` decode failure (engine.rs:707)
+- `start_streaming_playback` probe fallback (engine.rs:989)
+- `trigger_next` (engine.rs:1238)
+- `trigger_previous` (engine.rs:1258)
+- `get_status` end-of-track (engine.rs:1303)
+- `/player/stop` handler (handlers.rs:230)
+- `/player/next` handler (handlers.rs:236)
+
+**Verification:** `cargo check --no-default-features --features alsa,opus` passes with no new
+errors. Full suite passes: 64 unit + 26 endpoint tests, all green.
+
+**Files changed:**
+- `src/player/engine.rs` — `stop()` is now `async`, awaits cancelled streaming handles with a
+  5 s timeout; all internal call sites updated.
+- `src/api/handlers.rs` — `/player/stop` and `/player/next` call `engine.stop().await`.
+
+---
+
+## Additional findings consolidated from `bug.md` (2026-11-08)
+
+The following items were recorded in `bug.md` and are consolidated here.
+
+### Single-instance lock scope vs isolated runtimes (design note)
+
+`InstanceLock` on Linux also locks `/tmp/l337-audio-server-runtime/instance.lock` for cross-TMPDIR
+detection, except when `L337_RUNTIME_DIR` is set (isolated mode locks only that runtime). Correct for
+normal mode; operators/tests wanting a fully separate instance should set `L337_RUNTIME_DIR`
+consistently (and use matching runtime dirs). Per-socket lock now protects the same socket path
+regardless of lock scope.
+
+### Stale committed binary (`bin/l337-audio-server` is v0.1.0)
+
+`bin/l337-audio-server` in the repo is a stale v0.1.0 binary (built Sep 5 2026) that predates
+`/setup`, `/version`, `/health`, and `--help`/`--token`. It is a foot-gun for anyone who runs it
+directly instead of building via `scripts/build.sh` or fetching via `gh`. Either remove the committed
+binary or document clearly that it is a placeholder. Replaced by a fresh build during validation but
+should be regenerated/committed via CI.
+
+### Single-instance lock uses a fixed, privileged path
+
+`src/platform/single_instance` attempts `/run/l337-audio-server/instance.lock`, which is unwritable
+by a plain user (`Permission denied (os error 13)`). The lock should live under `runtime_dir()`
+(or `~/.cache/...` on the older binary) so unprivileged dummy runs do not needlessly warn.
+
+### `token_file_path()` vs env token
+
+On the v0.1.0 binary, `L337__SERVER__TOKEN` overrides the persisted token, and `--token` then
+prints the (possibly empty) path rather than the effective value. Not a blocker, but worth asserting
+in `--token` that a token actually exists.
+
+### Stale `/etc/l337-audio-server/server.ini` shadows the server config (§14)
+
+`src/main.rs:load_settings()` reads configuration sources in this order:
+
+1. `/etc/l337-audio-server/config`
+2. `/etc/l337-audio-server/server.ini` ← stale file from Sep 15 takes precedence over #3/#4
+3. `server.ini` next to the binary (`CWD`)
+4. Environment variables `L337__*`
+
+A pre-existing stale `/etc/l337-audio-server/server.ini` (e.g. `host = "127.0.0.1"`, `port = 1337`,
+`dummy = false`, `transport = "http"`) shadows the CWD/env config and forces TCP+TLS with no token,
+returning `HTTP 401 missing or invalid token`. Additionally, installers write user config to
+`~/.config/l337-audio-server/server.ini`, but `load_settings()` never reads that path.
+
+Fix: installers sync generated config into `/etc/l337-audio-server/server.ini` (replacing stale
+`transport = "http"` with `auto` and correct token/dummy settings).
+
+### No audible output — PipeWire has no hardware sink for l337 (§15)
+
+After the config fix, the server runs correctly over the Unix socket (`state: playing`,
+`codec: pcm_s16le`, `audio_available: true`) but nothing is audible because l337's WirePlumber
+session never exposes the ALSA hardware device as a sink — `wpctl status` shows only
+`Dummy-Driver`/`Freewheel-Driver` plus orphaned server output streams. The ALSA hardware works
+directly for l337 (`aplay` audible). The gap is PipeWire-only: l337's `~/.local/state/wireplumber/`
+has no `default-profile` (unlike other users' sessions).
+
+Fix: seed l337's WirePlumber state (`default-profile`/`default-nodes`/`default-routes`) from the
+detected ALSA card in `install-linux-pipewire.sh` (`seed_wireplumber_state()`), auto-detecting the
+card via `aplay -l`/`pw-cli`; `--uninstall --remove-data` removes the seeded state.

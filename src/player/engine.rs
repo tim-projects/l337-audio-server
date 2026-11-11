@@ -452,7 +452,7 @@ impl PlayerEngine {
             self.try_recover().map_err(EngineError::Other)?;
         }
 
-        self.stop();
+        self.stop().await;
         self.current_track = Some(track.clone());
 
         // G2: resolve the bandwidth ceiling for this request and remember it (and
@@ -589,7 +589,7 @@ impl PlayerEngine {
         title: Option<String>,
         artist: Option<String>,
     ) -> Result<(), String> {
-        self.stop();
+        self.stop().await;
         self.current_track = Some(Track {
             track_id: track_id.to_string(),
             stream_url: String::new(),
@@ -704,7 +704,7 @@ impl PlayerEngine {
                         e
                     );
                     // Leave playback stopped/empty on decode failure.
-                    self.stop();
+                    self.stop().await;
                     return;
                 }
             };
@@ -754,13 +754,33 @@ impl PlayerEngine {
         self.state = PlayerStateLabel::Playing;
     }
 
-    pub fn stop(&mut self) {
+    pub async fn stop(&mut self) {
         if let Some(streaming) = self.streaming.take() {
             streaming.cancel.store(true, Ordering::SeqCst);
             if let Some(handle) = streaming.download_handle {
                 handle.abort();
+                let _ = handle.await;
             }
-            streaming.decode_handle.abort();
+            // Wait for the decode producer to observe `cancel` and stop writing
+            // to the shared buffer before a new playback can start. Without
+            // this, `stop()` aborts the task but returns immediately, so the
+            // old decode can still be appending PCM while the next track's
+            // decode writes to the same buffer — two streams overlapping
+            // (concurrent playback). Bound the wait so a wedged producer (e.g.
+            // stuck in wait_for_progress on a stalled download) cannot block
+            // stop() indefinitely.
+            let decode_handle = streaming.decode_handle;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                decode_handle,
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(_)) => {}
+                Err(_elapsed) => {
+                    tracing::warn!("streaming decode task did not stop within 5 s after cancel");
+                }
+            }
         }
         // Pause the backend stream instead of destroying it from the engine
         // thread. PipeWire stream/mainloop objects are not safe to tear down
@@ -966,7 +986,7 @@ impl PlayerEngine {
                     error = %e,
                     "stream container could not be probed from a partial file; falling back to a whole-file download"
                 );
-                self.stop();
+                self.stop().await;
                 stream_http_to_file(
                     &self.http_client,
                     &fallback_url,
@@ -1215,7 +1235,7 @@ impl PlayerEngine {
             return;
         }
 
-        self.stop();
+        self.stop().await;
 
         if curr_path.exists() {
             let _ = fs::rename(&curr_path, &prev_path).await;
@@ -1235,7 +1255,7 @@ impl PlayerEngine {
             return;
         }
 
-        self.stop();
+        self.stop().await;
 
         if curr_path.exists() {
             let _ = fs::rename(&curr_path, &next_path).await;
@@ -1280,7 +1300,7 @@ impl PlayerEngine {
         // the decode-finished condition (`streaming` is None on the file path,
         // where the whole track is already decoded when state turns Playing).
         if self.state == PlayerStateLabel::Playing && decode_done && unconsumed == 0 {
-            self.stop();
+            self.stop().await;
             info!("end of track reached: state = stopped");
             // stop() cleared the buffer and reset the seek base, so the
             // snapshot taken above is stale.

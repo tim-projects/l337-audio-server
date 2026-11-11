@@ -1,9 +1,14 @@
 # bugs-completed.md — Completed Bug Fixes and Verified Fixes
 
 Tracks bugs fully resolved and verified. For ongoing/pending issues, see `bug.md`.
-Last updated: 2026-11-08.
+Last updated: 2026-11-11.
 
 ## ✅ Completed (l337-audio-server)
+
+### 9. Concurrent playback / `stop()` race (2026-11-11, `src/player/engine.rs`)
+- **Root cause**: `PlayerEngine::stop()` was synchronous — it aborted the background streaming download/decode tasks without awaiting them. When `play_track()` called `stop()` then immediately started a new decode, the old decode task could still be running and appending PCM to the shared `AudioBuffer` while the new track's decode also wrote to it. Two producers writing to one buffer caused the same track to be heard twice and the buffer to "jump between the two streams."
+- **Fix**: Made `stop()` async. It now sets the cancel flag, aborts and awaits the download handle, then awaits the decode handle with a 5-second timeout, guaranteeing the old producer has fully stopped writing to the shared buffer before a new playback begins — enforcing single-track playback. All internal call sites (`play_track`, `play_pushed`, `load_and_play`, `trigger_next`, `trigger_previous`, `get_status` end-of-track) and the `/player/stop` + `/player/next` handlers updated to `.await`.
+- **Verified**: `cargo check --no-default-features --features alsa,opus` passes with no new errors; 64 unit + 26 endpoint tests all green.
 
 ### 1. AAC divide-by-zero bug (§6 in bug.md)
 - **Root cause**: `decode_to_pcm` in `src/player/engine.rs` could yield `channels=0` for AAC-LC when probed codec params had `channels: None`, causing `pcm.len() / channels` panic.
