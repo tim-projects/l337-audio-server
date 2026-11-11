@@ -88,7 +88,7 @@ fn socket_mode_from_settings(settings: &ServerSettings) -> u32 {
         .as_deref()
         .and_then(|s| u32::from_str_radix(s.trim(), 8).ok())
         .map(|m| m & 0o777)
-        .unwrap_or(0o600)
+        .unwrap_or(0o660)
 }
 
 /// Path to the Unix domain socket used for local IPC.
@@ -401,7 +401,7 @@ async fn main() {
         println!("Options:");
         println!("  --dummy          Run without audio hardware (no soundcard required)");
         println!("  --transport=MODE Set transport: auto, socket, http (default: auto)");
-        println!("  --token          Print the path to the persisted auth token file and exit");
+        println!("  --token          Print the effective auth token source and exit");
         println!("  --version, -v    Print version and exit");
         println!("  --help, -h       Print this help message");
         println!();
@@ -411,8 +411,30 @@ async fn main() {
     }
 
     if std::env::args().any(|a| a == "--token") {
+        let settings = load_settings().expect("Failed to load config");
+
+        // Report the effective token source, mirroring the resolution at
+        // main.rs:536-538. `L337__SERVER__TOKEN` wins over `[server] token`,
+        // which wins over the persisted token file.
+        if std::env::var("L337__SERVER__TOKEN")
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
+        {
+            println!("token: from L337__SERVER__TOKEN environment variable");
+            return;
+        }
+        if let Some(token) = &settings.server.token {
+            if !token.is_empty() {
+                println!("token: from [server] token in config file");
+                return;
+            }
+        }
         let path = token_file_path();
-        println!("{}", path.display());
+        if path.exists() {
+            println!("token: persisted at {}", path.display());
+        } else {
+            println!("token: will be generated at {}", path.display());
+        }
         return;
     }
 
@@ -683,8 +705,33 @@ async fn main() {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(&path) {
                 let mut perms = meta.permissions();
-                perms.set_mode(socket_mode_from_settings(&settings.server));
+                // Socket is created owner-only (0o600). For multi-user access
+                // via the shared /run/l337-audio-server directory (group=audio),
+                // grant group read/write so any audio group member can connect.
+                perms.set_mode(0o660);
                 let _ = std::fs::set_permissions(&path, perms);
+            }
+            // chgrp the socket to 'audio' so group members can connect.
+            use std::os::unix::io::AsRawFd;
+            use std::ffi::CString;
+            use libc::{fchown, getgrnam};
+            if let Ok(path_cstr) = CString::new(path.as_os_str().as_encoded_bytes()) {
+                if let Ok(grp_cstr) = CString::new("audio") {
+                    unsafe {
+                        let grp = getgrnam(grp_cstr.as_ptr());
+                        if !grp.is_null() {
+                            let rc = fchown(listener.as_raw_fd(), -1i32 as libc::uid_t, (*grp).gr_gid);
+                            if rc != 0 {
+                                let err = std::io::Error::last_os_error();
+                                tracing::warn!("fchown audio {} failed rc={}: {} (groups: {:?})", path.display(), rc, err, std::process::Command::new("id").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default());
+                            } else {
+                                tracing::debug!("fchown audio {} succeeded", path.display());
+                            }
+                        } else {
+                            tracing::warn!("getgrnam(audio) returned NULL (errno={})", std::io::Error::last_os_error());
+                        }
+                    }
+                }
             }
         }
         tracing::info!(

@@ -119,6 +119,69 @@ headless.
 L337__SERVER__PORT=1337 ./bin/l337-audio-server --dummy   # env-var config override
 ```
 
+## Isolated testing on a live device
+
+When the machine already runs a live audio server (e.g. a supervised systemd service
+on its default socket), run test builds as **isolated instances** that never touch
+the live server's socket, port, token, or runtime dir:
+
+1. **Build the test binary to `/tmp`** (never the repo `target/` — see Build rules):
+
+   ```bash
+   CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/l337-build \
+     cargo build --release --no-default-features --features alsa,opus
+   cp -f /tmp/l337-build/release/l337-audio-server ./bin/l337-audio-server
+   ```
+
+2. **Create isolated runtime dirs:**
+
+   ```bash
+   rm -rf /tmp/l337-test && mkdir -p /tmp/l337-test/run /tmp/l337-test/state /tmp/l337-test/cache
+   ```
+
+3. **Start an isolated server on a unique socket/port with its own token:**
+
+   ```bash
+   setsid env \
+     L337_RUNTIME_DIR=/tmp/l337-test/run \
+     L337__SERVER__TOKEN=test-token-iso \
+     L337__SERVER__PORT=13370 \
+     L337__SERVER__DUMMY=true \
+     RUST_LOG=l337_audio_server=debug \
+     ./bin/l337-audio-server --transport=socket \
+     > /tmp/l337-test/server.log 2>&1 < /dev/null &
+   ```
+
+   - `L337_RUNTIME_DIR` gives it its own socket path and instance lock
+   - `L337__SERVER__PORT=13370` avoids colliding with the live port
+   - `L337__SERVER__TOKEN` gives it its own auth token
+   - `--dummy` means no audio hardware is touched
+   - Everything lives under `/tmp/l337-test`, so no files conflict with the live install
+
+4. **Test against it** (socket path is under your isolated runtime dir):
+
+   ```bash
+   curl --unix-socket /tmp/l337-test/run/l337.sock \
+     -H "Authorization: Bearer test-token-iso" \
+     http://localhost/player/status
+
+   # or via HTTP on the isolated port
+   curl -sk -H "Authorization: Bearer test-token-iso" \
+     https://127.0.0.1:13370/version
+   ```
+
+5. **Stop when done:**
+
+   ```bash
+   pkill -f l337-audio-server
+   rm -rf /tmp/l337-test
+   ```
+
+To test with real audio output instead of dummy mode, drop `--dummy` and set
+`PIPEWIRE_RUNTIME_DIR`/`PULSE_SERVER` to your live user session's sockets — the
+socket/port/token isolation above still keeps it separate from the running server
+instance.
+
 ## Tests
 
 ```bash

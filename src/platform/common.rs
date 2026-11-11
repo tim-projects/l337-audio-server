@@ -193,7 +193,16 @@ pub fn runtime_dir() -> PathBuf {
         std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute() && *p != PathBuf::from("/"))
-            .unwrap_or_else(|| PathBuf::from("/run/l337-audio-server"))
+            // Fallback for non-systemd runs: XDG_RUNTIME_DIR is unset, and
+            // /run/l337-audio-server is root-owned and unwritable by an
+            // unprivileged user (Permission denied). Use the user's cache dir
+            // instead so dummy runs don't needlessly warn.
+            .unwrap_or_else(|| {
+                dirs::cache_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("l337-audio-server")
+                    .join("runtime")
+            })
     }
     #[cfg(target_os = "android")]
     {
