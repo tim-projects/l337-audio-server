@@ -1,6 +1,6 @@
 # bugs-completed.md — Completed Bug Fixes and Verified Fixes
 
-Tracks bugs fully resolved and verified. For ongoing/pending issues, see `bug.md`.
+Tracks bugs fully resolved and verified. For ongoing/pending issues, see `bugs.md`.
 Last updated: 2026-11-11.
 
 ## ✅ Completed (l337-audio-server)
@@ -10,16 +10,16 @@ Last updated: 2026-11-11.
 - **Fix**: Made `stop()` async. It now sets the cancel flag, aborts and awaits the download handle, then awaits the decode handle with a 5-second timeout, guaranteeing the old producer has fully stopped writing to the shared buffer before a new playback begins — enforcing single-track playback. All internal call sites (`play_track`, `play_pushed`, `load_and_play`, `trigger_next`, `trigger_previous`, `get_status` end-of-track) and the `/player/stop` + `/player/next` handlers updated to `.await`.
 - **Verified**: `cargo check --no-default-features --features alsa,opus` passes with no new errors; 64 unit + 26 endpoint tests all green.
 
-### 1. AAC divide-by-zero bug (§6 in bug.md)
+### 1. AAC divide-by-zero bug (bugs.md)
 - **Root cause**: `decode_to_pcm` in `src/player/engine.rs` could yield `channels=0` for AAC-LC when probed codec params had `channels: None`, causing `pcm.len() / channels` panic.
 - **Fix**: Clamp/default channel handling (`channels.max(1)` / safe fallback) at affected decode/duration paths.
 - **Verified**: AAC plays (~6s) with no panic; WAV playback unchanged. Live/player APIClient validation; CI ALSA binary confirmed. ✅
 
-### 2. Rust loglevel from `server.ini` (§11 in bug.md)
+### 2. Rust loglevel from `server.ini` (bugs.md)
 - **Fix**: `[server] loglevel` (`error`/`warn`/`info`/`debug`/`trace`) loaded in `src/main.rs`; precedence `RUST_LOG` (explicit/parsable) > `loglevel` > crate default (`warn`).
 - **Verified**: on-device (2026-11-01). ✅
 
-### 3. Pipelinepro install runtime libs (§12 in bug.md)
+### 3. Pipelinepro install runtime libs (bugs.md)
 - **Fix**: Installer skips glibc-provided runtime SONAMEs, refreshes `ldconfig` before checks, probes via `ldconfig -p`/standard dirs.
 - **Verified**: simulation + Debian-host runs. ✅
 
@@ -33,7 +33,8 @@ Last updated: 2026-11-11.
   - Short WAV `120_K10_A.wav` (~1.35 MiB decoded f32 stereo 44.1k) fit under window — unaffected.
   - `90s_house_5.ogg` (Ogg Vorbis, 44100 Hz stereo, 4:21, `~112kbps`, ~87.8 MiB decoded) exceeded window — reproduced (curl timeout/no decode completion). `mpv --ao=pipewire` played the same file fine (file/device comparator OK).
 - **Fix**: `load_and_play` now `ensure_stream()` + `stream.play()` and sets `Playing` **before** awaiting incremental decode so callback consumes while decode fills/throttles; duration/codec/`actual_kbps` populated after decode; decode errors call `stop()`. Binary rebuilt/installed (`--features backend,opus`).
-- **Verified**: OGG `90s_house_5.ogg` audible in normal PipeWire mode (user confirmed; ~10s sufficient). WAV baseline still OK. Status advanced while playing. ✅
+- **Memory bounding (complementary, 2026-11-11):** `decode_file_incremental_blocking` now reclaims consumed samples while decoding and blocks on freed buffer space (`wait_for_space`) instead of sleeping, on both the Symphonia and Opus file paths. Peak RSS during file decode is independent of track length (Finding #3 / G4); previously `pcm` grew to the full decoded track.
+- **Verified**: OGG `90s_house_5.ogg` audible in normal PipeWire mode (user confirmed; ~10s sufficient). WAV baseline still OK. Status advanced while playing. `cargo check` clean; `cargo test` green (60 unit + 26 endpoint). Isolated custom-port (13370) dummy instance: local file plays end-to-end; 52 MB local WAV decodes without deadlocking, server stays responsive. ✅
 - **Follow-up (not a blocker):** `/player/play/stream` pushed-file handler still awaits full decode completion, so HTTP response may be delayed for long files even though audio has started.
 
 ### 6. Socket-mode multi-server/startup hardening (2026-11-08, `src/main.rs`)

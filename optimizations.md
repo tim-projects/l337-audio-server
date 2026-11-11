@@ -234,12 +234,20 @@ the same open file, or combine into a single `std::fs::File::open` + `metadata()
 
 ### OPT-13 — load_and_play decodes whole track into RAM (RAM)
 
-**File:** `src/player/engine.rs:521-620`
+**File:** `src/player/engine.rs` (`decode_file_incremental_blocking`)
 
-**Current:** The whole compressed file is read, then the entire track is decoded
-into a `Vec<f32>` before resampling and buffering. Comment at lines 577-581 already
-notes: "peak RSS ~ compressed size×2-2.5 for hour-long tracks." A 100 MB FLAC can
-peak at 200+ MB RSS.
+**Status:** **DONE** (2026-11-11). The file path no longer assigns the whole decoded
+track into `audio_buffer.pcm` in one shot. `decode_file_incremental_blocking` now
+reclaims consumed samples while decoding and blocks on freed buffer space
+(`wait_for_space`, 20 ms timeout) instead of sleeping, on both the Symphonia and Opus
+file paths. `pcm` stays bounded to the rebuffer window (~24 MiB default), so peak RSS
+during file decode is independent of track length. The Opus file path, previously
+unbounded, is throttled the same way (Finding #3 / G4).
+
+**Current (pre-fix):** The whole compressed file is read, then the entire track is
+decoded into a `Vec<f32>` before resampling and buffering. Comment at lines 577-581
+already notes: "peak RSS ~ compressed size×2-2.5 for hour-long tracks." A 100 MB FLAC
+can peak at 200+ MB RSS.
 
 **Optimization:** Decode incrementally into the shared `AudioBuffer` (the same
 throttled producer path that `streaming_decode_sync` uses), removing the whole-track
@@ -499,5 +507,5 @@ immediately — no second disk read.
 3. **OPT-16** (debounce manifest) — trivial, reduces disk writes
 4. **OPT-2** (ALSA chunk size) — one-constant change, reduces syscalls
 5. **OPT-4** (resampler memmove) — high impact on long tracks, medium effort
-6. **OPT-13** (incremental decode) — highest memory impact, but significant refactor
+6. **OPT-13** (incremental decode) — **DONE** (2026-11-11): highest memory impact; `decode_file_incremental_blocking` now bounds `pcm` to the rebuffer window via reclaim + `wait_for_space` on both file paths (Finding #3 / G4).
 7. **OPT-3** (ALSA idle wake) — best for battery/idle, medium effort

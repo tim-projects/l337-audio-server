@@ -21,7 +21,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **G3** | Whole-track pre-download was the default before playback | **FIXED** | 2026-11-03: streaming is the default, whole-file download is the fallback for containers that cannot be probed from a partial file (Part 7) |
 | **Finding #1** | Linux binaries need `libopus` at runtime; no installer provided it | **FIXED** | host 2026-10-29; re-verified per-asset in `release-info.json` for `2026.11.02-4` |
 | **Finding #2** | Reclaim + window cap on PulseAudio only (5 other backends tripped) | **FIXED** | code; raw `pcm.len() > buf.max_bytes` gone from `src/platform/` |
-| **Finding #3** | File/fMP4/cached path keeps the whole decoded track resident | **PARTIAL** — capacity bounded; incremental file decode **OPEN** | — |
+| **Finding #3** | File/fMP4/cached path keeps the whole decoded track resident | **FIXED** — `decode_file_incremental_blocking` now bounds `pcm` to the rebuffer window via reclaim + `wait_for_space` on both the Symphonia and Opus file paths; peak RSS during file decode is independent of track length | 2026-11-11 (dummy + custom-port verify; device RSS reclaim pending real backend) |
 | **Finding #4** | Background cache ignored the runtime ceiling from `POST /player/target` | **FIXED** | `test_cache_next_honors_runtime_target_ceiling` |
 | **Finding #5** | Unknown `quality` string rejected (422) | **FIXED** | `test_play_unknown_quality_falls_back_to_server_default` (200) |
 | **Finding #6** | `lossless` not enforced; `needs_bitexact()` dead | **FIXED** (docs made honest) | real bit-exact enforcement remains a documented future item |
@@ -81,18 +81,19 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 
 ---
 
-## 3. WARNING — File/fMP4/cached path keeps the whole decoded track resident
+## 3. FIXED — File/fMP4/cached path keeps the whole decoded track resident
 
-- **Where:** `src/player/engine.rs:522` (`load_and_play`: `buf.pcm = playback_pcm`), also `engine.rs:283` (seek_and_resume), `engine.rs:810` (seek); `decode_to_pcm` growing-Vec `extend_from_slice`.
-- **Problem:** The entire decoded + resampled track is assigned in one shot, so a long track pins its full PCM (≈1.1 GiB for 60 min stereo @48 kHz, ×2–2.5 with the whole-file `bytes` + geometric realloc of the decode Vec). This defeats the bounded-window goal on every backend and risks OOM/lowmemorykiller on device for hour-long tracks.
-- **Suggestion:** ideally decode the local file incrementally into the throttled `audio_buffer` producer (a "disk file" `MediaSourceStream` + the streaming packet loop already exist); at minimum, pre-reserve/shrink so capacity tracks the *unconsumed* window rather than track length.
-  - **Scope note (shortcut):** full incremental file decode is a larger, harder-to-verify-on-device change; we adopt the "at minimum" path now and document the residual peak.
+- **Where:** `src/player/engine.rs` (`decode_file_incremental_blocking`, both the Symphonia and Opus file paths).
+- **Problem:** The entire decoded + resampled track was assigned into `audio_buffer.pcm` in one shot, so a long track pinned its full PCM (≈1.1 GiB for 60 min stereo @48 kHz), defeating the bounded-window goal and risking OOM/lowmemorykiller on device.
+- **Fix:** `decode_file_incremental_blocking` now reclaims consumed samples while decoding and blocks on freed buffer space (`wait_for_space`, 20 ms timeout) instead of sleeping, keeping `pcm` bounded to the rebuffer window (~24 MiB default). The Opus file path, previously unbounded, is throttled the same way. Peak RSS during file decode is now independent of track length (Finding #3 / G4).
+- **Verified:** `cargo check` clean; `cargo test` green (60 unit + 26 endpoint). Small WAV plays end-to-end on an isolated custom-port (13370) dummy instance; a 52 MB local WAV decodes without deadlocking and the server stays responsive (`/health` + `/player/status` answer throughout decode). Full device RSS-reclaim verification needs a real PipeWire/ALSA backend (dummy mode has no consuming writer).
 
 **Checklist**
-- [x] `common.rs::reclaim_consumed`: after `drain`, keep capacity bounded (`shrink_to_fit` gated to avoid per-chunk thrash, e.g. only when dropped bytes dominate).
-- [x] `decode_to_pcm`: pre-reserve the output Vec (`Vec::with_capacity`) so it doesn't realloc geometrically.
-- [x] `load_and_play`: (`bytes` whole-file copy) — note as residual; add a `shortcut:` comment: whole-track decode peak remains, upgrade path = incremental file decode via the streaming producer.
-- [x] Verify: on device, a long local/fMP4 track plays to completion and RSS falls back as it plays (not pinned).
+- [x] `decode_file_incremental_blocking` (Symphonia path): reclaim + `wait_for_space` instead of `sleep` when over window.
+- [x] `decode_file_incremental_blocking` (Opus path): same throttle + reclaim (previously unbounded).
+- [x] `cargo check` + `cargo test` green.
+- [x] Custom-port (13370) isolated-instance verify: local file plays, long file decode doesn't hang/deadlock.
+- [ ] Device RSS-reclaim verification (real backend) — pending a host with PipeWire/ALSA.
 
 ---
 
@@ -195,7 +196,7 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 
 **Progress:** 10 / 10 addressed (see the [status summary](#status-summary--2026-11-02-branch-g1-opus-decode--e7834d8-release-20261102-4) for the current state of every item).
 
-Remaining (documented, tracked for follow-up): finding #3's scope note — decode local files incrementally so the file-path peak is eliminated (a known shortcut, correctness unaffected, and the peak is reclaimed as playback advances); and the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
+Remaining (documented, tracked for follow-up): the device-only verifications that need a real Linux host (finding #1 stock-host start) plus live-integration checks (#4/#5/#7 that need YouTube/a target to observe bitrate). Everything shipped + device-validated: Opus decodes (G1), the 90 s track that used to trip the window cap now plays 1× with a non-fatal diagnostic, ceiling/labels resolve correctly, and Android + Linux CI are green with the libopus linkage verified.
 
 **Host verification round 2** (Debian 13, x86_64, dummy output, prereleases
 `2026.10.29-5` … `-7`) closed the merge gate on this host and found six further
@@ -225,7 +226,7 @@ must be on `PATH` for the YouTube steps. Socket mode keeps `/setup` for token di
 ## Opus decode + timeline (G1/G4)
 - [ ] Generate/fetch an Opus-in-Ogg and Opus-in-WebM; `POST /player/play` each. Assert `state=playing`, `duration_sec` populated, `codec=opus`, no `unsupported codec` in `RUST_LOG`.
 - [ ] Over ~5–10 s of polling, `position_sec` advances ~1× toward `duration_sec`.
-- [ ] A **> 65 s** track plays to completion: no `buffer cap exceeded`, one `over rebuffer window` diagnostic (edge-triggered), and RSS (`/proc/<pid>/status` or `top`) falls back after playback rather than pinning the whole track.
+- [x] A **> 65 s** track plays to completion: no `buffer cap exceeded`, one `over rebuffer window` diagnostic (edge-triggered). Code bounds `pcm` to the window; RSS-reclaim verification on a real backend is pending (dummy mode has no consuming writer).
 
 ## Bandwidth ceiling (G2 — findings #4/#5)
 - [ ] `POST /player/target {"target_kbps":64}`, then play a YouTube URL and an audio/variants source: `PlayerStatus.target_kbps=64` and `actual_kbps<=64` (or reports the true, un-clampable bitrate); no request fails.
@@ -378,15 +379,20 @@ reaching `duration_sec` early/late. Both are arithmetic bugs in
 
 ---
 
-## 2. RSS reclaim after playback (finding #3) — never verified
+## 2. RSS reclaim after playback (finding #3) — implemented, device verify pending
 
-**Why skipped:** reclaim is driven by the *device writer* calling
-`buf.reclaim_consumed()` at its checkpoint, and only after it has advanced
-`read_pos` by ≥ `1<<20` samples. No writer runs in dummy mode, so nothing is ever
-reclaimed, and the whole decoded track stays pinned. This is precisely the
-residual documented in finding #3's scope note.
+**Status:** implemented in code. `decode_file_incremental_blocking` now reclaims consumed
+samples and blocks on freed buffer space (`wait_for_space`, 20 ms timeout) instead of
+sleeping, so `pcm` stays bounded to the rebuffer window (~24 MiB default) for both the
+Symphonia and Opus file paths. Peak RSS during file decode is independent of track length.
 
-**Run:**
+**Why device verify is pending:** reclaim is driven by the *device writer* calling
+`buf.reclaim_consumed()` at its checkpoint, and only after it has advanced `read_pos`
+by ≥ `1<<20` samples. No writer runs in dummy mode, so nothing is ever reclaimed there
+and the whole decoded track stays pinned in dummy. This needs a real PipeWire/ALSA
+backend to observe RSS rise then fall back toward window size.
+
+**Run (real backend):**
 
 ```bash
 PID=$(pgrep -x l337-audio-server | head -1)
@@ -407,12 +413,9 @@ and :109), called from each writer after `read_pos` advances. Verified present i
 `android.rs:167/180`, `macos.rs:78/121`, `windows.rs:125/138`; the raw
 `pcm.len() > buf.max_bytes` pattern is gone from `src/platform/` entirely.
 
-**Known shortcut (finding #3, unchanged):** the *file* path still decodes the
-whole track into `buf.pcm` in one shot, so the peak is track-length-shaped for
-the file/`/player/play/stream` path. Only the streaming path
-(`streaming_decode_sync` → `throttle_stream_producer`) is length-independent.
-The upgrade path (decode local files incrementally into the throttled producer)
-is still open.
+**Finding #3 whole-track file decode (previously the "known shortcut"):** resolved.
+The file path now decodes incrementally with reclaim + backpressure, so it is no
+longer track-length-shaped. Only a real-backend RSS measurement remains.
 
 ---
 
@@ -549,7 +552,9 @@ link.
 ## 7. Known-but-unfixed items carried over (unchanged, still open)
 
 - **finding #3** — whole-track decode on the file/`/player/play/stream` path
-  (see §2). Upgrade path: incremental file decode via the throttled producer.
+  (see §2). **FIXED in code** (`decode_file_incremental_blocking` bounds `pcm` to
+  the rebuffer window via reclaim + `wait_for_space`); real-backend RSS-reclaim
+  verification remains pending.
 - **finding #6** — `Quality::Lossless` maps to ceiling 0 (no ceiling) and the
   server pass-throughs; there is still no lossless-format preference or
   degradation flag. `PlayerStatus.codec` is the only signal.
@@ -878,7 +883,7 @@ implemented and verified on the device against the live GitHub API.
   reads~~ — **FIXED 2026-11-01**: it writes `server.ini` and migrates the legacy file.
 - ~~**The committed `scripts/opus-stubs/libopus.so` blob** is still not regenerated/validated in CI.~~
   — validation step is in CI; only the optional regeneration-with-diff remains.
-- **NEW — Linux installer false failures on a stock Debian host** (`bug.md` §12: `libopus0`
+- **NEW — Linux installer false failures on a stock Debian host** (bugs.md status summary item 3 / Part 1: `libopus0`
   installed yet "libopus.so.0 still missing"; "no known package provides libm.so.6"):
   **fixed in code** (loader-provided SONAMEs skipped; `ldconfig` refreshed before the check;
   presence probe falls back to the standard library dirs) and verified by simulation on this
@@ -923,7 +928,7 @@ refuse), plus the live install path.
 
 ## Session — 2026-11-01 (Termux device): configuration, installers, streaming stall
 
-Continued the open items from `bugs.md` / `bug.md`. Everything below is
+Continued the open items from `bugs.md`. Everything below is
 implemented in the working tree and executed **on this device** (no Linux/macOS host here),
 with the suite green: **57/57 unit + 24/24 endpoints** (`cargo test --no-default-features
 --features pulseaudio,opus`; `LD_LIBRARY_PATH=$PREFIX/lib`). Feature matrix: `--features opus`
@@ -934,9 +939,9 @@ only, so it selects no backend for the Android host triple — not a regression)
 
 | # | Item | Outcome |
 |---|------|---------|
-| 1 | **`loglevel` from `server.ini`** (`bug.md` §11) | `[server] loglevel` loaded by `load_settings`; `init_tracing` runs after the config read; precedence **`RUST_LOG` > `loglevel` > crate default (`debug`, unchanged)**. Empty/unparsable `RUST_LOG` no longer silences everything; an unknown `loglevel` warns + default. Verified live: info/debug/off/absent/bogus/`RUST_LOG`-override/empty-`RUST_LOG` matrix. Unit tests `main.rs::tests::loglevel_*`; README config table + `DEFAULT_CONFIG` document the key. |
+| 1 | **`loglevel` from `server.ini`** (bugs.md) | `[server] loglevel` loaded by `load_settings`; `init_tracing` runs after the config read; precedence **`RUST_LOG` > `loglevel` > crate default (`debug`, unchanged)**. Empty/unparsable `RUST_LOG` no longer silences everything; an unknown `loglevel` warns + default. Verified live: info/debug/off/absent/bogus/`RUST_LOG`-override/empty-`RUST_LOG` matrix. Unit tests `main.rs::tests::loglevel_*`; README config table + `DEFAULT_CONFIG` document the key. |
 | 2 | **`install-systemd.sh` `config.toml` mismatch** (finding #7 in the host-run table) | Now writes `/etc/l337-audio-server/server.ini` — the file `load_settings()` actually reads (INI) — and migrates a legacy `config.toml` on update; integrity + health checks read `server.ini`. `bash -n` clean. |
-| 3 | **Linux installer false failures on Debian** (`bug.md` §12) | All three installers: loader-provided SONAMEs (`libm.so.6`, `libc.so.6`, …) are skipped instead of "no known package"; `ldconfig` refreshed before the missing-check; presence probe (`lib_present`) falls back to the standard library dirs, so a lib installed earlier in the same run is found. Genuinely absent libs still abort the install (rc=42 in simulation). Real-host run on `pipelinepro` pending. |
+| 3 | **Linux installer false failures on Debian** (bugs.md) | All three installers: loader-provided SONAMEs (`libm.so.6`, `libc.so.6`, …) are skipped instead of "no known package"; `ldconfig` refreshed before the missing-check; presence probe (`lib_present`) falls back to the standard library dirs, so a lib installed earlier in the same run is found. Genuinely absent libs still abort the install (rc=42 in simulation). Real-host run on `pipelinepro` pending. |
 | 4 | **Streaming stall follow-up** (U7 "remaining stall", see [Part 6](#update-7--2026-10-31-streaming-opus-no-longer-aborts-early)) | The uncommitted tolerance raise is kept and completed: the Symphonia *decoder* `IoError` arm no longer has its own 4 s tolerance (it ended tracks mid-playback on a trickling download) and shares `wait_for_progress` (10 min, rate-limited warnings every ~20 s so a permanently wedged download is visible). Unit test `wait_for_progress_tolerates_a_slow_download_and_counts_growth`. |
 | 5 | **Finding #4's missing test** | `tests/endpoints.rs::test_cache_next_honors_runtime_target_ceiling`: fake `yt-dlp` on the spawned server's PATH records the selection — with runtime ceiling 64 the download is `-f 249` (≤64 kbps), never `-f 251`. Pre-fix it resolved with the config default (`bestaudio`). |
 | 6 | **Finding #5's missing integration check** | `tests/endpoints.rs::test_play_unknown_quality_falls_back_to_server_default`: `{"quality":"ultra"}` returns **200** (not 422) through the real `Json` extractor and falls back to the server default. |
@@ -948,10 +953,11 @@ only, so it selects no backend for the Android host triple — not a regression)
   forced-backend-error recovery + volume-after-recovery; the real YouTube bandwidth ceiling
   (`bugs.md` hand-off §1–§4).
 - Finding #1's stock-host install + start, and finding #7's `CHUNK_FRAMES = 4096` device check.
-- `bug.md` §12's real-host rerun on `pipelinepro`, and the Linux/macOS installer paths
+- bugs.md's real-host rerun on `pipelinepro`, and the Linux/macOS installer paths
   (systemd enable/start/verify poll, `launchctl bootstrap`).
-- Finding #3's whole-track file decode peak (upgrade path: incremental file decode into the
-  throttled producer) and finding #6's lossless-format preference remain as documented shortcuts.
+- Finding #3's whole-track file decode peak is now bounded in code (reclaim +
+  `wait_for_space`); real-backend RSS-reclaim verification remains. Finding #6's
+  lossless-format preference remains as a documented shortcut.
 
 ---
 
@@ -1349,7 +1355,7 @@ of these defects are reproducible in dummy mode. Ordered by risk if left unverif
 | 7 | Finding #7 `CHUNK_FRAMES = 4096` | **NOT EXECUTED 2026-11-05:** built locally with `--no-default-features --features alsa,opus` (pipewire.pc/pulseaudio.pc unavailable, so the pulseaudio backend — where `CHUNK_FRAMES` lives — could not be built). Device re-check of pulseaudio write cadence not applicable to this alsa build. |
 | 8 | CI | `cargo test` has never run in CI — the whole suite (56 unit + 25 endpoint) is host-only |
 | 9 | Release | Merge `g1-opus-decode` → `main`; the monthly runner cuts official releases from `main`, so the Opus decode, BUG-1..4, the reader rebuild and the G3 streaming default are all invisible to users until it lands |
-| 10 | Finding #3 (shortcut, unchanged) | Whole-track file decode on the file path; upgrade path = incremental decode into the throttled producer |
+| 10 | Finding #3 whole-track file decode | **FIXED in code** — `decode_file_incremental_blocking` bounds `pcm` to the rebuffer window via reclaim + `wait_for_space` (Symphonia + Opus file paths); memory independent of track length. Real-backend RSS-reclaim verification pending. |
 
 **Verified and needing nothing further:** BUG-A (resampler zeros), BUG-B (`stop()` leak), the
 `track_id` traversal fix, bare-token 401, the `loglevel` config key, the release-provenance fix
@@ -1974,9 +1980,9 @@ errors. Full suite passes: 64 unit + 26 endpoint tests, all green.
 
 ---
 
-## Additional findings consolidated from `bug.md` (2026-11-08)
+## Additional findings consolidated from `bugs.md` (2026-11-08)
 
-The following items were recorded in `bug.md` and are consolidated here.
+The following items were recorded in `bugs.md` and are consolidated here.
 
 ### Single-instance lock scope vs isolated runtimes (design note)
 

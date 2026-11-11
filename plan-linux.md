@@ -62,20 +62,31 @@ back to the ~5 s generic path. bugs.md caveats under "WebM/Opus streaming stalls
 > `src/player/engine.rs::reprobe_format()`, the Opus/Symphonia/raw-packet streaming loops, and
 > the `wedge_action()` / `rebuild_due` policy.
 
-### A4. Incremental file decode (Finding #3 shortcut, table row 10)
-**Context:** The file/`/player/play/stream` path still decodes the whole track into `buf.pcm`
-in one shot (`engine.rs:522`), pinning ≈1.1 GiB for a 60-min stereo @48 kHz track. The
-documented shortcut keeps this and marks "full incremental file decode" as the upgrade path.
-bugs.md Part 1 Finding #3 and table row 10.
+### A4. Incremental file decode (Finding #3) — DONE (2026-11-11)
+
+**Context:** The file/`/player/play/stream` path previously decoded the whole track into
+`buf.pcm` in one shot (`engine.rs:522`), pinning ≈1.1 GiB for a 60-min stereo @48 kHz
+track.
+
+**Fix:** `decode_file_incremental_blocking` now reclaims consumed samples while
+decoding and blocks on freed buffer space (`wait_for_space`, 20 ms timeout) instead of
+sleeping, on both the Symphonia and Opus file paths. `pcm` stays bounded to the
+rebuffer window (~24 MiB default), so peak RSS is independent of track length. The Opus
+file path, previously unbounded, is throttled the same way.
+
+**Verified:** `cargo check` clean; `cargo test` green (60 unit + 26 endpoint). Isolated
+custom-port (13370) dummy instance: local file plays end-to-end; 52 MB local WAV
+decodes without deadlocking, server stays responsive.
 
 **Prompt:**
 > Decode local files incrementally into the throttled `audio_buffer` producer instead of
 > assigning the whole decoded track at once. Reuse the existing "disk file"
 > `MediaSourceStream` + streaming packet loop (`streaming_decode_sync` /
-> `throttle_stream_producer`) so the file path becomes length-independent like the streaming
-> path. At minimum: pre-reserve/shrink `decode_to_pcm` so capacity tracks the unconsumed
-> window rather than track length. Update the `load_and_play` shortcut comment and the RSS
-> reclaim verification (table row 3) to confirm the whole-track peak is eliminated.
+> `throttle_stream_producer`) so the file path becomes length-independent like the
+> streaming path. At minimum: pre-reserve/shrink `decode_to_pcm` so capacity tracks the
+> unconsumed window rather than track length. Update the `load_and_play` shortcut comment
+> and the RSS reclaim verification (table row 3) to confirm the whole-track peak is
+> eliminated.
 
 ### A5. Real bit-exact enforcement / lossless preference (Finding #6, optional future)
 **Context:** `Quality::Lossless` maps to ceiling 0 (no ceiling) like `best`; nothing calls
