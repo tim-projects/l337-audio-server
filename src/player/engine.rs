@@ -143,6 +143,10 @@ pub struct PlayerEngine {
     actual_kbps: Option<u32>,
     /// Short codec label of the current/last track when known (for PlayerStatus).
     codec_label: Option<String>,
+    /// Whether the current/last track was requested as lossless (for PlayerStatus).
+    lossless_requested: bool,
+    /// Whether a lossless rendition was actually delivered (for PlayerStatus).
+    lossless_fulfilled: bool,
     /// Shared HTTP client reused across all downloads (OPT-8): avoids rebuilding
     /// a reqwest::Client (TLS session cache, connection pool, DNS cache) on every
     /// download_stream / stream_http_to_file call.
@@ -243,6 +247,8 @@ impl PlayerEngine {
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
             codec_label: None,
+            lossless_requested: false,
+            lossless_fulfilled: false,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
@@ -290,6 +296,8 @@ impl PlayerEngine {
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
             codec_label: None,
+            lossless_requested: false,
+            lossless_fulfilled: false,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
@@ -461,6 +469,8 @@ impl PlayerEngine {
         self.effective_target_kbps = ceiling;
         self.actual_kbps = None;
         self.codec_label = None;
+        self.lossless_requested = track.quality.map(|q| q.is_lossless()).unwrap_or(false);
+        self.lossless_fulfilled = false;
         // A failed play must not report the previous track's timeline.
         self.duration_sec = None;
 
@@ -478,7 +488,7 @@ impl PlayerEngine {
         if is_youtube_url(&track.stream_url) {
             info!("play_track: YouTube streaming for {}", track.stream_url);
             match self
-                .start_streaming_playback(&track.stream_url, ceiling)
+                .start_streaming_playback(&track.stream_url, ceiling, self.lossless_requested)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -503,7 +513,7 @@ impl PlayerEngine {
                     error!("YouTube streaming failed, falling back to download: {}", e);
                     let path = self.storage.get_active_slot_path("current");
                     if let Err(e) =
-                        download_stream(&self.http_client, &track.stream_url, &path, ceiling).await
+                        download_stream(&self.http_client, &track.stream_url, &path, ceiling, self.lossless_requested).await
                     {
                         if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
                             return Err(EngineError::YouTube(yt_err.clone()));
@@ -546,7 +556,7 @@ impl PlayerEngine {
             path.display()
         );
 
-        if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling).await
+        if let Err(e) = download_stream(&self.http_client, &track.stream_url, &path, ceiling, self.lossless_requested).await
         {
             let err_box = e;
             if let Some(yt_err) = err_box.downcast_ref::<YouTubeError>() {
@@ -715,6 +725,10 @@ impl PlayerEngine {
         self.duration_sec = Some(duration_sec);
         // G2 observability: codec + delivered bitrate of this (file/download)
         // source — compressed file bytes over duration is the true source bitrate.
+        if self.lossless_requested {
+            self.lossless_fulfilled =
+                codec.as_ref().map(|c| is_lossless_codec_label(c)).unwrap_or(false);
+        }
         self.codec_label = codec;
         self.actual_kbps = if duration_sec > 0 {
             Some((bytes_len as u64 * 8 / 1000 / duration_sec.max(1)) as u32)
@@ -849,6 +863,7 @@ impl PlayerEngine {
         &mut self,
         url: &str,
         ceiling: u32,
+        lossless: bool,
     ) -> Result<(), StreamStartError> {
         let path = self.storage.get_active_slot_path("current");
         let _ = tokio::fs::remove_file(&path).await;
@@ -857,7 +872,7 @@ impl PlayerEngine {
             let ext = guess_ext_from_url(url);
             (url.to_string(), None, None, ext, None)
         } else {
-            let cache_key = format!("{url}|{ceiling}");
+            let cache_key = format!("{url}|{ceiling}|{lossless}");
             let now = std::time::Instant::now();
             let cached = {
                 let cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -868,7 +883,7 @@ impl PlayerEngine {
             };
             match cached {
                 Some((rs, _)) => (rs.url, rs.abr, rs.codec, rs.ext, rs.duration),
-                None => match resolve_youtube_stream_url(url, ceiling).await {
+                None => match resolve_youtube_stream_url(url, ceiling, lossless).await {
                     Ok(v) => {
                         let (stream_url, abr, codec, ext, duration) = &v;
                         let mut cache = self.yt_dlp_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -894,6 +909,10 @@ impl PlayerEngine {
         };
         // Record the delivered bitrate / codec / duration of the chosen stream.
         self.actual_kbps = abr;
+        if self.lossless_requested {
+            self.lossless_fulfilled =
+                codec.as_ref().map(|c| is_lossless_codec_label(c)).unwrap_or(false);
+        }
         self.codec_label = codec;
         if let Some(dur) = duration {
             self.duration_sec = Some(dur);
@@ -1334,6 +1353,8 @@ impl PlayerEngine {
             target_kbps: self.effective_target_kbps,
             actual_kbps: self.actual_kbps,
             codec: self.codec_label.clone(),
+            lossless_requested: self.lossless_requested,
+            lossless_fulfilled: self.lossless_fulfilled,
             warm: self.is_warm(),
             active_sessions: self.active_sessions(),
         }
@@ -2307,6 +2328,7 @@ pub async fn download_stream(
     url: &str,
     dest: &PathBuf,
     ceiling: u32,
+    lossless: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
 
@@ -2330,7 +2352,7 @@ pub async fn download_stream(
                 "yt-dlp is not installed. Install yt-dlp to play/download YouTube URLs.".into(),
             );
         }
-        return download_via_ytdlp(url, dest, ceiling)
+        return download_via_ytdlp(url, dest, ceiling, lossless)
             .await
             .map_err(|e| format!("yt-dlp download failed for {url}: {e}").into());
     }
@@ -2425,11 +2447,12 @@ async fn download_via_ytdlp(
     url: &str,
     dest: &PathBuf,
     ceiling: u32,
+    lossless: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Same policy as the streaming path: pick the rendition ourselves, then ask
     // yt-dlp for that exact format, so a ceiling (or `best`) never plays one
     // rendition and downloads another behind the user's back.
-    let selection = ytdlp_selection_json(url, ceiling).await?;
+    let selection = ytdlp_selection_json(url, ceiling, lossless).await?;
     let format_id = selection
         .get("format_id")
         .and_then(serde_json::Value::as_str)
@@ -2525,6 +2548,7 @@ async fn run_ytdlp(
 async fn ytdlp_selection_via_dump(
     url: &str,
     ceiling: u32,
+    lossless: bool,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     let output = run_ytdlp(url, &["--dump-single-json"]).await?;
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
@@ -2533,7 +2557,7 @@ async fn ytdlp_selection_via_dump(
     let Some(formats) = json.get("formats").and_then(serde_json::Value::as_array) else {
         return Ok(None);
     };
-    let Some(chosen) = select_audio_format(formats, ceiling).cloned() else {
+    let Some(chosen) = select_audio_format(formats, ceiling, lossless).cloned() else {
         return Ok(None);
     };
     // yt-dlp reports duration at the video level; keep the rendition's own value
@@ -2612,8 +2636,9 @@ async fn ytdlp_selection_via_selector(
 async fn ytdlp_selection_json(
     url: &str,
     ceiling: u32,
+    lossless: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(format) = ytdlp_selection_via_dump(url, ceiling).await? {
+    if let Some(format) = ytdlp_selection_via_dump(url, ceiling, lossless).await? {
         return Ok(format);
     }
     ytdlp_selection_via_selector(url, ceiling).await
@@ -2632,7 +2657,10 @@ fn yt_dlp_format_selector(ceiling: u32) -> String {
 /// G2 rendition policy applied to yt-dlp's format list: the **highest average
 /// bitrate** audio rendition at or below `ceiling` (`0` = best, no ceiling),
 /// falling back to the *lowest* available when nothing fits so a ceiling can
-/// never fail playback (reported honestly as `actual_kbps`).
+/// never fail playback (reported honestly as `actual_kbps`). When `lossless` is
+/// true, a lossless rendition (flac/alac/pcm) is preferred over any lossy one;
+/// if none fits, falls back to best (reported honestly as degraded via
+/// `PlayerStatus.lossless_fulfilled`).
 ///
 /// The choice is made here rather than left to yt-dlp's `bestaudio` ranking:
 /// yt-dlp resolves `bestaudio` to a ~129 kbps AAC m4a even when a higher-bitrate
@@ -2641,6 +2669,7 @@ fn yt_dlp_format_selector(ceiling: u32) -> String {
 fn select_audio_format<'a>(
     formats: &'a [serde_json::Value],
     ceiling: u32,
+    lossless: bool,
 ) -> Option<&'a serde_json::Value> {
     let abr = |f: &serde_json::Value| {
         f.get("abr")
@@ -2667,16 +2696,51 @@ fn select_audio_format<'a>(
     }
     let mut best: Option<&serde_json::Value> = None;
     let mut lowest: Option<&serde_json::Value> = None;
+    let mut best_lossless: Option<&serde_json::Value> = None;
     for format in &audio {
         let bitrate = abr(format);
+        let is_lossless_codec = is_lossless_codec(format);
         if best.map_or(true, |b| bitrate > abr(b)) && (ceiling == 0 || bitrate <= ceiling as f64) {
             best = Some(format);
         }
         if lowest.map_or(true, |l| bitrate < abr(l)) {
             lowest = Some(format);
         }
+        if lossless
+            && is_lossless_codec
+            && best_lossless.map_or(true, |b| bitrate > abr(b))
+            && (ceiling == 0 || bitrate <= ceiling as f64)
+        {
+            best_lossless = Some(format);
+        }
     }
-    best.or(lowest)
+    if lossless {
+        // Prefer a lossless rendition; fall back to best (lossy) if none exists,
+        // reported honestly as degraded via PlayerStatus.lossless_fulfilled.
+        best_lossless.or(best).or(lowest)
+    } else {
+        best.or(lowest)
+    }
+}
+
+/// Whether a yt-dlp format's `acodec` denotes a lossless audio codec
+/// (flac/alac/pcm/wav), used to honor `quality: lossless`.
+fn is_lossless_codec(f: &serde_json::Value) -> bool {
+    f.get("acodec")
+        .and_then(serde_json::Value::as_str)
+        .map(is_lossless_codec_label)
+        .unwrap_or(false)
+}
+
+/// Whether a short codec label (as in `PlayerStatus.codec` / yt-dlp `acodec`)
+/// denotes a lossless audio codec.
+fn is_lossless_codec_label(label: &str) -> bool {
+    let a = label.trim().to_lowercase();
+    a.starts_with("flac")
+        || a.starts_with("alac")
+        || a.starts_with("pcm")
+        || a == "lossless"
+        || a == "wav"
 }
 
 /// Map a yt-dlp `acodec` string to the short label used in `PlayerStatus.codec`.
@@ -2703,10 +2767,12 @@ fn normalize_codec(acodec: &str) -> Option<String> {
 
 /// Resolve a YouTube page URL to a direct audio stream URL honoring `ceiling`,
 /// also returning the selected rendition's average bitrate and codec so
-/// `PlayerStatus` can show reality.
+/// `PlayerStatus` can show reality. When `lossless` is true, the full-format
+/// path prefers a lossless rendition (flac/alac/pcm).
 async fn resolve_youtube_stream_url(
     url: &str,
     ceiling: u32,
+    lossless: bool,
 ) -> Result<
     (
         String,
@@ -2717,7 +2783,7 @@ async fn resolve_youtube_stream_url(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let format = ytdlp_selection_json(url, ceiling).await?;
+    let format = ytdlp_selection_json(url, ceiling, lossless).await?;
 
     // Record the delivered bitrate / codec / duration of the chosen stream.
     let abr = format
@@ -3660,7 +3726,7 @@ mod tests {
             fmt("250", Some(74.0), "opus"),
             fmt("249", Some(51.0), "opus"),
         ];
-        let best = select_audio_format(&formats, 0).expect("some format must be chosen");
+        let best = select_audio_format(&formats, 0, false).expect("some format must be chosen");
         assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"));
         assert_eq!(
             best.get("abr").and_then(|v| v.as_f64()),
@@ -3680,35 +3746,35 @@ mod tests {
 
         // Nothing fits the ceiling except the lowest: deliver the lowest rather
         // than failing playback, and report it as the true actual_kbps.
-        let chosen = select_audio_format(&formats, 60).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 60, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("139")
         );
 
         // 130 admits 129 but not 158: the 129 kbps AAC is the highest that fits.
-        let chosen = select_audio_format(&formats, 130).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 130, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("140")
         );
 
         // 128 admits neither 129 nor 158, so the 74 kbps tier is the highest fit.
-        let chosen = select_audio_format(&formats, 128).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 128, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("250")
         );
 
         // Just above an Opus tier: that tier, not a lower one.
-        let chosen = select_audio_format(&formats, 100).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 100, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("250")
         );
 
         // Wide open ceiling behaves like best.
-        let chosen = select_audio_format(&formats, 1024).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 1024, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("251")
@@ -3722,7 +3788,7 @@ mod tests {
             fmt("140", Some(129.0), "mp4a.40.2"),
             fmt("251", Some(158.0), "opus"),
         ];
-        let chosen = select_audio_format(&formats, 0).expect("a format must be chosen");
+        let chosen = select_audio_format(&formats, 0, false).expect("a format must be chosen");
         assert_eq!(
             chosen.get("format_id").and_then(|v| v.as_str()),
             Some("251"),
@@ -3731,7 +3797,7 @@ mod tests {
 
         // Only a rendition that carries audio: it is still the playable choice.
         let mixed = vec![fmt_video("22", 700.0, "mp4a.40.2")];
-        let chosen = select_audio_format(&mixed, 0).expect("a format must be chosen");
+        let chosen = select_audio_format(&mixed, 0, false).expect("a format must be chosen");
         assert_eq!(chosen.get("format_id").and_then(|v| v.as_str()), Some("22"));
 
         // No audio anywhere would be silence, and an empty list is None, not a panic.
@@ -3739,8 +3805,8 @@ mod tests {
             "format_id": "136", "abr": Some(700.0),
             "acodec": "none", "vcodec": "avc1",
         })];
-        assert!(select_audio_format(&silent, 0).is_none());
-        assert!(select_audio_format(&[], 0).is_none());
+        assert!(select_audio_format(&silent, 0, false).is_none());
+        assert!(select_audio_format(&[], 0, false).is_none());
     }
 
     // BUG-4: `best` (ceiling 0) must deliver the highest available tier, not
@@ -3758,7 +3824,7 @@ mod tests {
             fmt("250", Some(74.0), "opus"),
             fmt("249", Some(51.0), "opus"),
         ];
-        let best = select_audio_format(&formats, 0).expect("some format must be chosen");
+        let best = select_audio_format(&formats, 0, false).expect("some format must be chosen");
         assert_eq!(best.get("format_id").and_then(|v| v.as_str()), Some("251"));
         assert_eq!(
             best.get("abr").and_then(|v| v.as_f64()),
@@ -3776,7 +3842,7 @@ mod tests {
             fmt_video("22", 700.0, "mp4a.40.2"),
             fmt("251", Some(158.0), "opus"),
         ];
-        let best = select_audio_format(&with_video, 0).expect("some format must be chosen");
+        let best = select_audio_format(&with_video, 0, false).expect("some format must be chosen");
         assert_eq!(
             best.get("format_id").and_then(|v| v.as_str()),
             Some("251"),
@@ -3861,6 +3927,82 @@ mod tests {
             yt_dlp_format_selector(1024),
             "bestaudio[abr<=1024]/bestaudio"
         );
+    }
+
+    #[test]
+    fn test_is_lossless_codec_label() {
+        assert!(is_lossless_codec_label("flac"));
+        assert!(is_lossless_codec_label("flac,24bit"));
+        assert!(is_lossless_codec_label("alac"));
+        assert!(is_lossless_codec_label("pcm_s16le"));
+        assert!(is_lossless_codec_label("pcm_s24le"));
+        assert!(is_lossless_codec_label("lossless"));
+        assert!(is_lossless_codec_label("wav"));
+        assert!(!is_lossless_codec_label("opus"));
+        assert!(!is_lossless_codec_label("aac"));
+        assert!(!is_lossless_codec_label("vorbis"));
+        assert!(!is_lossless_codec_label("mp3"));
+        assert!(!is_lossless_codec_label("none"));
+        assert!(!is_lossless_codec_label(""));
+    }
+
+    #[test]
+    fn test_is_lossless_codec() {
+        let lossless = serde_json::json!({"acodec": "flac", "abr": 1000, "vcodec": "none"});
+        let lossy = serde_json::json!({"acodec": "opus", "abr": 160, "vcodec": "none"});
+        let none = serde_json::json!({"acodec": "none", "abr": 0, "vcodec": "none"});
+        assert!(is_lossless_codec(&lossless));
+        assert!(!is_lossless_codec(&lossy));
+        assert!(!is_lossless_codec(&none));
+    }
+
+    fn audio_rendition(acodec: &str, abr: f64) -> serde_json::Value {
+        serde_json::json!({
+            "format_id": format!("{acodec}-{abr}"),
+            "abr": abr,
+            "acodec": acodec,
+            "vcodec": "none",
+        })
+    }
+
+    #[test]
+    fn test_select_audio_format_prefers_lossless() {
+        let formats = vec![
+            audio_rendition("opus", 160.0), // highest bitrate overall (lossy)
+            audio_rendition("aac", 129.0),
+            audio_rendition("flac", 96.0),  // lossless, lower bitrate than opus
+            audio_rendition("mp3", 128.0),
+        ];
+
+        // Best (no ceiling): picks highest-bitrate rendition regardless of codec (opus 160).
+        let best = select_audio_format(&formats, 0, false).unwrap();
+        assert_eq!(best.get("acodec").unwrap(), "opus");
+
+        // Lossless: picks the lossless rendition (flac 96) even though opus 160
+        // is higher bitrate — lossless takes precedence over raw bitrate.
+        let lossless = select_audio_format(&formats, 0, true).unwrap();
+        assert_eq!(lossless.get("acodec").unwrap(), "flac");
+    }
+
+    #[test]
+    fn test_select_audio_format_lossless_falls_back_to_best() {
+        // No lossless rendition available at all -> fall back to best (lossy),
+        // reported as degraded by the caller via lossless_fulfilled = false.
+        let formats = vec![
+            audio_rendition("opus", 160.0),
+            audio_rendition("aac", 129.0),
+        ];
+        let chosen = select_audio_format(&formats, 0, true).unwrap();
+        assert_eq!(chosen.get("acodec").unwrap(), "opus");
+
+        // Lossless rendition exists but exceeds ceiling -> falls back to best
+        // under ceiling (lossy).
+        let formats = vec![
+            audio_rendition("opus", 128.0),
+            audio_rendition("flac", 800.0), // exceeds ceiling 256
+        ];
+        let chosen = select_audio_format(&formats, 256, true).unwrap();
+        assert_eq!(chosen.get("acodec").unwrap(), "opus");
     }
 
     #[test]

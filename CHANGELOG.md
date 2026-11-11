@@ -111,6 +111,12 @@ with the new version heading.
   files. The Opus file path, previously unbounded, is throttled the same way.
   Peak RSS during file decode is now independent of track length (Finding #3 /
   G4).
+- `quality: lossless` is now enforced instead of silently delivering lossy audio:
+  format selection prefers a lossless rendition (flac/alac/pcm/wav) at or below
+  the ceiling, falling back to best (lossy) only when none exists, and
+  `PlayerStatus` gains `lossless_requested` / `lossless_fulfilled` so clients can
+  tell whether delivery was degraded (Finding #6). `Quality::needs_bitexact()`
+  (dead in product) was removed.
 
 ### Changed
 - Installers no longer provision auth tokens (removed mixed-case unhyphenated

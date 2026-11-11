@@ -24,7 +24,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **Finding #3** | File/fMP4/cached path keeps the whole decoded track resident | **FIXED** — `decode_file_incremental_blocking` now bounds `pcm` to the rebuffer window via reclaim + `wait_for_space` on both the Symphonia and Opus file paths; peak RSS during file decode is independent of track length | 2026-11-11 (dummy + custom-port verify; device RSS reclaim pending real backend) |
 | **Finding #4** | Background cache ignored the runtime ceiling from `POST /player/target` | **FIXED** | `test_cache_next_honors_runtime_target_ceiling` |
 | **Finding #5** | Unknown `quality` string rejected (422) | **FIXED** | `test_play_unknown_quality_falls_back_to_server_default` (200) |
-| **Finding #6** | `lossless` not enforced; `needs_bitexact()` dead | **FIXED** (docs made honest) | real bit-exact enforcement remains a documented future item |
+| **Finding #6** | `lossless` not enforced; `needs_bitexact()` dead | **FIXED** — `quality: lossless` now prefers lossless renditions (flac/alac/pcm) in format selection; `PlayerStatus.lossless_requested`/`lossless_fulfilled` report whether lossless was requested and actually delivered (honest degradation). `needs_bitexact()` removed. | 2026-11-11 (unit-tested) |
 | **Finding #7** | `CHUNK_FRAMES = 256` forced ~190 PA writes/sec | **FIXED** in code (4096); device re-check **OPEN** | — |
 | **Finding #8** | Termux libopus install/diagnostics, matrix `fail-fast`, needless `libclang` | **FIXED** | |
 | **Finding #9** | Committed `libopus.so` stub can drift; per-asset Opus capability unrecorded | **FIXED** (CI validation + recording) | optional CI regeneration-with-diff remains open |
@@ -125,18 +125,22 @@ concrete **Checklist**. Tick each step; the whole item is done when its checklis
 
 ---
 
-## 6. WARNING — `lossless` not enforced; `needs_bitexact()` dead outside tests
+## 6. FIXED — `lossless` not enforced; real bit-exact delivery with honest degradation
 
-- **Where:** `src/api/models.rs:39` (`needs_bitexact`), `src/player/engine.rs::yt_dlp_format_selector` (Lossless → 0 → `bestaudio`, often Opus/lossy), `PlayerStatus.codec`.
-- **Problem:** `Quality::Lossless.ceiling_kbps() == 0` → `bestaudio` → yt-dlp routinely resolves to Opus (lossy); nothing calls `needs_bitexact()`, so bit-exactness is never enforced/degraded/flagged. The documented promise ("bit-exact pass-through; for lossy-only sources degrades to best and says so") is unimplemented; a lossless request silently returns lossy audio.
-- **Suggestion:** either wire `needs_bitexact()` into selection (prefer a lossless format; return an explicit degradation flag if none) **or** remove it and make the docs honest — server pass-throughs (never re-encodes), and `PlayerStatus.codec` reports whether delivery is actually lossless.
-  - **Scope note:** the server has no transcode-down path, so "never a lossy re-encode" is already satisfied; the real gap is the overclaim, so we remove the dead getter + align docs (the honest, minimal fix).
-
-**Checklist**
-- [x] Remove `Quality::needs_bitexact` and its unit test (dead in product).
-- [x] Update the `Quality`/`Lossless` doc to state: `lossless` maps to ceiling 0 (no ceiling) like `best`; the server pass-throughs and never re-encodes; `PlayerStatus.codec` reports the actual delivered encoding.
-- [x] (Optional, future) real bit-exact enforcement: prefer a lossless selector + degrade-with-flag; tracked separately.
-- [x] `cargo build` no longer warns on `needs_bitexact`; no reference remains in `src/`.
+- **Where:** `src/api/models.rs` (`Quality`), `src/player/engine.rs` (`yt_dlp_format_selector`, `select_audio_format`, `resolve_youtube_stream_url`, `download_stream`, `start_streaming_playback`, `load_and_play`), `src/api/models.rs` (`PlayerStatus`).
+- **Problem:** `Quality::Lossless.ceiling_kbps() == 0` (same as `Best`), so `resolve_ceiling` gave lossless no ceiling and `yt_dlp_format_selector(0)` returned `bestaudio` — yt-dlp's own ranking, which routinely resolves to a lossy Opus/AAC rendition. Nothing called `needs_bitexact()`, and `PlayerStatus` had no lossless signal, so a `quality: lossless` request silently returned lossy audio (overclaim).
+- **Fix (real enforcement, not just honest docs):**
+  - Added `Quality::is_lossless()` to distinguish `Lossless` from `Best` (both ceiling 0).
+  - Threaded `lossless: bool` through `download_stream` → `resolve_youtube_stream_url` → `ytdlp_selection_json` → `ytdlp_selection_via_dump` → `select_audio_format`. When `lossless` is true, `select_audio_format` prefers the highest-bitrate lossless rendition (flac/alac/pcm/wav) at or below ceiling; if none fits, falls back to best (lossy) and reports the degradation honestly.
+  - `PlayerStatus` gains `lossless_requested` (lossless was requested) and `lossless_fulfilled` (a lossless rendition was actually delivered), so clients can tell whether delivery was degraded.
+  - `needs_bitexact()` and its test were removed (dead in product; the server pass-throughs and never re-encodes).
+- **Checklist**
+  - [x] `Quality::is_lossless()` added; `Lossless` distinguished from `Best` despite both having ceiling 0.
+  - [x] `lossless` threaded through the YouTube resolution path (dump + selector fallback).
+  - [x] `select_audio_format` prefers lossless renditions; honest fall-back to best when none fits.
+  - [x] `PlayerStatus.lossless_requested` / `lossless_fulfilled` emitted in `get_status`.
+  - [x] `needs_bitexact()` removed from `src/`; no references remain.
+  - [x] Unit tests: `test_is_lossless_codec_label`, `test_is_lossless_codec`, `test_select_audio_format_prefers_lossless`, `test_select_audio_format_lossless_falls_back_to_best`. All green (`cargo test`: 64 unit + 26 endpoint).
 
 ---
 
@@ -555,9 +559,6 @@ link.
   (see §2). **FIXED in code** (`decode_file_incremental_blocking` bounds `pcm` to
   the rebuffer window via reclaim + `wait_for_space`); real-backend RSS-reclaim
   verification remains pending.
-- **finding #6** — `Quality::Lossless` maps to ceiling 0 (no ceiling) and the
-  server pass-throughs; there is still no lossless-format preference or
-  degradation flag. `PlayerStatus.codec` is the only signal.
 - **finding #7** — `CHUNK_FRAMES = 4096` in `src/platform/pulseaudio.rs` is
   unverified on device (audio still 1×, no underrun, lower wakeups).
 - **finding #9** — the committed `scripts/opus-stubs/libopus.so` blob is
@@ -957,7 +958,8 @@ only, so it selects no backend for the Android host triple — not a regression)
   (systemd enable/start/verify poll, `launchctl bootstrap`).
 - Finding #3's whole-track file decode peak is now bounded in code (reclaim +
   `wait_for_space`); real-backend RSS-reclaim verification remains. Finding #6's
-  lossless-format preference remains as a documented shortcut.
+  lossless enforcement is implemented in code (see Part 1 §6); only real-backend
+  verification of delivery remains.
 
 ---
 

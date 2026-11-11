@@ -271,7 +271,13 @@ pub async fn cache_next(
         );
         if let Err(e) = {
             let engine = state_clone.0.lock().await;
-            download_stream(&engine.http_client, &track.stream_url, &dest, ceiling).await
+            download_stream(
+                &engine.http_client,
+                &track.stream_url,
+                &dest,
+                ceiling,
+                track.quality.map(|q| q.is_lossless()).unwrap_or(false),
+            ).await
         } {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {
@@ -317,7 +323,13 @@ pub async fn cache_previous(
         );
         if let Err(e) = {
             let engine = state_clone.0.lock().await;
-            download_stream(&engine.http_client, &track.stream_url, &dest, ceiling).await
+            download_stream(
+                &engine.http_client,
+                &track.stream_url,
+                &dest,
+                ceiling,
+                track.quality.map(|q| q.is_lossless()).unwrap_or(false),
+            ).await
         } {
             error!("Background cache failed for {}: {}", track_id, e);
         } else {

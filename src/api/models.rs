@@ -21,20 +21,26 @@ pub enum Quality {
 }
 
 impl Quality {
-    /// Ceiling in kbps for this label. `0` = no ceiling (best/lossless =
-    /// source-max; lossless additionally demands bit-exact pass-through).
-    pub fn ceiling_kbps(self) -> u32 {
-        match self {
-            Quality::Lowest => 16,
-            Quality::Low => 48,
-            Quality::Medium => 128,
-            Quality::High => 256,
-            Quality::Veryhigh => 512,
-            Quality::Extreme => 1024,
-            Quality::Best => 0,
-            Quality::Lossless => 0,
-        }
+/// Ceiling in kbps for this label. `0` = no ceiling (best/lossless =
+/// source-max; lossless additionally demands bit-exact pass-through).
+pub fn ceiling_kbps(self) -> u32 {
+    match self {
+        Quality::Lowest => 16,
+        Quality::Low => 48,
+        Quality::Medium => 128,
+        Quality::High => 256,
+        Quality::Veryhigh => 512,
+        Quality::Extreme => 1024,
+        Quality::Best => 0,
+        Quality::Lossless => 0,
     }
+}
+
+/// Whether this label demands bit-exact (lossless) delivery rather than merely
+/// "best available" (which may still be lossy).
+pub fn is_lossless(self) -> bool {
+    matches!(self, Quality::Lossless)
+}
 }
 
 /// Tolerant deserializer for `Option<Quality>`: an absent field is `None`
@@ -189,6 +195,16 @@ pub struct PlayerStatus {
     /// Number of active client sessions reported via session connect/disconnect.
     #[serde(default)]
     pub active_sessions: u32,
+    /// Whether the current/last track was requested as lossless (`quality:
+    /// "lossless"`). `false` when best or a numeric ceiling was requested.
+    #[serde(default)]
+    pub lossless_requested: bool,
+    /// Whether a lossless rendition was actually delivered. `false` when
+    /// lossless was requested but no lossless rendition was available, so a
+    /// lossy rendition was delivered instead (degraded honestly rather than
+    /// silently). Only meaningful when `lossless_requested` is `true`.
+    #[serde(default)]
+    pub lossless_fulfilled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
