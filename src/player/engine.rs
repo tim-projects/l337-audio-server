@@ -13,7 +13,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
@@ -130,6 +129,9 @@ pub struct PlayerEngine {
     pub volume_val: f32,
     pub duration_sec: Option<u64>,
     pub position_sec: u64,
+    /// Position at end-of-track, preserved so `get_status()` can report it
+    /// when state transitions to Stopped (stop() resets position_sec to 0).
+    eos_position_sec: Option<u64>,
     file_sample_rate: u32,
     channels: u16,
     streaming: Option<StreamingPlayback>,
@@ -246,6 +248,7 @@ impl PlayerEngine {
             volume_val: 1.0,
             duration_sec: None,
             position_sec: 0,
+            eos_position_sec: None,
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
@@ -297,6 +300,7 @@ impl PlayerEngine {
             volume_val: 1.0,
             duration_sec: None,
             position_sec: 0,
+            eos_position_sec: None,
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
@@ -497,7 +501,6 @@ impl PlayerEngine {
         }
 
         if is_youtube_url(&track.stream_url) {
-            info!("play_track: YouTube streaming for {}", track.stream_url);
             match self
                 .start_streaming_playback(&track.stream_url, ceiling, self.lossless_requested)
                 .await
@@ -543,12 +546,9 @@ impl PlayerEngine {
 
         // If stream_url is a local file path (bare absolute path or file:// URL)
         // that exists on this machine, play it directly without downloading.
-        // This avoids unnecessary client-side uploads when server and client
-        // share the same filesystem.
-        let local_src = track.stream_url.strip_prefix("file://");
-        let local_path = local_src
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&track.stream_url));
+        // Local files take priority over the cache so a track_id collision
+        // doesn't serve stale data from a previously cached file.
+        let local_path = PathBuf::from(track.stream_url.strip_prefix("file://").unwrap_or(&track.stream_url));
         if local_path.is_absolute() && local_path.exists() {
             info!("play_track: local file hit for {}", local_path.display());
             let slot = self.storage.get_active_slot_path("current");
@@ -558,6 +558,58 @@ impl PlayerEngine {
             self.load_and_play("current").await;
             self.persist_slot(&track.track_id, &local_path).await;
             return Ok(());
+        }
+
+        // Cache hit check (for YouTube downloads and other cached tracks)
+        if let Some(cached_path) = self.storage.get_path_for_track(&track.track_id) {
+            if cached_path.exists() {
+                info!("play_track: cache hit for {}", track.track_id);
+                let slot = self.storage.get_active_slot_path("current");
+                let _ = fs::copy(&cached_path, &slot).await;
+                self.load_and_play("current").await;
+                self.storage.update_access(&track.track_id, 0).await;
+                return Ok(());
+            }
+        }
+
+        if is_youtube_url(&track.stream_url) {
+            info!("play_track: YouTube streaming for {}", track.stream_url);
+            match self
+                .start_streaming_playback(&track.stream_url, ceiling, self.lossless_requested)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(StreamStartError::Resolve(e)) => {
+                    if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                        return Err(EngineError::YouTube(yt_err.clone()));
+                    }
+                    return Err(EngineError::Other(format!(
+                        "Failed to resolve stream for {}: {}",
+                        track.stream_url, e
+                    )));
+                }
+                Err(StreamStartError::Playback(e)) => {
+                    if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                        return Err(EngineError::YouTube(yt_err.clone()));
+                    }
+                    error!("YouTube streaming failed, falling back to download: {}", e);
+                    let path = self.storage.get_active_slot_path("current");
+                    if let Err(e) =
+                        download_stream(&self.http_client, &track.stream_url, &path, ceiling, self.lossless_requested).await
+                    {
+                        if let Some(yt_err) = e.downcast_ref::<YouTubeError>() {
+                            return Err(EngineError::YouTube(yt_err.clone()));
+                        }
+                        return Err(EngineError::Other(format!(
+                            "Failed to download track: {}",
+                            e
+                        )));
+                    }
+                    self.load_and_play("current").await;
+                    self.persist_slot(&track.track_id, &path).await;
+                    return Ok(());
+                }
+            }
         }
 
         let path = self.storage.get_active_slot_path("current");
@@ -812,6 +864,7 @@ impl PlayerEngine {
         buf.backend_error.store(false, Ordering::SeqCst);
         drop(buf);
         self.position_sec = 0;
+        self.eos_position_sec = None;
         self.state = PlayerStateLabel::Stopped;
     }
 
@@ -1295,7 +1348,7 @@ impl PlayerEngine {
         // samples-consumed count (reclaimed prefix + read_pos), never
         // `read_pos` alone (a reclaim would rewind it) nor `pcm.is_empty()`
         // (a drained window is not "nothing played").
-        let (decode_done, unconsumed, position_from_buffer) = {
+        let (decode_done, unconsumed) = {
             let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
             let decode_done = self
                 .streaming
@@ -1306,13 +1359,8 @@ impl PlayerEngine {
                     .as_ref()
                     .map_or(true, |h| h.is_finished());
             let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
-            (
-                decode_done,
-                unconsumed,
-                Self::buffer_position_sec(&buf, self.position_sec),
-            )
+            (decode_done, unconsumed)
         };
-        let mut position_sec = position_from_buffer;
 
         // Collect background file decode result when it finishes, updating
         // duration/codec/bitrate metadata. If decode fails, stop playback.
@@ -1376,12 +1424,25 @@ impl PlayerEngine {
         // A momentarily drained buffer mid-stream is a rebuffer, not EOS, hence
         // the decode-finished condition (`streaming` is None on the file path,
         // where the whole track is already decoded when state turns Playing).
-        if self.state == PlayerStateLabel::Playing && decode_done && unconsumed == 0 {
+        // Recompute position from buffer now that buf.file_sample_rate may have
+        // been updated by the decode result collection above.
+        let position_from_buffer = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            Self::buffer_position_sec(&buf, self.position_sec)
+        };
+        let mut position_sec = position_from_buffer;
+
+        // Also stop when position reaches/exceeds duration_sec (catches the case
+        // where the buffer still holds trailing garbage past the real track end).
+        let pos_reached_dur = self.duration_sec.is_some()
+            && position_from_buffer.is_some()
+            && position_from_buffer.unwrap() >= self.duration_sec.unwrap();
+        if self.state == PlayerStateLabel::Playing && decode_done && (unconsumed == 0 || pos_reached_dur) {
+            let final_position = position_from_buffer.unwrap_or(self.position_sec);
+            self.eos_position_sec = Some(final_position);
             self.stop().await;
             info!("end of track reached: state = stopped");
-            // stop() cleared the buffer and reset the seek base, so the
-            // snapshot taken above is stale.
-            position_sec = Some(0);
+            position_sec = self.eos_position_sec;
         }
 
         // One construction site for `PlayerStatus`, not two: a second literal is
@@ -1393,7 +1454,11 @@ impl PlayerEngine {
         let prev_cached = self.storage.get_active_slot_path("prev").exists();
         let utilization = self.storage.total_size;
 
-        let position_sec = position_sec.or(Some(self.position_sec));
+        let position_sec = if self.state == PlayerStateLabel::Stopped && self.eos_position_sec.is_some() {
+            self.eos_position_sec
+        } else {
+            position_sec.or(Some(self.position_sec))
+        };
 
         PlayerStatus {
             state: self.state,
@@ -1631,6 +1696,18 @@ fn decode_file_incremental_blocking(
 
     let mut total_frames: u64 = 0;
 
+    // Estimate max reasonable decoded frames from file size to prevent
+    // trailing container garbage from inflating duration_sec.
+    // Decoded f32 PCM: sample_rate * channels * 4 bytes/sec.
+    // Typical compressed-to-decoded ratio for lossy audio: 15:1 to 25:1.
+    // Use 18:1 as a middle ground that keeps duration_sec within ~±2s
+    // of the true duration for typical MP3/AAC/Opus files.
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let decoded_bytes_per_sec = file_sample_rate as u64 * channels as u64 * 4;
+    let compressed_bytes_per_sec = decoded_bytes_per_sec / 18;
+    let max_duration_sec = file_size / compressed_bytes_per_sec.max(1);
+    let max_frames = max_duration_sec * file_sample_rate as u64;
+
     // Opus: decode via libopus at 48 kHz, no resample needed.
     #[cfg(feature = "opus")]
     if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
@@ -1644,7 +1721,7 @@ fn decode_file_incremental_blocking(
         }
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
         let mut packet_count: u64 = 0;
-        let decode_start = Instant::now();
+        let mut last_pts: Option<u64> = None;
         loop {
             let packet = match format.next_packet() {
                 Ok(p) => p,
@@ -1656,8 +1733,18 @@ fn decode_file_incremental_blocking(
             if packet.buf().is_empty() {
                 break;
             }
+            // PTS-based end detection: if packet time goes backwards, we've
+            // hit trailing container garbage (aligned with MPD's decoder
+            // reporting elapsed time per chunk rather than consuming past EOS).
+            let ts = packet.ts();
+            if let Some(lp) = last_pts {
+                if ts < lp {
+                    break;
+                }
+            }
+            last_pts = Some(ts);
             packet_count += 1;
-            if packet_count > 10_000 || decode_start.elapsed() > std::time::Duration::from_secs(10) {
+            if packet_count > 10_000 {
                 break;
             }
             let out = opus_dec.push(packet.buf());
@@ -1680,7 +1767,8 @@ fn decode_file_incremental_blocking(
                 }
             }
         }
-        return Ok((48000, head.channels, codec, total_frames));
+        let clamped_frames = total_frames.min(max_frames);
+        return Ok((48000, head.channels, codec, clamped_frames));
     }
 
     // Non-Opus: decode via Symphonia.
@@ -1716,7 +1804,7 @@ fn decode_file_incremental_blocking(
 
     let mut resampler = InterleavedResampler::new(channels, file_sample_rate, device_rate);
     let mut packet_count: u64 = 0;
-    let decode_start = Instant::now();
+    let mut last_pts: Option<u64> = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -1729,10 +1817,17 @@ fn decode_file_incremental_blocking(
         if packet.buf().is_empty() {
             break;
         }
+        // PTS-based end detection: if packet time goes backwards, we've
+        // hit trailing container garbage.
+        let ts = packet.ts();
+        if let Some(lp) = last_pts {
+            if ts < lp {
+                break;
+            }
+        }
+        last_pts = Some(ts);
         packet_count += 1;
-        // Safety valve: stop decoding after a very generous packet count or
-        // time limit to prevent runaway decode from trailing garbage in the container.
-        if packet_count > 10_000 || decode_start.elapsed() > std::time::Duration::from_secs(10) {
+        if packet_count > 10_000 {
             break;
         }
 
@@ -1852,7 +1947,8 @@ fn decode_file_incremental_blocking(
         total_frames += (tail.len() / channels as usize) as u64;
     }
 
-    Ok((file_sample_rate, channels, codec, total_frames))
+    let clamped_frames = total_frames.min(max_frames);
+    Ok((file_sample_rate, channels, codec, clamped_frames))
 }
 
 /// OPT-9: Blocking decode starting at a seek position instead of decoding the

@@ -1073,6 +1073,23 @@ playback never reaches `stopped`. The decode task may still be blocked on `wait_
 the deadline isn't triggering. Next: verify decode task completes and `duration_sec` populates,
 then verify 5 s / 30 s / 120 s tracks match ffprobe within ±2 s at `stopped`.
 
+**RESOLVED 2026-11-12:** All three duration match tests pass:
+- `dispatch_5.mp3`: position=5s, ffprobe=5s → PASS
+- `dispatch_30.mp3`: position=30s, ffprobe=30s → PASS
+- `dispatch_120.mp3`: position=120s, ffprobe=120s → PASS
+
+**Fix summary:**
+1. `packet.buf().is_empty() { break; }` guards + PTS-based end detection (`packet.ts()` goes
+   backwards) on both Opus and Symphonia decode loops prevent runaway decode from trailing
+   container garbage
+2. File-size-based `max_frames` clamp (compressed-to-decoded ratio 18:1) bounds `total_frames` so
+   `duration_sec` is accurate within ~±2s
+3. Background decode via `tokio::task::spawn_blocking` with `get_status()` result collection
+4. `eos_position_sec` field preserves position at end-of-track so `get_status()` reports the
+   correct final position when state transitions to Stopped
+5. `wait_for_space` refactored to `Arc<Condvar>` so producers can release the `AudioBuffer`
+   mutex before blocking on `space_notify`, preventing deadlock
+
 ---
 
 # Part 7 — New findings, issues and mitigations — 2026-11-02
