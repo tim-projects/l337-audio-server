@@ -95,8 +95,30 @@ with the new version heading.
   WirePlumber creates sink nodes for l337's session; `--uninstall --remove-data`
   removes the seeded state. `--uninstall --remove-data` also removes these files
   so a clean reinstall does not carry stale per-user state.
+- Unix socket permissions: `src/main.rs` defaults socket mode to `0o660` (was `0o600`)
+  so any member of the `audio` group can connect to `/run/l337-audio-server/l337.sock`.
+  The installer sets the setgid bit on `/run/l337-audio-server/` so new socket files
+  inherit the `audio` group automatically.
+- Linux PipeWire installer now enables multi-user socket access by default
+  (`--group-access` implied): creates `/run/l337-audio-server/` as `l337:audio`
+  mode `0770` with the setgid bit set, sets `Environment=L337_RUNTIME_DIR=/run/l337-audio-server`
+  in the systemd unit. Use `--no-group-access` to restore per-user
+  `/run/user/<uid>/l337.sock` sockets.
+- Local file playback no longer keeps the whole decoded track resident: `decode_file_incremental_blocking`
+  now reclaims consumed samples while decoding (and blocks on freed buffer space
+  instead of sleeping) so `audio_buffer.pcm` stays bounded to the rebuffer window
+  (~24 MiB by default) rather than growing to the full decoded length of long
+  files. The Opus file path, previously unbounded, is throttled the same way.
+  Peak RSS during file decode is now independent of track length (Finding #3 /
+  G4).
 
 ### Changed
+- Installers no longer provision auth tokens (removed mixed-case unhyphenated
+  32-char generation from Linux/macOS/Windows installers and deleted
+  `scripts/generate-token.sh`). The server now generates a single standard token
+  on first start (`src/auth_challenge.rs:generate_token()`: uppercase
+  `A-Z0-9`, hyphenated groups of 4, e.g. `XXXX-XXXX-XXXX-XXXX-XXXX`) and
+  persists it to `server_token.txt` (`src/main.rs:load_or_create_token()`).
 - Performance optimizations (OPT-1, OPT-2, OPT-4, OPT-5, OPT-6, OPT-7, OPT-8,
   OPT-10, OPT-11, OPT-12, OPT-13, OPT-15, OPT-16, OPT-18, OPT-21, OPT-22):
   shared `reqwest::Client` via `Arc` (fewer TLS handshakes), incremental cache

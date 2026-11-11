@@ -452,7 +452,7 @@ impl PlayerEngine {
             self.try_recover().map_err(EngineError::Other)?;
         }
 
-        self.stop();
+        self.stop().await;
         self.current_track = Some(track.clone());
 
         // G2: resolve the bandwidth ceiling for this request and remember it (and
@@ -520,6 +520,25 @@ impl PlayerEngine {
             }
         }
 
+        // If stream_url is a local file path (bare absolute path or file:// URL)
+        // that exists on this machine, play it directly without downloading.
+        // This avoids unnecessary client-side uploads when server and client
+        // share the same filesystem.
+        let local_src = track.stream_url.strip_prefix("file://");
+        let local_path = local_src
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&track.stream_url));
+        if local_path.is_absolute() && local_path.exists() {
+            info!("play_track: local file hit for {}", local_path.display());
+            let slot = self.storage.get_active_slot_path("current");
+            fs::copy(&local_path, &slot)
+                .await
+                .map_err(|e| EngineError::Other(format!("failed to copy local file: {e}")))?;
+            self.load_and_play("current").await;
+            self.persist_slot(&track.track_id, &local_path).await;
+            return Ok(());
+        }
+
         let path = self.storage.get_active_slot_path("current");
         info!(
             "play_track: downloading {} -> {}",
@@ -570,7 +589,7 @@ impl PlayerEngine {
         title: Option<String>,
         artist: Option<String>,
     ) -> Result<(), String> {
-        self.stop();
+        self.stop().await;
         self.current_track = Some(Track {
             track_id: track_id.to_string(),
             stream_url: String::new(),
@@ -685,7 +704,7 @@ impl PlayerEngine {
                         e
                     );
                     // Leave playback stopped/empty on decode failure.
-                    self.stop();
+                    self.stop().await;
                     return;
                 }
             };
@@ -735,13 +754,33 @@ impl PlayerEngine {
         self.state = PlayerStateLabel::Playing;
     }
 
-    pub fn stop(&mut self) {
+    pub async fn stop(&mut self) {
         if let Some(streaming) = self.streaming.take() {
             streaming.cancel.store(true, Ordering::SeqCst);
             if let Some(handle) = streaming.download_handle {
                 handle.abort();
+                let _ = handle.await;
             }
-            streaming.decode_handle.abort();
+            // Wait for the decode producer to observe `cancel` and stop writing
+            // to the shared buffer before a new playback can start. Without
+            // this, `stop()` aborts the task but returns immediately, so the
+            // old decode can still be appending PCM while the next track's
+            // decode writes to the same buffer — two streams overlapping
+            // (concurrent playback). Bound the wait so a wedged producer (e.g.
+            // stuck in wait_for_progress on a stalled download) cannot block
+            // stop() indefinitely.
+            let decode_handle = streaming.decode_handle;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                decode_handle,
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(_)) => {}
+                Err(_elapsed) => {
+                    tracing::warn!("streaming decode task did not stop within 5 s after cancel");
+                }
+            }
         }
         // Pause the backend stream instead of destroying it from the engine
         // thread. PipeWire stream/mainloop objects are not safe to tear down
@@ -947,7 +986,7 @@ impl PlayerEngine {
                     error = %e,
                     "stream container could not be probed from a partial file; falling back to a whole-file download"
                 );
-                self.stop();
+                self.stop().await;
                 stream_http_to_file(
                     &self.http_client,
                     &fallback_url,
@@ -1196,7 +1235,7 @@ impl PlayerEngine {
             return;
         }
 
-        self.stop();
+        self.stop().await;
 
         if curr_path.exists() {
             let _ = fs::rename(&curr_path, &prev_path).await;
@@ -1216,7 +1255,7 @@ impl PlayerEngine {
             return;
         }
 
-        self.stop();
+        self.stop().await;
 
         if curr_path.exists() {
             let _ = fs::rename(&curr_path, &next_path).await;
@@ -1261,7 +1300,7 @@ impl PlayerEngine {
         // the decode-finished condition (`streaming` is None on the file path,
         // where the whole track is already decoded when state turns Playing).
         if self.state == PlayerStateLabel::Playing && decode_done && unconsumed == 0 {
-            self.stop();
+            self.stop().await;
             info!("end of track reached: state = stopped");
             // stop() cleared the buffer and reset the seek base, so the
             // snapshot taken above is stale.
@@ -1536,6 +1575,17 @@ fn decode_file_incremental_blocking(
                 ab.pcm.extend_from_slice(&out);
                 ab.notify_data();
                 total_frames += (out.len() / head.channels as usize) as u64;
+                // Throttle Opus file decode like the Symphonia path: reclaim what
+                // the callback consumed so `pcm` stays bounded to the rebuffer
+                // window, not the whole track (Finding #3 / G4).
+                let over = ab.exceeds_window();
+                if over {
+                    ab.reclaim_consumed();
+                    // wait_for_space uses its own condvar (not this lock), but we
+                    // hold `ab` here; the 20 ms timeout bounds any stall of the
+                    // audio callback, so this cannot deadlock.
+                    ab.wait_for_space(std::time::Duration::from_millis(20));
+                }
             }
         }
         return Ok((48000, head.channels, codec, total_frames));
@@ -1651,12 +1701,19 @@ fn decode_file_incremental_blocking(
                         total_frames += (resampled.len() / channels as usize) as u64;
                     }
 
-                    // Throttle if buffer exceeds rebuffer window.
+                    // Throttle if buffer exceeds rebuffer window: reclaim what the
+                    // callback consumed so `pcm` stays bounded to the window, not
+                    // the whole track (Finding #3 / G4), then block until space is
+                    // freed instead of polling.
                     {
-                        let ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                        if ab.exceeds_window() {
-                            drop(ab);
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        let over = ab.exceeds_window();
+                        if over {
+                            ab.reclaim_consumed();
+                            // wait_for_space uses its own condvar (not this lock),
+                            // but we hold `ab` here; the 20 ms timeout bounds any
+                            // stall of the audio callback, so this cannot deadlock.
+                            ab.wait_for_space(std::time::Duration::from_millis(20));
                         }
                     }
                 }
