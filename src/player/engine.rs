@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
@@ -132,6 +133,12 @@ pub struct PlayerEngine {
     file_sample_rate: u32,
     channels: u16,
     streaming: Option<StreamingPlayback>,
+    /// Background file decode task handle, so `load_and_play` can return
+    /// immediately instead of blocking on full-file decode (which can be
+    /// throttled by the rebuffer window). Result is collected in `get_status`.
+    file_decode_handle: Option<tokio::task::JoinHandle<Result<(u32, u16, Option<String>, u64), String>>>,
+    /// Compressed file size of the currently playing file (for actual_kbps).
+    file_bytes_len: Option<u64>,
     /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
     default_target_kbps: u32,
     /// Runtime-mutable default ceiling (kbps); per-track `target_kbps`/`quality`
@@ -242,6 +249,8 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            file_decode_handle: None,
+            file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
             effective_target_kbps: default_target_kbps,
@@ -291,6 +300,8 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            file_decode_handle: None,
+            file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
             effective_target_kbps: default_target_kbps,
@@ -678,6 +689,7 @@ impl PlayerEngine {
                 return;
             }
         };
+        self.file_bytes_len = Some(bytes_len);
 
         // Start the backend consuming before incremental decode. The decoder
         // throttles on AudioBuffer::exceeds_window() and blocks on space_notify;
@@ -702,51 +714,28 @@ impl PlayerEngine {
 
         // OPT-13: decode incrementally into the audio buffer instead of
         // allocating the whole decoded PCM at once (peak RSS ~ compressed
-        // size x 2-2.5 for hour-long tracks).
-        let (file_sample_rate, channels, codec, total_frames) =
-            match self.decode_file_incremental(&path).await {
-                Ok(result) => result,
-                Err(e) => {
-                    error!(
-                        "load_and_play({}): incremental decode failed on {}: {}",
-                        slot,
-                        path.display(),
-                        e
-                    );
-                    // Leave playback stopped/empty on decode failure.
-                    self.stop().await;
-                    return;
-                }
-            };
-
-        self.file_sample_rate = file_sample_rate;
-        self.channels = channels;
-        let duration_sec = (total_frames as f64 / file_sample_rate as f64).round() as u64;
-        self.duration_sec = Some(duration_sec);
-        // G2 observability: codec + delivered bitrate of this (file/download)
-        // source — compressed file bytes over duration is the true source bitrate.
-        if self.lossless_requested {
-            self.lossless_fulfilled =
-                codec.as_ref().map(|c| is_lossless_codec_label(c)).unwrap_or(false);
-        }
-        self.codec_label = codec;
-        self.actual_kbps = if duration_sec > 0 {
-            Some((bytes_len as u64 * 8 / 1000 / duration_sec.max(1)) as u32)
-        } else {
-            None
+        // size x 2-2.5 for hour-long tracks). Run decode in a background
+        // task so `load_and_play` returns immediately instead of blocking
+        // on decode while the rebuffer window throttles the producer.
+        let audio_buffer_clone = self.audio_buffer.clone();
+        let path_clone = path.clone();
+        let speed = self.speed;
+        let pitch = self.pitch;
+        let device_rate = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.sample_rate
         };
 
-        let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        buf.channels = channels;
-        buf.file_sample_rate = file_sample_rate;
-        buf.speed = self.speed;
-        buf.pitch = self.pitch;
-        drop(buf);
+        let decode_handle = tokio::task::spawn_blocking(move || {
+            decode_file_incremental_blocking(&path_clone, audio_buffer_clone, speed, pitch, device_rate)
+        });
+        self.file_decode_handle = Some(decode_handle);
 
-        // Playback was started before decode; keep state Playing.
+        // Playback was started before decode; decode runs in background and
+        // metadata is collected on the first `get_status` poll after it finishes.
         info!(
-            "load_and_play({}): Playing (decode complete, duration {:?}s)",
-            slot, self.duration_sec
+            "load_and_play({}): Playing (decode running in background)",
+            slot
         );
     }
 
@@ -795,6 +784,16 @@ impl PlayerEngine {
                     tracing::warn!("streaming decode task did not stop within 5 s after cancel");
                 }
             }
+        }
+        // Abort and wait for the background file decode task, if any, so a
+        // wedged decode cannot keep appending PCM after stop().
+        if let Some(handle) = self.file_decode_handle.take() {
+            handle.abort();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle,
+            )
+            .await;
         }
         // Pause the backend stream instead of destroying it from the engine
         // thread. PipeWire stream/mainloop objects are not safe to tear down
@@ -1301,7 +1300,11 @@ impl PlayerEngine {
             let decode_done = self
                 .streaming
                 .as_ref()
-                .map_or(true, |s| s.decode_handle.is_finished());
+                .map_or(true, |s| s.decode_handle.is_finished())
+                && self
+                    .file_decode_handle
+                    .as_ref()
+                    .map_or(true, |h| h.is_finished());
             let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
             (
                 decode_done,
@@ -1310,6 +1313,61 @@ impl PlayerEngine {
             )
         };
         let mut position_sec = position_from_buffer;
+
+        // Collect background file decode result when it finishes, updating
+        // duration/codec/bitrate metadata. If decode fails, stop playback.
+        if self.file_decode_handle.is_some() {
+            if let Some(handle) = &self.file_decode_handle {
+                if handle.is_finished() {
+                    let handle = self.file_decode_handle.take().unwrap();
+                    match handle.await {
+                        Ok(Ok((file_sample_rate, channels, codec, total_frames))) => {
+                            self.file_sample_rate = file_sample_rate;
+                            self.channels = channels;
+                            let duration_sec =
+                                (total_frames as f64 / file_sample_rate as f64).round() as u64;
+                            self.duration_sec = Some(duration_sec);
+                            if self.lossless_requested {
+                                self.lossless_fulfilled =
+                                    codec.as_ref().map(|c| is_lossless_codec_label(c)).unwrap_or(false);
+                            }
+                            self.codec_label = codec.clone();
+                            self.actual_kbps = self.file_bytes_len.and_then(|bytes_len| {
+                                if duration_sec > 0 {
+                                    Some(
+                                        (bytes_len as u64 * 8 / 1000 / duration_sec.max(1))
+                                            as u32,
+                                    )
+                                } else {
+                                    None
+                                }
+                            });
+                            let mut buf = self
+                                .audio_buffer
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            buf.channels = channels;
+                            buf.file_sample_rate = file_sample_rate;
+                            buf.speed = self.speed;
+                            buf.pitch = self.pitch;
+                            drop(buf);
+                            info!(
+                                "file decode complete: duration {}s codec {:?}",
+                                duration_sec, codec
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            error!("file decode failed: {}", e);
+                            self.stop().await;
+                        }
+                        Err(_) => {
+                            error!("file decode task panicked");
+                            self.stop().await;
+                        }
+                    }
+                }
+            }
+        }
 
         // BUG-3 (device report): there was no end-of-track, so state stayed
         // `playing` forever with a frozen head and the client never advanced.
@@ -1477,6 +1535,9 @@ pub(crate) fn decode_to_pcm(
         if packet.track_id() != track_id {
             continue;
         }
+        if packet.buf().is_empty() {
+            break;
+        }
 
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
@@ -1582,6 +1643,8 @@ fn decode_file_incremental_blocking(
             ab.file_sample_rate = 48000;
         }
         let mut opus_dec = crate::player::opus::OpusTrackDecoder::new(&head)?;
+        let mut packet_count: u64 = 0;
+        let decode_start = Instant::now();
         loop {
             let packet = match format.next_packet() {
                 Ok(p) => p,
@@ -1589,6 +1652,13 @@ fn decode_file_incremental_blocking(
             };
             if packet.track_id() != track_id {
                 continue;
+            }
+            if packet.buf().is_empty() {
+                break;
+            }
+            packet_count += 1;
+            if packet_count > 10_000 || decode_start.elapsed() > std::time::Duration::from_secs(10) {
+                break;
             }
             let out = opus_dec.push(packet.buf());
             if !out.is_empty() {
@@ -1602,10 +1672,11 @@ fn decode_file_incremental_blocking(
                 let over = ab.exceeds_window();
                 if over {
                     ab.reclaim_consumed();
-                    // wait_for_space uses its own condvar (not this lock), but we
-                    // hold `ab` here; the 20 ms timeout bounds any stall of the
-                    // audio callback, so this cannot deadlock.
-                    ab.wait_for_space(std::time::Duration::from_millis(20));
+                }
+                let space_notify = ab.space_notify.clone();
+                drop(ab);
+                if over {
+                    AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
                 }
             }
         }
@@ -1644,6 +1715,8 @@ fn decode_file_incremental_blocking(
     };
 
     let mut resampler = InterleavedResampler::new(channels, file_sample_rate, device_rate);
+    let mut packet_count: u64 = 0;
+    let decode_start = Instant::now();
 
     loop {
         let packet = match format.next_packet() {
@@ -1652,6 +1725,15 @@ fn decode_file_incremental_blocking(
         };
         if packet.track_id() != track_id {
             continue;
+        }
+        if packet.buf().is_empty() {
+            break;
+        }
+        packet_count += 1;
+        // Safety valve: stop decoding after a very generous packet count or
+        // time limit to prevent runaway decode from trailing garbage in the container.
+        if packet_count > 10_000 || decode_start.elapsed() > std::time::Duration::from_secs(10) {
+            break;
         }
 
         match decoder.decode(&packet) {
@@ -1726,16 +1808,17 @@ fn decode_file_incremental_blocking(
                     // callback consumed so `pcm` stays bounded to the window, not
                     // the whole track (Finding #3 / G4), then block until space is
                     // freed instead of polling.
-                    {
+                    let (over, space_notify) = {
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                         let over = ab.exceeds_window();
                         if over {
                             ab.reclaim_consumed();
-                            // wait_for_space uses its own condvar (not this lock),
-                            // but we hold `ab` here; the 20 ms timeout bounds any
-                            // stall of the audio callback, so this cannot deadlock.
-                            ab.wait_for_space(std::time::Duration::from_millis(20));
                         }
+                        let sn = ab.space_notify.clone();
+                        (over, sn)
+                    }; // ab dropped here so callback can consume
+                    if over {
+                        AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
                     }
                 }
             }
@@ -2900,11 +2983,13 @@ fn throttle_stream_producer(audio_buffer: &Arc<Mutex<AudioBuffer>>, cancel: &Ato
         }
         // Block until the consumer frees buffer space instead of polling every
         // 20 ms (OPT-19). A missed signal is harmless: the timeout bounds
-        // re-check latency.
-        {
+        // re-check latency. Release the AudioBuffer lock before waiting so the
+        // callback can consume PCM and notify.
+        let space_notify = {
             let b = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            b.wait_for_space(std::time::Duration::from_millis(20));
-        }
+            b.space_notify.clone()
+        }; // b dropped here
+        AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
         stalls += 1;
         if stalls > 3600 {
             return;
@@ -3164,7 +3249,7 @@ fn streaming_decode_sync(
     let mut format = probed.format;
     let track_id;
     let codec_params;
-    let mut decoder_opts = Default::default();
+    let decoder_opts = Default::default();
 
     let audio_track = format.tracks().iter().find(|t| {
         let ct = t.codec_params.codec;
@@ -3418,9 +3503,12 @@ fn streaming_decode_sync(
                 }
                 throttle_stream_producer(&audio_buffer, &cancel);
 
-                match decoder.decode(&packet) {
-                    Ok(audio_buf) => {
-                        let spec = *audio_buf.spec();
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                if audio_buf.frames() == 0 {
+                    break;
+                }
+                let spec = *audio_buf.spec();
                         if sample_buf.is_none() {
                             sample_buf = Some(symphonia::core::audio::SampleBuffer::<f32>::new(
                                 audio_buf.capacity() as u64,

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 
 #[allow(unused_imports)]
@@ -66,10 +67,10 @@ pub struct AudioBuffer {
     /// Signaled when new PCM data is appended to the buffer, so the ALSA/PipeWire
     /// writer can block instead of polling every 10 ms when the window is empty
     /// (OPT-3).
-    pub(crate) notify: std::sync::Condvar,
+    pub(crate) notify: Arc<std::sync::Condvar>,
     /// Signaled when the backend consumes PCM data, so a producer throttled by
     /// `exceeds_window()` can block instead of polling every 20 ms (OPT-19).
-    pub(crate) space_notify: std::sync::Condvar,
+    pub(crate) space_notify: Arc<std::sync::Condvar>,
     /// Backend cap in bytes of the *unconsumed rebuffer window* (G4) — a few
     /// seconds of decoded PCM, not a whole track. Backends drain/reclaim consumed
     /// samples as playback advances, so memory stays independent of track length.
@@ -89,8 +90,8 @@ impl AudioBuffer {
             pitch: 1.0,
             backend_error: std::sync::atomic::AtomicBool::new(false),
             over_logged: std::sync::atomic::AtomicBool::new(false),
-            notify: std::sync::Condvar::new(),
-            space_notify: std::sync::Condvar::new(),
+            notify: Arc::new(std::sync::Condvar::new()),
+            space_notify: Arc::new(std::sync::Condvar::new()),
             max_bytes: 24 * 1024 * 1024,
         }
     }
@@ -162,13 +163,23 @@ impl AudioBuffer {
         let _ = self.notify.wait_timeout(guard, timeout).unwrap();
     }
 
-    /// Block until buffer space is freed or `timeout` elapses, using a throwaway
-    /// mutex just for the condvar machinery (OPT-19).
-    pub fn wait_for_space(&self, timeout: std::time::Duration) {
-        let dummy = std::sync::Mutex::new(());
-        let guard = dummy.lock().unwrap();
-        let _ = self.space_notify.wait_timeout(guard, timeout).unwrap();
-    }
+/// Block until buffer space is freed or `timeout` elapses.
+/// The static variant takes `&Condvar` directly so callers can release the
+/// `AudioBuffer` mutex before waiting — otherwise the backend callback cannot
+/// acquire the lock to consume PCM and call `notify_space`, causing deadlock.
+pub fn wait_for_space_var(space_notify: &Condvar, timeout: std::time::Duration) {
+    let dummy = std::sync::Mutex::new(());
+    let guard = dummy.lock().unwrap();
+    let _ = space_notify.wait_timeout(guard, timeout).unwrap();
+}
+
+/// Block until buffer space is freed or `timeout` elapses, using a throwaway
+/// mutex just for the condvar machinery (OPT-19).
+/// Holds `&self` (and thus the `AudioBuffer` mutex if called via `MutexGuard`);
+/// prefer `wait_for_space_var` when the caller must release the lock first.
+pub fn wait_for_space(&self, timeout: std::time::Duration) {
+    Self::wait_for_space_var(&self.space_notify, timeout)
+}
 }
 
 /// Runtime directory for the platform's session bus / IPC.

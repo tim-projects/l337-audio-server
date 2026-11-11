@@ -212,3 +212,54 @@ created at build time from `CHANGELOG.md`.
 sudo ./install.sh --dry-run   # preview
 sudo ./install.sh             # install
 ```
+
+## Playback Duration Match Test (Critical)
+
+Before considering playback fixes complete, the MP3 playback duration must match
+ffprobe to the nearest second. Use `scripts/match_mp3_duration.sh`:
+
+```bash
+# Build and start server on isolated port 13370
+CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/l337-build \
+  cargo build --release --features backend,opus
+cp -f /tmp/l337-build/release/l337-audio-server bin/l337-audio-server
+
+rm -rf /tmp/l337-test && mkdir -p /tmp/l337-test/run /tmp/l337-test/state /tmp/l337-test/cache
+cp "/path/to/test.mp3" /tmp/l337-test/dispatch.mp3
+
+# For faster testing, cut test files to 5s / 30s / 120 seconds:
+# ffmpeg -i test.mp3 -t 5  -c copy test_5.mp3
+# ffmpeg -i test.mp3 -t 30 -c copy test_30.mp3
+# ffmpeg -i test.mp3 -t 120 -c copy test_120.mp3
+
+L337_RUNTIME_DIR=/tmp/l337-test/run \
+L337__SERVER__TOKEN=test-token-iso \
+L337__SERVER__PORT=13370 \
+L337__SERVER__DUMMY=false \
+./bin/l337-audio-server --transport=http &
+
+# Run duration match test — start with smallest file:
+./scripts/match_mp3_duration.sh 13370 test-token-iso /tmp/l337-test/dispatch_5.mp3
+
+# Then 30s, then 120s:
+./scripts/match_mp3_duration.sh 13370 test-token-iso /tmp/l337-test/dispatch_30.mp3
+./scripts/match_mp3_duration.sh 13370 test-token-iso /tmp/l337-test/dispatch_120.mp3
+```
+
+**Pass criteria:** `position_sec` at `stopped` state equals ffprobe duration within
+±2 seconds. Any choppiness, buffer issues, or wrong playback speed will be
+revealed by a mismatch.
+```
+
+## MPD position-tracking reference
+
+MPD (https://github.com/MusicPlayerDaemon/MPD) does NOT derive playback position
+from buffer consumption (`read_pos` / `consumed_total`). Instead, each decoder
+plugin reports elapsed time per decoded chunk (`MadDecoder::elapsed_time` via
+`mad_timer_add` on `frame.header.duration`), and `MultipleOutputs::CheckPipe()`
+reads `chunk->time` when consuming each chunk to update `elapsed_time`. Position =
+decoder-reported time per consumed chunk, not buffer bytes / sample rate. This is
+more accurate because the decoder knows exactly how much audio each chunk
+represents — over-decoding trailing container garbage doesn't inflate position.
+Consider adopting this pattern if `position_sec` derived from
+`consumed_total + read_pos` continues to drift past `duration_sec`.

@@ -1021,6 +1021,60 @@ assets + the termux asset**.
 
 ---
 
+## Session — 2026-11-11: PipeWire RT callback rewrite + background decode + duration match test
+
+**Server**: PipeWire backend with `std::thread::spawn` + `MainLoopBox::run()`, changed to
+`ThreadLoopBox::new` + `thread_loop.start()` so `StreamFlags::RT_PROCESS` actually schedules the
+process callback on PipeWire's real-time thread. `AudioBuffer` refactored to `Arc<RingBuffer>`
+(modeled after MPD's lock-free SPSC ring buffer — see https://github.com/MusicPlayerDaemon/MPD);
+the PipeWire RT callback reads lock-free, always queues a full buffer (silence on underrun), and
+never allocates/locks/blocks in the RT path. `decode_file_incremental_blocking` now spawns a
+background `tokio::spawn_blocking` decode task so `POST /player/play` returns immediately instead
+of waiting ~90 s for full-file decode. Ring buffer capacity raised to ~5 s (`sample_rate * 10`
+samples). `playback_started_at` wall-clock timing was replaced with `ring.total_read()`-based
+position tracking (real sample consumption, not wall-clock). `get_status()` made synchronous
+(removed `.await` on `stop()`) to satisfy axum's `Handler` trait (avoids holding
+`tokio::sync::MutexGuard` across an await point).
+
+**MPD position-tracking reference** (https://github.com/MusicPlayerDaemon/MPD): MPD does NOT derive
+playback position from buffer consumption (`read_pos` / `consumed_total`). Instead, each decoder
+plugin reports elapsed time per decoded chunk (`MadDecoder::elapsed_time` via `mad_timer_add` on
+`frame.header.duration`), and `MultipleOutputs::CheckPipe()` reads `chunk->time` when consuming
+each chunk to update `elapsed_time`. Position = decoder-reported time per consumed chunk, not
+buffer bytes / sample rate. This is more accurate because the decoder knows exactly how much audio
+each chunk represents — over-decoding trailing container garbage doesn't inflate position.
+
+**Verification — `cargo check` clean; `cargo test` green (72 unit + 26 endpoint).**
+**Real-hardware playback (PipeWire, isolated `L337_RUNTIME_DIR`):**
+
+| Track | ffprobe | `position_sec` at `stopped` | PASS? |
+|-------|---------|---------------------------|-------|
+| `dispatch_5.mp3` | ~5 s | 4 s then `stopped` | partial |
+| `dispatch_30.mp3` | ~30 s | position advances ~1× but `duration_sec` stays null; never reaches `stopped` | FAIL |
+
+**Root cause found:** Symphonia's `next_packet()` can return `Ok(packet)` with an **empty buffer**
+at end-of-stream instead of `Err`, so the decode loop continues calling `decoder.decode()` on an
+empty packet. `decode_done` never becomes true, `duration_sec` stays null, and position advances
+past the actual track length because the decoder produces frames from trailing garbage packets.
+
+**Fixes applied:**
+1. `if packet.buf().is_empty() { break; }` guards added to Opus, Symphonia, and stream decode paths
+2. Packet-count + time deadline on decode loops (10k packets / 10s) to prevent runaway decode from
+   trailing container garbage (MPD-aligned: decoder should stop at actual track end)
+3. Background decode restructure: `load_and_play` spawns `decode_file_incremental_blocking` via
+   `tokio::task::spawn_blocking` and returns immediately; `get_status()` collects the join handle
+   result to populate `duration_sec`, `codec_label`, `actual_kbps`, `file_sample_rate`, `channels`
+4. `wait_for_space` refactored to `Arc<Condvar>` so producers can release the `AudioBuffer` mutex
+   before blocking on `space_notify`, preventing deadlock when the callback needs the same lock
+   to consume PCM
+
+**Still open:** Full duration match test — position advances ~1× but `duration_sec` stays null and
+playback never reaches `stopped`. The decode task may still be blocked on `wait_for_space_var` or
+the deadline isn't triggering. Next: verify decode task completes and `duration_sec` populates,
+then verify 5 s / 30 s / 120 s tracks match ffprobe within ±2 s at `stopped`.
+
+---
+
 # Part 7 — New findings, issues and mitigations — 2026-11-02
 
 ## Release provenance — what ships in a release vs what is built (FIXED)
@@ -2042,4 +2096,3 @@ has no `default-profile` (unlike other users' sessions).
 
 Fix: seed l337's WirePlumber state (`default-profile`/`default-nodes`/`default-routes`) from the
 detected ALSA card in `install-linux-pipewire.sh` (`seed_wireplumber_state()`), auto-detecting the
-card via `aplay -l`/`pw-cli`; `--uninstall --remove-data` removes the seeded state.
