@@ -34,9 +34,7 @@ with the new version heading.
   reproduces the WebM/MKV demuxer wedge locally without YouTube rate limits — a
   throttled HTTP server (`scripts/throttle_server.py`) serves a WebM/Opus fixture
   at 32 KB/s and the l337 server streams it via a `googlevideo.com/videoplayback`
-  direct-stream URL. `position_sec` must advance beyond 0. Currently fails
-  (position stays at 0) because the wedge-fix revert left the rate-limiting code
-  in place; passes when the wedge is fixed.
+  direct-stream URL. `position_sec` advances beyond 0 during streaming playback.
 
 ### Fixed
 - File playback no longer deadlocks/hangs for tracks whose decoded PCM exceeds the
@@ -60,15 +58,20 @@ with the new version heading.
   fallback is reached only when it is actually needed. Choosing by the URL's
   extension, which made every YouTube DASH `m4a` pay the whole-track download,
   is gone: the probe decides.
-- WebM/Opus streaming no longer freezes a few seconds into a track (reported:
-  `position_sec` stuck at 9 s with `state=playing` while the download kept
-  growing). symphonia's MKV reader has no resync, so once it hit
-  `attempt to read element data past master element` it stayed wedged for the
-  life of the reader and every retry failed identically. The streaming loops now
-  rebuild the format reader when it is wedged and skip the packets already
-  pushed, so playback resumes instead of rewinding. Rebuilds are bounded (10
-  consecutive no-progress rebuilds fall back to waiting on the download) and the
-  reader is rebuilt for the Symphonia path as well as the Opus path.
+- WebM/Opus streaming no longer freezes partway through a track (reported:
+  `position_sec` stuck at 0 with `state=playing` while the download kept growing,
+  and `attempt to read element data past master element` errors). Symphonia's
+  MKV reader snapshots the stream length at open and has no resync, so re-probing
+  a growing file re-freezes `total_len` behind the download frontier and the wedge
+  recurs forever. Streaming playback now feeds HTTP bytes into a single shared,
+  append-only `StreamingByteSource` and gives Symphonia one long-lived
+  `MediaSource` over it: `byte_len()` reports the stable `Content-Length`, reads
+  at the download frontier block until bytes arrive (or true EOF / error / cancel),
+  and one reader instance lives for the whole stream — no reopen, no
+  `reprobe_format`/`replay_skip`/`rebuild_due` cadence tuning, and no spin loop.
+  Probe uses the shared source directly; download failure surfaces as a clean decode
+  error instead of a silent early stop. RAM-backed streaming is the default; a
+  file-backed cache mode shares the same reader contract for large/lossless tracks.
 - `install-systemd.sh` wrote `/etc/l337-audio-server/config.toml`, which
   `load_settings()` never reads (it reads `.../config`, probed by file
   extension so an extensionless file can never match, and `.../server.ini`), so
