@@ -1373,6 +1373,54 @@ must advance beyond 0. **Currently FAILS** — position stays at 0 for the full 
 confirming the wedge is still present with the reverted rate-limiting code. Will pass when the
 wedge is fixed.
 
+### Proposed fix (Option A, 2026-11-12 analysis) — streaming `MediaSource` over a growing download buffer
+
+**Core idea:** stop decoding a mutating on-disk file that must be re-probed/rebuilt as it grows.
+Instead, feed HTTP bytes into a single shared, append-only byte source and give Symphonia one
+long-lived `MediaSource` over it. The downloader appends; the decoder reads/seeks against that
+source while download proceeds. Reads at the frontier **block** until bytes arrive (or true
+EOF/error/cancel) rather than observing a premature EOF, and the source reports a **stable logical
+length**. This removes the frozen-`total_len` / rebuild-replay failure mode for normal (known-length)
+HTTP streams (the same shape as MPD’s buffered `InputStream`/AVIO-callback model).
+
+**Why it addresses the MKV wedge:** Symphonia’s MKV reader snapshots stream length at open
+(`seek(SeekFrom::End(0))` → frozen `total_len`). Today `FileSource::byte_len()` reflects current
+file size and each `reprobe_format`/`replay_skip` rebuild re-freezes near the download frontier, so a
+slow, still-growing stream wedges again (rate-limiting vs spin-loop tradeoff; `rebuild_due`/
+`wedge_action` in `src/player/engine.rs`). With a streaming source: `byte_len()` returns HTTP
+`Content-Length` (final, stable) so the reader’s end bound is correct; `read()` waits while
+`downloaded < requested` and returns `0` only on real completion-at-end; `is_seekable() == true`
+with `Seek` over already-downloaded bytes. No reopen, no packet replay bookkeeping.
+
+**Sketch (engine integration):**
+- Shared state: `data` backing, `downloaded`, `total: Option<u64>` (from `Content-Length`),
+  `complete`, `error`, `cancelled`, notifier (condvar/event usable from `spawn_blocking` decode).
+- Downloader (replaces `stream_http_to_file` body) appends chunks, advances `downloaded`, notifies;
+  on end sets `complete`, on failure sets `error`; can tee to `slot/current` for cache/persistence.
+  Headers/`Content-Length` must be known before (or as) the source is handed to probe/decode.
+- `StreamingMediaSource: Read + Seek + MediaSource` (`pos` per reader): serve from
+  `[pos, min(pos+len, downloaded))`; block when at frontier and not complete/error/cancelled;
+  `SeekFrom::End` uses `total`; `byte_len() -> total`.
+- `start_streaming_playback` / `streaming_decode_sync`: feed `MediaSourceStream` from this source
+  instead of `FileSource(path)`; drop `reprobe_format`/`replay_skip`/wedge rebuild loops for the
+  growing-partial case. `IoError`/`wait_for_progress` “not here yet” becomes reader-blocking;
+  real download failure propagates as `source.error`.
+- Probe/fallback preserved: run probe under `STREAM_PROBE_BUDGET`; if a format needs tail/index
+  unavailable in-budget (e.g. progressive MP4 `moov` at end) or probe cannot complete on prefix,
+  cancel and fall back to whole-file download (current behavior).
+- Storage: prefer a hybrid (gate reads on the slot file by `downloaded`, report `Content-Length`) to
+  avoid holding whole tracks in RAM while keeping slot/cache layout; pure in-memory `Vec`/chunks is
+  simpler but larger-footprint.
+- Edge cases: unknown/chunked `Content-Length` (demuxers that `Seek(End)` at open may not be
+  satisfiable mid-stream → detect/fallback), cancellation must wake blocked readers, and download
+  errors must not be reported as clean EOF mid-track. Position tracking remains a separate concern
+  (decoder/chunk-time, per MPD/AGENTS.md note).
+
+**Prior art / references (Symphonia streaming `MediaSource`, 2026-11-12 search):**
+- **koan-core `StreamBuffer` / `StreamingSource`** — [`koan_core::audio::streaming`](https://docs.rs/koan-core/latest/src/koan_core/audio/streaming.rs.html) (project: [radiosilence/koan](https://github.com/radiosilence/koan), Symphonia decode incl. MKV/WebM/Opus): shared growable `Vec<u8>` + `total_len: Option<u64>` (Content-Length) + `done`/`failed` + `Condvar`. `Read` blocks (timeout) while `pos >= downloaded` and not done/failed; clean EOF on `done`, `BrokenPipe` on mid-stream failure, `TimedOut` on stall. `SeekFrom::End` uses `total_len`. `MediaSource { is_seekable() -> true, byte_len() -> total_len }`. Tests cover partial/in-progress reads, wake-on-fail, stall timeout, multiple readers.
+- **zuno `BufferReader`** — [`src-tauri/src/audio.rs` @ `2068af34`](https://github.com/noFAYZ/zuno/blob/2068af34/src-tauri/src/audio.rs) (in-flight download buffer, Symphonia demux): waits for contiguous bytes at `pos` (deadline/poll), EOF at `total`, failed download reported as EOF so buffered frames can finish. `Seek` allowed (wait on read). `MediaSource { is_seekable() -> true, byte_len() -> url/state total (`clen`) }` with explicit rationale: *“`byte_len` comes from the URL’s own `clen` rather than from what has arrived — the demuxer uses it to locate the tail of a Matroska file, and answering with the current fill would point it at the middle of the download.”*
+- **Symphonia behavior:** [PR #340 (merged 2025)](https://github.com/pdeljanov/Symphonia/pull/340) *“flac, isomp4, mkv: optimize length detection by using byte_len() instead of seeking”* (demuxers prefer `byte_len()` over `seek(End)`; avoids blocking/full-download for length on streams) — makes stable `byte_len()==Content-Length` the correct contract. [Discussion #302](https://github.com/pdeljanov/Symphonia/discussions/302): duration/metadata required real `byte_len()` (not `None`). No upstream issue explicitly titled “past master element” found resolved by this pattern, but the class (incorrect/frozen end bound on a still-arriving MKV/WebM stream) is addressed by reporting final length + blocking reads at frontier (koan/zuno pattern).
+
 ## New issue — whole-track pre-download was the default (FIXED 2026-11-03: streaming is now the default, G3)
 
 **Reported as a product requirement:** playback should not have to download the whole track before
