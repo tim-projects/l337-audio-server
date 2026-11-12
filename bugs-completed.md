@@ -245,6 +245,11 @@ All verified in code; no hardware required.
 - **Fix**: `--token` now resolves the effective token (env > config file > persisted file) and prints both the source and the value. No side effects: it never creates/persists a token, only reads existing sources.
 - **Verified**: all four cases print source + value correctly — env var (`L337__SERVER__TOKEN`), config `[server] token`, persisted `server_token.txt`, and "will be generated at <path>" when none exist.
 
+#### H15 — Single-instance lock uses fixed privileged path `/run/l337-audio-server/instance.lock` (2026-11-12)
+- **Root cause**: `instance_lock_candidates()` added `/tmp/l337-audio-server-runtime/instance.lock` as a lock candidate outside `runtime_dir()`, and `runtime_dir()` returned `XDG_RUNTIME_DIR` directly (e.g. `/run/user/1000`) without a `l337-audio-server` subdirectory — inconsistent with the cache-dir fallback (`~/.cache/l337-audio-server/runtime`).
+- **Fix**: `runtime_dir()` on Linux now appends `l337-audio-server` to `XDG_RUNTIME_DIR` for consistency (`/run/user/1000/l337-audio-server` instead of `/run/user/1000`). `instance_lock_candidates()` reduced to a single candidate under `runtime_dir()` — the redundant `/tmp/l337-audio-server-runtime/instance.lock` (and equivalent macOS/Windows fallbacks) removed, since `runtime_dir()` already resolves to a writable platform path.
+- **Verified**: `cargo check --no-default-features --features alsa,opus` clean; `cargo test` 68 unit + 26 endpoint all green. `test_runtime_dir` and `test_runtime_dir_is_absolute` pass. Lock path now always under `runtime_dir()` (XDG_RUNTIME_DIR/l337-audio-server or ~/.cache/l337-audio-server/runtime), never `/run/l337-audio-server` or bare `/tmp`.
+
 ## 📋 Still pending (not completed)
 - **§9b**: TUI `/auth/challenge` + `/auth/redeem` not tested live.
 - **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.

@@ -212,6 +212,7 @@ pub fn runtime_dir() -> PathBuf {
         std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute() && *p != PathBuf::from("/"))
+            .map(|xdg| xdg.join("l337-audio-server"))
             // Fallback for non-systemd runs: XDG_RUNTIME_DIR is unset, and
             // /run/l337-audio-server is root-owned and unwritable by an
             // unprivileged user (Permission denied). Use the user's cache dir

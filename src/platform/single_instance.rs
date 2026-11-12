@@ -150,10 +150,9 @@ impl Drop for InstanceLock {
 
 fn instance_lock_candidates() -> Vec<PathBuf> {
     // An isolated instance (L337_RUNTIME_DIR set — tests, side-by-side runs)
-    // must not also lock the shared platform fallbacks: the hardcoded /tmp
-    // candidate exists to detect two instances that use *different* temp dirs,
-    // which is exactly what isolation means here. With the override set, the
-    // runtime dir is the only candidate.
+    // locks only that runtime dir. Otherwise the lock lives under runtime_dir(),
+    // which already resolves to a writable platform path (XDG_RUNTIME_DIR or
+    // the user's cache dir) so unprivileged runs never needlessly warn.
     if let Some(dir) = std::env::var_os("L337_RUNTIME_DIR") {
         if !dir.is_empty() {
             return vec![PathBuf::from(dir).join("instance.lock")];
@@ -164,25 +163,6 @@ fn instance_lock_candidates() -> Vec<PathBuf> {
 
     let rt = super::common::runtime_dir();
     paths.push(rt.join("instance.lock"));
-
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(PathBuf::from("/tmp/l337-audio-server-runtime").join("instance.lock"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use dirs;
-        if let Some(cache) = dirs::cache_dir() {
-            paths.push(cache.join("l337-audio-server").join("runtime").join("instance.lock"));
-        }
-        paths.push(PathBuf::from("/tmp/l337-audio-server-runtime").join("instance.lock"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        paths.push(std::env::temp_dir().join("l337-audio-server").join("runtime").join("instance.lock"));
-    }
 
     paths
 }
