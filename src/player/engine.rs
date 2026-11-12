@@ -376,18 +376,19 @@ impl PlayerEngine {
 
     fn take_backend_error(&mut self) -> Option<u64> {
         let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        if buf.backend_error.load(Ordering::SeqCst) {
-            let position = self.calculate_position(&buf);
-            buf.pcm.clear();
-            buf.read_pos = 0;
-            buf.consumed_total = 0;
-            buf.backend_error.store(false, Ordering::SeqCst);
-            self.state = PlayerStateLabel::Stopped;
-            self.position_sec = 0;
-            Some(position)
-        } else {
-            None
-        }
+    if buf.backend_error.load(Ordering::SeqCst) {
+        let position = self.calculate_position(&buf);
+        buf.pcm.clear();
+        buf.read_pos = 0;
+        buf.consumed_total = 0;
+        buf.decoded_frames = 0;
+        buf.backend_error.store(false, Ordering::SeqCst);
+        self.state = PlayerStateLabel::Stopped;
+        self.position_sec = 0;
+        Some(position)
+    } else {
+        None
+    }
     }
 
     fn seek_and_resume(&mut self, position: u64) -> Result<(), String> {
@@ -423,13 +424,14 @@ impl PlayerEngine {
         buf.pcm = playback_pcm;
         buf.read_pos = 0;
         buf.consumed_total = 0;
+        buf.decoded_frames = 0;
         buf.channels = channels;
         buf.file_sample_rate = file_sample_rate;
         buf.speed = self.speed;
         buf.pitch = self.pitch;
         self.file_sample_rate = file_sample_rate;
         self.channels = channels;
-
+        self.position_sec = position;
         Ok(())
     }
 
@@ -757,6 +759,7 @@ impl PlayerEngine {
         self.codec_label = None;
         self.actual_kbps = None;
         self.position_sec = 0;
+        self.eos_position_sec = None;
         if let Some(stream) = self.stream.as_mut() {
             if let Err(e) = stream.play() {
                 error!("load_and_play: stream.play failed: {}", e);
@@ -863,6 +866,7 @@ impl PlayerEngine {
         buf.pcm.clear();
         buf.read_pos = 0;
         buf.consumed_total = 0;
+        buf.decoded_frames = 0;
         buf.backend_error.store(false, Ordering::SeqCst);
         drop(buf);
         self.position_sec = 0;
@@ -1014,6 +1018,7 @@ impl PlayerEngine {
             buf.pcm.clear();
             buf.read_pos = 0;
             buf.consumed_total = 0;
+            buf.decoded_frames = 0;
             buf.channels = 0;
             buf.file_sample_rate = 0;
         }
@@ -1458,6 +1463,8 @@ impl PlayerEngine {
         if self.state == PlayerStateLabel::Playing && decode_done && (unconsumed == 0 || pos_reached_dur) {
             let final_position = position_from_buffer.unwrap_or(self.position_sec);
             let final_position = decoded_sec.map(|dt| final_position.min(dt)).unwrap_or(final_position);
+            // Natural EOS: the decode loop delivered the whole track
+            // (decoded_sec known via MPD's chunk->time pattern).
             let is_natural_eos = decoded_sec.is_some();
             self.stop().await;
             info!("end of track reached: state = stopped");
