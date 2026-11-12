@@ -173,11 +173,82 @@ All verified in code; no hardware required.
 ### 8. `.desktop` "Play with L337 Audio Server" action
 - Local desktop integration created/tested in that environment.
 
+### Host-run extras — server bugs found & fixed on Linux host (2026-10-29)
+
+#### H1 — Arbitrary file write + delete via `track_id` (CRITICAL)
+- **Root cause**: `X-Track-Id` was joined straight into the cache path; `../x` wrote a file outside the cache dir (confirmed `/tmp/…/state/PWNED_WRITE`, 129 KB of attacker bytes) and an absolute `X-Track-Id: /tmp/x` did too; a pool overflow then deleted a file outside the cache dir (confirmed `/tmp/PWNED_DEL` removed).
+- **Fix**: One shared rule `is_safe_track_id()` (single plain component, no `/`, `\`, `.`/`..`, NUL, ≤128 chars). `get_path_for_track` → `Option`; eviction only removes paths inside the cache dir; the API boundary (`play`, `cache_next`, `cache_previous`, `X-Track-Id`) returns 400.
+- **Verified**: all traversal forms 400, nothing written/deleted outside the cache dir, valid ids still 200.
+
+#### H2 — `cargo test` did not compile (`decode_to_pcm` 4-tuple vs 3-tuple)
+- **Root cause**: `decode_to_pcm` returns a 4-tuple but the test destructured a 3-tuple; `cargo build`-only CI never caught it.
+- **Fix**: Test updated (+ asserts the new codec label).
+- **Verified**: the suite compiles with `--no-default-features --features alsa,opus --all-targets`.
+
+#### H3 — Bare token always 401
+- **Root cause**: `X-L337-Token: <token>` (and `Authorization: <token>`) only compared when the presented value had the same length as `"Bearer <token>"`, so the short form skipped every branch.
+- **Fix**: Compare the bearer form and the bare token independently, each constant-time.
+- **Verified**: all 4 header forms 200; all wrong/short/long tokens 401.
+
+#### H4 — Failed YouTube resolve ran yt-dlp twice
+- **Root cause**: a failed YouTube resolve ran yt-dlp twice (resolve, then the downloader re-resolving it) — ~2× latency per failure and 2× the chance of a rate-limit block.
+- **Fix**: `StreamStartError::Resolve`/`Playback`; only a post-resolution failure falls back to a plain download.
+- **Verified**: an unresolvable YouTube URL returns `Failed to resolve stream for …` once; `duration_sec` no longer reports the previous track's timeline.
+
+#### H5 — `seek` past the end silently re-buffered the whole track from 0
+- **Root cause**: `seek` past the end re-buffered the whole track from 0 while reporting `position_sec > duration_sec` (observed `99999` vs `100`).
+- **Fix**: Clamp to the decoded length.
+- **Verified**: observed `100`/`0` at the end instead of `99999`/`100`.
+
+#### H6 — Volume lost after stream recovery (regression)
+- **Root cause**: regression from this round's own recovery fix — writing the software gain in `try_recover` while `set_volume` only wrote it when `pactl` failed meant that, after a recovery, a successful `pactl` set attenuated on top of the software gain (0.8 hardware × 0.5 software = 0.4 effective).
+- **Fix**: Software gain is the single authoritative volume path: every backend already multiplies dequeued samples by it, and it lives in the `Arc` shared with the backend so it survives stream recreation by construction. Removes the `set_pipewire_sink_input_volume` pactl helper and the recovery workaround.
+- **Verified**: unit test asserts the gain tracks `volume_val`.
+
+#### H7 — Installer wrote `config.toml` which `load_settings()` never reads
+- **Root cause**: `install-systemd.sh` writes `/etc/l337-audio-server/config.toml`, but `load_settings()` reads `…/config` and `…/server.ini`, never `config.toml`, so the installer's host/port/token were silently ignored.
+- **Fix**: Installer writes `server.ini` (the file `load_settings()` actually reads, as INI) and migrates a legacy `config.toml` on update; integrity/health checks read `server.ini`. Authoritative file is `server.ini`.
+- **Verified**: `bash -n` clean. Fixed 2026-11-01.
+
+#### H8 — `writer_loop` paced with the shared buffer's `channels` field (0 until set) — 85–86 ms write gaps (2026-11-06)
+- **Root cause**: `writer_loop` paced itself with `AudioBuffer`'s shared `channels` field, which is `0` until the engine sets it and need not match the sample spec the stream was created with; a 2-channel stream paced with a 1-channel assumption slept twice as long as the audio written, so every write interval was 85–86 ms on a ~43 ms sink buffer → continuous drops.
+- **Fix**: `writer_loop` takes the `rate`/`channels` the stream was created with; arithmetic moved to `pace_seconds()` with unit tests pinning the stereo case, the doubled-pace regression, and degenerate inputs; starvation diagnostic edge-triggered (≥3 consecutive polls, ~30 ms).
+- **Verified**: release build, local 213 s file twice → 4 write gaps of 61–66 ms (normal jitter) vs 60/60 at 85–86 ms before; zero mid-track starvation; clean `state → stopped` at EOS. Rust suite 67/67.
+
+#### H9 — Termux sink buffer default raised to ~100 ms (2026-11-06)
+- **Root cause**: with pacing fixed the sink's own buffer was still ~43 ms; PulseAudio tunes latency down unless the stream asks, and `PA_STREAM_ADJUST_LATENCY` overrides the request (the earlier 4 s `buffer_attr` experiment negotiated 43 ms and sounded worse).
+- **Fix**: The stream requests its own latency: `tlength` = 60 ms (negotiates ~86 ms, PulseAudio rounds up to the device fragment size), `maxlength` = 2× so the backlog stays bounded (BUG-2's property), `prebuf = -1` so playback waits the target before the first sample, and `PA_STREAM_ADJUST_LATENCY` is dropped so the request survives. Gated to the Termux pulseaudio path.
+- **Verified**: `pactl list sink-inputs` → `Buffer Latency: 85577 usec` (was 43 ms); full 213 s local file and local-HTTP stream → zero mid-track writer starvation; only the ~30 ms end-of-track drain tail is logged (inside the sink buffer, inaudible).
+
+#### H10 — PipeWire install exposes no hardware sink for `l337` user (2026-11-09)
+- **Root cause**: `l337`'s `~/.local/state/wireplumber/` had no `default-profile`, so WirePlumber never enumerated the ALSA card and created sink nodes; `wpctl status` showed only `Dummy-Driver`/`Freewheel-Driver` plus orphaned server output streams. `aplay` and `mpv --ao=pipewire` as l337 worked, so hardware and ALSA access were healthy — only the PipeWire session lacked sinks.
+- **Fix**: Copied gaming's `default-profile`/`default-nodes`/`default-routes` into l337's `~/.local/state/wireplumber/` and restarted wireplumber. Installer `seed_wireplumber_state()` (in `setup_user_pipewire_services()`) now auto-detects the ALSA card via `aplay -l`/`pw-cli` and seeds the state; `--uninstall --remove-data` removes it.
+- **Verified**: WAV `test_a440.wav` (6 s, 44.1 kHz stereo pcm_s16le) → `playing → stopped`, `actual_kbps: 1209`, audible; OGG `test_a440.ogg` → `playing → stopped`, `codec: vorbis`, `actual_kbps: 22`, audible.
+
+#### H11 — Stale `.tmp` accepted as a good binary (CRITICAL, installer)
+- **Root cause**: `curl -f` never truncates its `-o` target, so a partial file left by an interrupted run passed the "non-empty?" test and was installed as a complete binary.
+- **Fix**: Success is decided by the transfer status, and the destination is removed before each attempt.
+- **Verified**: stale content never handed over.
+
+#### H12 — Local installer executed as root from the caller's CWD (CRITICAL, installer)
+- **Root cause**: `curl … install.sh | sudo bash` feeds the script over stdin (`$0 = bash`), so a bare `scripts/install-*.sh` resolved wherever the user ran it, executing an attacker-placeable file as root.
+- **Fix**: Only a real checkout (a directory containing `.git`) is trusted now.
+- **Verified**: install-path resolution checked.
+
+#### H13 — `--binary` clobbered (regression, installer)
+- **Root cause**: `install-android-termux.sh` re-read `L337_BINARY_PATH` after argument parsing, overwriting the path `install.sh` had passed; every install died with "No binary given" after a successful download.
+- **Fix**: The env fallback is resolved before parsing in all four installers.
+- **Verified**: real install runs end-to-end.
+
+#### H14 — `--token` prints the path instead of the effective token value (`src/main.rs`)
+- **Root cause**: `--token` reported only the token *source* and *path* (e.g. "persisted at /path") but never the actual token value, so operators couldn't see what token the server would use.
+- **Fix**: `--token` now resolves the effective token (env > config file > persisted file) and prints both the source and the value. No side effects: it never creates/persists a token, only reads existing sources.
+- **Verified**: all four cases print source + value correctly — env var (`L337__SERVER__TOKEN`), config `[server] token`, persisted `server_token.txt`, and "will be generated at <path>" when none exist.
+
 ## 📋 Still pending (not completed)
 - **§9b**: TUI `/auth/challenge` + `/auth/redeem` not tested live.
 - **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.
 - **Play-stream response latency/metadata timing**: pushed `/player/play/stream` starts audio before decode completes but HTTP response blocks until full decode.
-- **`--token` / token source clarity**: prints persisted token-file path before config/env resolution; configured token authoritative at runtime.
 - **CI build matrix**: addressed in `.github/workflows/build.yml`; keep local/default-feature build note only.
 - **Real-hardware verification (COMPLETE — done 2026-11-11):** `pw-cli ls-node` shows `node.name = "l337-audio-server"` on PipeWire; WAV `test_tone.wav` (10s) plays end-to-end (pos advances 0→10s, no stutter, no clipping); MP3 `dispatch.mp3` (503s) plays end-to-end with background decode (pos advances ~1×, returns immediately); `POST /player/play` returns <1s for both formats. Codec/duration/actual_kbps populate correctly from background decode. `RT_PROCESS` + `ThreadLoopBox` verified working (dedicated real-time thread for PipeWire callback). Still outstanding: binary size before/after comparison (`cargo bloat`), `CHUNK_FRAMES=4096` device re-check on PulseAudio backend, RSS reclaim measurement on real backend, stock-host libopus install-from-scratch (needs passwordless sudo).
 

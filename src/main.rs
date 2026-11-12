@@ -413,28 +413,37 @@ async fn main() {
     if std::env::args().any(|a| a == "--token") {
         let settings = load_settings().expect("Failed to load config");
 
-        // Report the effective token source, mirroring the resolution at
-        // main.rs:536-538. `L337__SERVER__TOKEN` wins over `[server] token`,
-        // which wins over the persisted token file.
+        // Report the effective token source and value, mirroring the
+        // resolution at main.rs:558-561. `L337__SERVER__TOKEN` wins over
+        // `[server] token`, which wins over the persisted token file.
         if std::env::var("L337__SERVER__TOKEN")
             .map(|t| !t.is_empty())
             .unwrap_or(false)
         {
+            let token = std::env::var("L337__SERVER__TOKEN").unwrap();
             println!("token: from L337__SERVER__TOKEN environment variable");
+            println!("value: {}", token);
             return;
         }
         if let Some(token) = &settings.server.token {
             if !token.is_empty() {
                 println!("token: from [server] token in config file");
+                println!("value: {}", token);
                 return;
             }
         }
         let path = token_file_path();
         if path.exists() {
-            println!("token: persisted at {}", path.display());
-        } else {
-            println!("token: will be generated at {}", path.display());
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                let t = existing.trim().to_string();
+                if !t.is_empty() {
+                    println!("token: persisted at {}", path.display());
+                    println!("value: {}", t);
+                    return;
+                }
+            }
         }
+        println!("token: will be generated at {}", path.display());
         return;
     }
 
