@@ -159,6 +159,7 @@ mod tests {
         headers.insert("X-Track-Id", HeaderValue::from_static("upload-track"));
         headers.insert("X-Title", HeaderValue::from_static("Upload Title"));
         headers.insert("X-Artist", HeaderValue::from_static("Upload Artist"));
+        headers.insert("X-Duration", HeaderValue::from_static("123"));
 
         let response = upload_stream(
             State(state.clone()),
@@ -179,6 +180,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["state"], "playing");
         assert_eq!(json["current_track"]["track_id"], "upload-track");
+        assert_eq!(json["current_track"]["duration"], 123);
+        assert_eq!(json["duration_sec"], 123);
     }
 
     #[tokio::test]

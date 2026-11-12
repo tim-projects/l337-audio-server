@@ -537,6 +537,10 @@ pub async fn upload_stream(
         .get("X-Artist")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let duration = headers
+        .get("X-Duration")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     let dest = {
         let engine = state.0.lock().await;
@@ -574,7 +578,7 @@ pub async fn upload_stream(
     let mut engine = state.0.lock().await;
     if slot == "current" {
         if let Err(e) = engine
-            .play_pushed(&track_id, "current", title, artist)
+            .play_pushed(&track_id, "current", title, artist, duration)
             .await
         {
             error!("play_pushed failed: {}", e);

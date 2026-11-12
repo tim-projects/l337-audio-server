@@ -26,6 +26,10 @@ with the new version heading.
   from `server.ini` (only `RUST_LOG=off`, environment-controlled, can silence
   the server), so a config edit cannot leave an install with no diagnostics and
   no record of it. Startup logs the effective level and where it came from.
+- Track uploads (`POST /player/play/stream`) now accept an `X-Duration`
+  header (seconds, int) sent by the player and surface it immediately via
+  `PlayerStatus.duration_sec` / `current_track.duration`, so the UI shows the
+  track length right away instead of waiting for the server to finish decoding.
 
 ### Fixed
 - File playback no longer deadlocks/hangs for tracks whose decoded PCM exceeds the

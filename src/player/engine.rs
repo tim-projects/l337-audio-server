@@ -665,6 +665,7 @@ impl PlayerEngine {
         slot: &str,
         title: Option<String>,
         artist: Option<String>,
+        duration: Option<u64>,
     ) -> Result<(), String> {
         self.stop().await;
         self.current_track = Some(Track {
@@ -672,7 +673,7 @@ impl PlayerEngine {
             stream_url: String::new(),
             title,
             artist,
-            duration: None,
+            duration,
             target_kbps: None,
             quality: None,
         });
@@ -681,6 +682,13 @@ impl PlayerEngine {
         self.load_and_play(slot).await;
         if self.state != PlayerStateLabel::Playing {
             return Err(format!("failed to load pushed audio from slot {slot}"));
+        }
+        // Client-supplied duration (from X-Duration on upload) gives the UI a
+        // duration immediately, before the background decode finishes. The
+        // decoder overrides it in get_status once the whole track is decoded,
+        // since the decoder is authoritative.
+        if let Some(d) = duration {
+            self.duration_sec = Some(d);
         }
         self.persist_slot(track_id, &path).await;
         Ok(())
