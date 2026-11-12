@@ -15,7 +15,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **BUG-4** | `best` (`target_kbps=0`) selected a low-bitrate rendition | **FIXED** | verified on a live target 2026-11-02, **both directions** via `yt-dlp -F` (AAC 129 k when AAC is the max; Opus 144 k when Opus is the max) |
 | **BUG-A** | `resample_interleaved` emitted literal zeros for 44.1→48 kHz (all AAC/MP3 playback was silent) | **FIXED** | 2026-11-02 `parec` monitor peak **6513** during AAC playback (0 = the old regression) |
 | **BUG-B** | `stop()` never tore the stream down — leaked sink-input appending silence | **FIXED** | 2026-11-02 sink-input `count=0` after `POST /player/stop` |
-| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **FIXED** — premature-EOS fixed, wedged-MKV root cause fixed by rebuilding the reader, then the *second* wedge (Symphonia's frozen stream length + a rebuild policy that gave up) fixed 2026-11-05 and verified on-device (0→213 s continuous, see the 2026-11-04/05 session). **Re-test 2026-11-12:** page-URL YouTube stream (`https://www.youtube.com/watch?v=dQw4w9WgXcQ`) still stalls at position 0 — demuxer wedges on `past master element`, single rebuild attempted then falls to "waiting for download" despite completed download. `wedge_action()` fix IS committed and in the test build but does not lift the frozen `total_len` bound via the page-URL path. See Part 7 re-test finding. | 2026-10-31, 2026-11-02 (trace), 2026-11-03 (fix, Part 7), **2026-11-05 (re-fix + live verify)**, **2026-11-12 (page-URL re-test stall)** |
+| **U2 / U7** | Streaming Opus ended early (~7 s), then resumed but **stalls at ~9 s** | **FIXED** — premature-EOS fixed, wedged-MKV root cause fixed by rebuilding the reader, then the *second* wedge (Symphonia's frozen stream length + a rebuild policy that gave up) fixed 2026-11-05 and verified on-device (0→213 s continuous, see the 2026-11-04/05 session). **Re-test 2026-11-12:** page-URL YouTube stream (`https://www.youtube.com/watch?v=dQw4w9WgXcQ`) still stalled at position 0 — demuxer wedged on `past master element`, single rebuild attempted then fell to "waiting for download" despite completed download. **Fix 2026-11-12:** after `reprobe_format()` in `wedge_action()` rebuild path, reset `last_rebuild_at = None` so the next `DecodeError("past master element")` immediately triggers another rebuild instead of waiting for the 250 ms rate limit or 3 s quiet grace. Fix committed but not yet re-verified against YouTube. | 2026-10-31, 2026-11-02 (trace), 2026-11-03 (fix, Part 7), **2026-11-05 (re-fix + live verify)**, **2026-11-12 (page-URL re-test stall + fix committed)** |
 | **C** | The installed binary was a stale release — none of the fixes were in the running artifact | **FIXED** — provenance found, runner hardened | 2026-11-02: dispatch requires a branch + tag pinned to `$GITHUB_SHA`; release `2026.11.02-4` tag == built commit |
 | **NOTES** | Client progress bar (`time` field) + `/health` capability advertisement | **CLOSED** | 2026-11-02 `codecs`/`quality` advertised; `PlayerStatus.time` = `"00:00/04:54"` |
 | **G3** | Whole-track pre-download was the default before playback | **FIXED** | 2026-11-03: streaming is the default, whole-file download is the fallback for containers that cannot be probed from a partial file (Part 7) |
@@ -1342,29 +1342,26 @@ port 13373, `L337__SERVER__TOKEN=yt-test-token`, `RUST_LOG=l337_audio_server=deb
   though the download had already completed. `wait_for_progress`'s no-growth watchdog did not
   trigger within the test window.
 
-**Root cause hypothesis:** The `wedge_action()` rebuild policy triggers on "file grew since last
-rebuild" or "file quiet for 3 s". On this test, the download completed before the decode loop ever
-hit the wedge, so the reader was opened against a prefix that was already smaller than the final
-file — the frozen `total_len` bound (see the 2026-11-04 deeper root cause). The single rebuild
-attempt rebuilt against the same prefix-bound file and failed again with the same
-"past master element" error. After that, the loop waited for download growth that never came,
-because the download was already complete. The "quiet for 3 s" re-probe path did not fire, possibly
-because the error-cycles path took precedence and never transitioned to the quiet-grace path.
+**Root cause:** `rebuild_due()` rate-limits rebuilds to `REBUILD_MIN_INTERVAL` (250 ms) and requires
+`REBUILD_QUIET_GRACE` (3 s) of no file growth before a retry. After the first rebuild attempt
+failed (new reader still hit the frozen `total_len` bound), the loop fell into `wait_for_progress()`
+which sleeps 200 ms per cycle and waits for download growth. But the download was already complete
+— no growth would ever come. Errors recurred every ~200 ms, each re-checking `rebuild_due()` which
+returned `Wait` because the 3 s quiet grace hadn't elapsed since the *first* rebuild. The 3 s timer
+started from the first rebuild and `last_rebuild_at` was never reset, so the quiet-grace path was
+delayed until 3 s after the first rebuild — but by then the test window may have ended, or the
+rebuild against the same complete file may have failed again for the same reason.
 
-**Key difference from the 2026-11-05 device verification:** That test passed against a *direct*
-yt-dlp URL (already-resolved media URL), while this test went through the full YouTube page URL
-resolution path (`https://www.youtube.com/watch?v=...`). The demuxer may be opening against a
-different prefix snapshot when resolving via the page URL vs. the direct media URL.
+**Fix (2026-11-12, committed):** After `reprobe_format()` is called in the `WedgeAction::Rebuild`
+case (both Opus and Symphonia streaming loops, `src/player/engine.rs`), reset `last_rebuild_at =
+None`. This causes the next `DecodeError("past master element")` to immediately trigger another
+`rebuild_due()` → `Rebuild` instead of waiting for the 250 ms rate limit or 3 s quiet grace. The
+rebuild loop now retries immediately after a failed rebuild, bounded by the 600 s no-growth
+watchdog in `wait_for_progress()`.
 
 **Follow-ups to close this properly:**
-- [ ] Re-test against a direct yt-dlp media URL (not the page URL) to isolate whether the
-      page-URL resolution path produces a different prefix snapshot.
-- [ ] Verify that the "quiet for 3 s" re-probe path fires after the download completes, lifting
-      the frozen `total_len` bound. Add log tracing to confirm which branch of `wedge_action()`
-      is taken.
-- [ ] Consider re-probing on *every* `DecodeError("past master element")` when the file size at
-      probe time differs from current file size, not just on "grew since last rebuild" or
-      "quiet for 3 s".
+- [ ] Re-test against YouTube page URL with the fixed binary to confirm `position_sec` advances past 0.
+- [ ] Re-test against a direct yt-dlp media URL (googlevideo.com) as a comparison point.
 - [ ] Add an in-repo WebM fixture with a deliberately torn cluster so a reworded symphonia error
       message or resequenced demuxer fails CI (see existing follow-up above).
 

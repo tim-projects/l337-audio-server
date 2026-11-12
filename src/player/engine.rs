@@ -3531,6 +3531,13 @@ fn streaming_decode_sync(
                             error_start_size = current_size;
                             stall_cycles = 0;
                             rebuilt = true;
+                            // The rebuilt reader may fail again on the same
+                            // frozen `total_len` bound if the download hasn't
+                            // grown enough yet. Reset `last_rebuild_at` so the
+                            // next error immediately triggers another rebuild
+                            // attempt instead of waiting for the 250 ms rate
+                            // limit or 3 s quiet grace.
+                            last_rebuild_at = None;
                         }
                     }
                     if !rebuilt {
@@ -3889,6 +3896,13 @@ fn streaming_decode_sync(
                             error_cycles = 0;
                             error_start_size = current_size;
                             stall_cycles = 0;
+                            // The rebuilt reader may fail again on the same
+                            // frozen `total_len` bound if the download hasn't
+                            // grown enough yet. Reset `last_rebuild_at` so the
+                            // next error immediately triggers another rebuild
+                            // attempt instead of waiting for the 250 ms rate
+                            // limit or 3 s quiet grace.
+                            last_rebuild_at = None;
                         } else if !wait_for_progress(&path, &mut last_file_size, &mut stall_cycles)
                         {
                             // The probe could not run: wait for the download
