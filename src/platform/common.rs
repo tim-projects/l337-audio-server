@@ -55,6 +55,13 @@ pub struct AudioBuffer {
     /// `consumed_total + read_pos`, never `read_pos` alone — otherwise every
     /// reclaim checkpoint rewinds the reported timeline to the seek base.
     pub consumed_total: usize,
+    /// Cumulative decoder-written frames (samples / channels) ever appended to
+    /// this buffer, counted at `file_sample_rate`. Follows MPD's pattern:
+    /// each decoder plugin reports elapsed time per decoded chunk
+    /// (MusicChunk.time), and position is updated from decoder-reported time
+    /// rather than buffer consumption (which can drift due to trailing
+    /// container garbage). Used as an authoritative cap on reported position.
+    pub decoded_frames: u64,
     pub channels: u16,
     pub sample_rate: u32,
     pub file_sample_rate: u32,
@@ -93,6 +100,7 @@ impl AudioBuffer {
             notify: Arc::new(std::sync::Condvar::new()),
             space_notify: Arc::new(std::sync::Condvar::new()),
             max_bytes: 24 * 1024 * 1024,
+            decoded_frames: 0,
         }
     }
 

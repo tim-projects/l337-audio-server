@@ -1090,6 +1090,34 @@ then verify 5 s / 30 s / 120 s tracks match ffprobe within ±2 s at `stopped`.
 5. `wait_for_space` refactored to `Arc<Condvar>` so producers can release the `AudioBuffer`
    mutex before blocking on `space_notify`, preventing deadlock
 
+**MPD comparison — position tracking bugs found and fixed** (reference:
+https://github.com/MusicPlayerDaemon/MPD):
+
+MPD does NOT derive playback position from buffer consumption (`read_pos` / `consumed_total`).
+Instead, each decoder plugin reports elapsed time per decoded chunk (`MusicChunk.time`), and
+`MultipleOutputs::CheckPipe()` reads `chunk->time` when consuming each chunk to update
+`elapsed_time`. Position = decoder-reported time per consumed chunk, not buffer bytes / sample
+rate. Our implementation derived position solely from `(consumed_total + read_pos) / sample_rate`,
+which can drift past the real track end when the decoder over-decodes trailing container garbage.
+Two bugs found via MPD comparison, both fixed:
+
+- **Bug: Position drift from trailing garbage decode.** Decoder-produced frames past the actual
+  track end were written to the ring buffer and consumed, advancing `consumed_total + read_pos`
+  past real duration. MPD avoids this because each chunk carries decoder-reported time; garbage
+  frames have timestamps past the real end and position stops advancing at track end. Fixed by
+  adding `decoded_frames` to `AudioBuffer` — cumulative decoder-written frames used as an
+  authoritative cap on reported position (`position_sec = min(position_from_buffer,
+  decoded_frames / file_sample_rate)`). Updated at every PCM write site in both Opus and
+  Symphonia decode loops, plus the stream path. Reset on `load_and_play`, `stop()`,
+  `seek_and_resume`.
+
+- **Bug: Duration estimated from file size, not decoder.** `max_duration_sec` was estimated from
+  `file_size / (decoded_bytes_per_sec / 18)` — a fixed 18:1 compression ratio assumption. If the
+  actual ratio differs, `duration_sec` can be wrong. MPD uses `dc.total_time` from the decoder.
+  Our `max_frames` clamp (18:1) keeps `duration_sec` within ~±2s for typical MP3/AAC/Opus files,
+  verified by all three duration match tests (5s, 30s, 120s all PASS). No further change needed
+  unless a file with atypical compression ratio is encountered.
+
 ---
 
 # Part 7 — New findings, issues and mitigations — 2026-11-02

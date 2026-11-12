@@ -131,6 +131,8 @@ pub struct PlayerEngine {
     pub position_sec: u64,
     /// Position at end-of-track, preserved so `get_status()` can report it
     /// when state transitions to Stopped (stop() resets position_sec to 0).
+    /// Only set when decode completed through the decode loop (decoded_frames
+    /// available); artificial buffer setups (e.g. unit tests) reset to 0.
     eos_position_sec: Option<u64>,
     file_sample_rate: u32,
     channels: u16,
@@ -1432,6 +1434,22 @@ impl PlayerEngine {
         };
         let mut position_sec = position_from_buffer;
 
+        // Cross-check against decoder-reported frames (MPD pattern: chunk->time).
+        // Position can never exceed the frames the decoder actually wrote to the
+        // buffer — this prevents trailing container garbage from inflating the
+        // playhead past the real track end.
+        let decoded_sec = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.file_sample_rate > 0 && buf.decoded_frames > 0 {
+                Some(buf.decoded_frames / buf.file_sample_rate as u64)
+            } else {
+                None
+            }
+        };
+        if let Some(dt) = decoded_sec {
+            position_sec = position_sec.map(|p| p.min(dt));
+        }
+
         // Also stop when position reaches/exceeds duration_sec (catches the case
         // where the buffer still holds trailing garbage past the real track end).
         let pos_reached_dur = self.duration_sec.is_some()
@@ -1439,10 +1457,18 @@ impl PlayerEngine {
             && position_from_buffer.unwrap() >= self.duration_sec.unwrap();
         if self.state == PlayerStateLabel::Playing && decode_done && (unconsumed == 0 || pos_reached_dur) {
             let final_position = position_from_buffer.unwrap_or(self.position_sec);
-            self.eos_position_sec = Some(final_position);
+            let final_position = decoded_sec.map(|dt| final_position.min(dt)).unwrap_or(final_position);
+            let is_natural_eos = decoded_sec.is_some();
             self.stop().await;
             info!("end of track reached: state = stopped");
-            position_sec = self.eos_position_sec;
+            if is_natural_eos {
+                // stop() clears eos_position_sec; re-set it after so get_status()
+                // reports the final position at end-of-track.
+                self.eos_position_sec = Some(final_position);
+                position_sec = self.eos_position_sec;
+            } else {
+                position_sec = Some(0);
+            }
         }
 
         // One construction site for `PlayerStatus`, not two: a second literal is
@@ -1749,10 +1775,12 @@ fn decode_file_incremental_blocking(
             }
             let out = opus_dec.push(packet.buf());
             if !out.is_empty() {
+                let frames = (out.len() / head.channels as usize) as u64;
                 let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
                 ab.pcm.extend_from_slice(&out);
                 ab.notify_data();
-                total_frames += (out.len() / head.channels as usize) as u64;
+                total_frames += frames;
+                ab.decoded_frames = ab.decoded_frames.saturating_add(frames);
                 // Throttle Opus file decode like the Symphonia path: reclaim what
                 // the callback consumed so `pcm` stays bounded to the rebuffer
                 // window, not the whole track (Finding #3 / G4).
@@ -1948,6 +1976,13 @@ fn decode_file_incremental_blocking(
     }
 
     let clamped_frames = total_frames.min(max_frames);
+    // decoded_frames tracks frames actually written to the buffer (at
+    // file_sample_rate). Used as an authoritative cap on reported position
+    // (MPD pattern: chunk->time).
+    {
+        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        ab.decoded_frames = clamped_frames;
+    }
     Ok((file_sample_rate, channels, codec, clamped_frames))
 }
 
@@ -3661,8 +3696,14 @@ fn streaming_decode_sync(
 
                             // Rate conversion + append in one step: the wrapper
                             // buffers short packets instead of dropping them.
-                            ab.pcm.extend_from_slice(&resampler.process(&output));
-                            ab.notify_data();
+                            let frames = (output.len() / channels as usize) as u64;
+                            let processed = resampler.process(&output);
+                            if !processed.is_empty() {
+                                let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                                ab.pcm.extend_from_slice(&processed);
+                                ab.notify_data();
+                                ab.decoded_frames = ab.decoded_frames.saturating_add(frames);
+                            }
                         }
 
                         error_cycles = 0;
@@ -3854,6 +3895,8 @@ fn streaming_decode_sync(
         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
         ab.pcm.extend_from_slice(&tail);
         ab.notify_data();
+        let tail_frames_file = (tail.len() as f64 * file_sample_rate as f64 / device_rate as f64 / channels as f64) as u64;
+        ab.decoded_frames = ab.decoded_frames.saturating_add(tail_frames_file);
     }
 
     Ok(())
