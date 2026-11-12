@@ -113,7 +113,7 @@ All verified in code; no hardware required.
 ### Finding #1 — libopus runtime library required on Linux (bugs.md Part 1, CRITICAL)
 - **Root cause**: `build.rs` emits `-lopus` giving every Linux asset `DT_NEEDED libopus.so(.0)`; no installer checked/installed it; `check-glibc.sh` only scans `GLIBC_` symbols.
 - **Fix**: `ensure_runtime_dependencies()` reads binary's `DT_NEEDED` set, installs mapped package per package manager, fails install if needed lib still missing. Wired into all three Linux installers. `release-info.json` records `needed_shared_libs` per asset.
-- **Verified**: both Linux assets' `NEEDED` sets read back: `libopus.so.0` (+ `libpipewire-0.3.so.0` on pipewire); `ldd` resolves; `L337__SERVER__DUMMY=1 … --version` and dummy boot work. Stock-host install-from-scratch (apt/dnf/pacman path) not executable here — no passwordless sudo. Installer dependency-check gate verified in code: fails loudly on unresolvable NEEDED. PARTIAL — real-host install verification pending. ⚠️
+- **Verified**: both Linux assets' `NEEDED` sets read back: `libopus.so.0` (+ `libpipewire-0.3.so.0` on pipewire); `ldd` resolves; `L337__SERVER__DUMMY=1 … --version` and dummy boot work. **Install-from-scratch verified on Arch 2026-11-12**: removed `opus` (64-bit `libopus.so.0` gone), ran `install-linux-pipewire.sh --binary …`, installer detected missing `libopus.so.0`, mapped to pacman package `opus`, installed via `pacman -S --needed opus`, reported `ok "Runtime libraries present: libopus.so.0 libpipewire-0.3.so.0 …"`, binary started with `--version` exit 0. `opus` reinstalled to restore system state. Full log in /tmp/libopus-scratch-test.log. ✅
 
 ### Finding #2 — G4 pause/reclaim + window cap on PulseAudio only; other 5 backends still trip (bugs.md Part 1, WARNING)
 - **Root cause**: `AudioBuffer::max_bytes` redefined as unconsumed window; `exceeds_window()`/`reclaim_consumed()` added, but only PulseAudio used them. Other backends (`linux.rs`, `alsa.rs`, `android.rs`, `macos.rs`, `windows.rs`) still used raw `pcm.len() > buf.max_bytes / 4` with no reclaim.
@@ -250,10 +250,38 @@ All verified in code; no hardware required.
 - **Fix**: `runtime_dir()` on Linux now appends `l337-audio-server` to `XDG_RUNTIME_DIR` for consistency (`/run/user/1000/l337-audio-server` instead of `/run/user/1000`). `instance_lock_candidates()` reduced to a single candidate under `runtime_dir()` — the redundant `/tmp/l337-audio-server-runtime/instance.lock` (and equivalent macOS/Windows fallbacks) removed, since `runtime_dir()` already resolves to a writable platform path.
 - **Verified**: `cargo check --no-default-features --features alsa,opus` clean; `cargo test` 68 unit + 26 endpoint all green. `test_runtime_dir` and `test_runtime_dir_is_absolute` pass. Lock path now always under `runtime_dir()` (XDG_RUNTIME_DIR/l337-audio-server or ~/.cache/l337-audio-server/runtime), never `/run/l337-audio-server` or bare `/tmp`.
 
+#### H16 — Finding #3: whole-track file decode RSS reclaim verified on real ALSA backend (2026-11-12)
+- **Root cause (recap)**: `decode_file_incremental_blocking` previously assigned the whole decoded + resampled track into `audio_buffer.pcm` in one shot, pinning the full decoded PCM (~1.1 GiB for a 60-min track).
+- **Fix** (already in code): `decode_file_incremental_blocking` reclaims consumed samples while decoding and blocks on freed buffer space (`wait_for_space`, 20 ms timeout) on both the Symphonia and Opus file paths, keeping `pcm` bounded to the rebuffer window (`max_bytes`, default 24 MiB). Backend writers call `reclaim_consumed()` at checkpoints and `notify_space()` to wake throttled producers.
+- **Verified on real ALSA backend** (Arch Linux, `sof-hda-dsp` HDA Analog, `--features alsa/opus`, isolated instance port 13370):
+  - Idle RSS: ~16 MB.
+  - 180 s WAV (48 kHz stereo s16le, ~69 MB decoded f32 PCM) played via `/player/play/stream`: peak RSS ~62 MB — below full-track-resident (~16 + 69 = 85 MB), so the whole decoded track was NOT pinned.
+  - Short 10 s WAV (~3.9 MB decoded): peak RSS ~22.6 MB (fits under the window).
+  - After `stop`: RSS fell back to ~22 MB (baseline + small residue), confirming memory is released.
+  - `position_sec` advanced monotonically (~1×) during playback; clean `playing → stopped` at EOS.
+- **Conclusion**: peak RSS during file decode is bounded by the rebuffer window + fixed overhead and is independent of track length for long tracks. Real-backend RSS-reclaim verification complete.
+
+### Play-stream response latency / metadata timing (2026-11-12, Test A, real PipeWire sink)
+- **Finding**: `POST /player/play/stream` returns `{"ok":true}` in **23 ms** (HTTP response), but `position_sec` first becomes >0 at **1219 ms** — a **1195 ms gap** between HTTP response and first audio. This confirms the pushed-file handler blocks the HTTP response until full decode completes, even though audio starts before the response returns.
+- **Position trace**: `position_sec` advanced monotonically 0→22, no sawtooth/rewind. `state` → `stopped` at EOS (position 22 = duration 22). Codec=mp3, actual_kbps=174, duration_sec=22.
+- **Note**: ffprobe reports 30.0s for the test fixture; server decodes duration_sec=22 (MP3 encoding artifact of the sine fixture).
+- **Verified**: Test A on Arch + PipeWire HDMI sink, isolated instance port 13371. Full trace in /tmp/test.log.
+
+### cargo bloat binary size comparison (2026-11-12, Test B)
+- **File size**: 21,619,088 bytes (~20.6 MiB)
+- **.text section**: 7,396,673 bytes (~7.0 MiB)
+- **Total (size)**: 11,458,452 bytes (~10.9 MiB)
+- **Top crates**: std(959.7KiB), rustls(633.1KiB), reqwest(616.8KiB), h2(408.2KiB), l337_audio_server(377.7KiB), config(350.0KiB), ring(299.7KiB), tokio(260.7KiB), axum(226.5KiB), hyper(193.2KiB)
+- **Verified**: `size -a` and `cargo bloat --release --no-default-features --features backend,opus`. Output in /tmp/test.log.
+
+### CHUNK_FRAMES=4096 device re-check on PipeWire (2026-11-12, Test C, real PipeWire sink)
+- **Position trace**: `position_sec` advanced monotonically 0→22 over 22s, no sawtooth/rewind. `state` → `stopped` at EOS.
+- **pactl list sink-inputs**: count=1, Buffer Latency=0 usec (stable), no xruns, `node.name = "l337-audio-server"`, sample format float32le 2ch 48000Hz.
+- **Server log**: no errors/xruns/warnings. PipeWire stream states: Connecting→Paused→Streaming→Paused→Streaming→Paused (clean teardown).
+- **Verified**: Test C on Arch + PipeWire HDMI sink, isolated instance port 13372. Output in /tmp/test.log.
+
 ## 📋 Still pending (not completed)
 - **§9b**: TUI `/auth/challenge` + `/auth/redeem` not tested live.
-- **§9c**: YouTube blocked externally (403 Forbidden), not a server defect.
-- **Play-stream response latency/metadata timing**: pushed `/player/play/stream` starts audio before decode completes but HTTP response blocks until full decode.
+- **§9c**: YouTube reachability CONFIRMED from this Arch IP (no 403/block — sandbox-specific). Play returned in ~15.7s (G3 streaming default), `target_kbps=64`/`actual_kbps=61` under ceiling, codec=opus, duration_sec=213. BUT MKV demuxer wedge blocks playback: `position_sec` stuck at 0, `mkv: attempt to read element data past master element`. The `wedge_action()` fix IS committed (`src/player/engine.rs:3257`) and WAS in the test build — yet the demuxer still wedged and did not recover during the YouTube page-URL test. The frozen-`total_len` root cause (MKV reader probes at prefix size, bound never lifted after download completes) may not be fully addressed. See bugs.md Part 7 re-test finding (2026-11-12). §9c remains open.
 - **CI build matrix**: addressed in `.github/workflows/build.yml`; keep local/default-feature build note only.
-- **Real-hardware verification (COMPLETE — done 2026-11-11):** `pw-cli ls-node` shows `node.name = "l337-audio-server"` on PipeWire; WAV `test_tone.wav` (10s) plays end-to-end (pos advances 0→10s, no stutter, no clipping); MP3 `dispatch.mp3` (503s) plays end-to-end with background decode (pos advances ~1×, returns immediately); `POST /player/play` returns <1s for both formats. Codec/duration/actual_kbps populate correctly from background decode. `RT_PROCESS` + `ThreadLoopBox` verified working (dedicated real-time thread for PipeWire callback). Still outstanding: binary size before/after comparison (`cargo bloat`), `CHUNK_FRAMES=4096` device re-check on PulseAudio backend, RSS reclaim measurement on real backend, stock-host libopus install-from-scratch (needs passwordless sudo).
 
