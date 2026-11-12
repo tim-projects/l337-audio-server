@@ -30,6 +30,13 @@ with the new version heading.
   header (seconds, int) sent by the player and surface it immediately via
   `PlayerStatus.duration_sec` / `current_track.duration`, so the UI shows the
   track length right away instead of waiting for the server to finish decoding.
+- Integration test `test_mkv_wedge_streaming` (behind `--features opus`):
+  reproduces the WebM/MKV demuxer wedge locally without YouTube rate limits — a
+  throttled HTTP server (`scripts/throttle_server.py`) serves a WebM/Opus fixture
+  at 32 KB/s and the l337 server streams it via a `googlevideo.com/videoplayback`
+  direct-stream URL. `position_sec` must advance beyond 0. Currently fails
+  (position stays at 0) because the wedge-fix revert left the rate-limiting code
+  in place; passes when the wedge is fixed.
 
 ### Fixed
 - File playback no longer deadlocks/hangs for tracks whose decoded PCM exceeds the

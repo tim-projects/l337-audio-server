@@ -130,7 +130,128 @@ async fn spawn_server_inner(extra_path: Option<&PathBuf>) -> (u16, tokio::proces
 
     let _ = child.kill().await;
     let _ = child.wait().await;
+
     panic!("Server did not become ready on port {}", port);
+}
+
+/// Spawn the throttled HTTP server (scripts/throttle_server.py) serving a local
+/// file at a slow byte rate, to reproduce the MKV demuxer wedge without
+/// YouTube rate limits. Returns the child process and the port it listens on.
+///
+/// Only compiled with `--features opus` because WebM/Opus decoding requires
+/// the Opus codec.
+#[cfg(feature = "opus")]
+async fn spawn_throttle_server(fixture: &PathBuf) -> (u16, tokio::process::Child) {
+    let port = 18080u16;
+    let mut child = Command::new("python3")
+        .args(&[
+            "scripts/throttle_server.py",
+            "--file", fixture.to_str().unwrap(),
+            "--rate", "32768",
+            "--port", &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn throttled HTTP server");
+
+    // Wait for the throttle server to be ready by polling /size.
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let url = format!("http://127.0.0.1:{port}/size");
+    for _ in 0..40 {
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return (port, child);
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    let _ = child.kill().await;
+    panic!("Throttled HTTP server did not become ready on port {port}");
+}
+
+/// MKV demuxer wedge (finding U2/U7 follow-up): streaming a WebM/Opus file over
+/// a throttled connection triggers Symphonia's "past master element" error when
+/// an element crosses the probe-time size boundary in a partially-downloaded
+/// file. The reader rebuilds but stays wedged because wait_for_progress()
+/// waits for download growth that may never come (download already complete).
+///
+/// Reproduces locally without YouTube rate limits: a Python throttled server
+/// serves the WebM fixture at ~32 KB/s, and the l337 server streams it via the
+/// direct-stream URL path (googlevideo.com/videoplayback). position_sec must
+/// advance beyond 0.
+#[cfg(feature = "opus")]
+#[tokio::test]
+async fn test_mkv_wedge_streaming() {
+    let fixture = std::env::temp_dir().join("l337-test-fixture-251.webm");
+    let fixture_source =
+        std::env::current_dir().unwrap().join("tests/fixtures/test_251.webm");
+    std::fs::copy(&fixture_source, &fixture).expect("Failed to copy test fixture");
+
+    let (_throttle_port, mut throttle_child) = spawn_throttle_server(&fixture).await;
+
+    let (_port, mut l337_child, config_dir) = spawn_server().await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    let token = get_token_via_challenge(&client, _port, &config_dir).await;
+
+    // Play the WebM stream via the throttled direct-stream URL.
+    // The path contains "googlevideo.com/videoplayback" so
+    // is_direct_stream_url() matches and the server streams (not downloads).
+    let stream_url =
+        "http://127.0.0.1:18080/googlevideo.com/videoplayback/test_251.webm";
+
+    let resp = client
+        .post(format!("https://127.0.0.1:{_port}/player/play"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "track_id": "mkv-wedge-test",
+            "stream_url": stream_url,
+            "duration": 30
+        }))
+        .send()
+        .await
+        .expect("Failed to call /player/play");
+
+    assert_eq!(resp.status(), 200);
+
+    // Poll position_sec for up to 30 seconds — it must advance beyond 0.
+    let mut position_advanced = false;
+    for _ in 0..60 {
+        let status_resp = client
+            .get(format!("https://127.0.0.1:{_port}/player/status"))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .expect("Failed to call /player/status");
+        let status = status_resp.json::<serde_json::Value>().await.unwrap();
+        let pos = status["position_sec"].as_u64().unwrap_or(0);
+        let state = status["state"].as_str().unwrap_or("");
+        if pos > 0 {
+            position_advanced = true;
+            break;
+        }
+        if state == "stopped" {
+            break; // End of track reached without advancing
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(
+        position_advanced,
+        "MKV demuxer wedge: position_sec stayed at 0 during streaming playback"
+    );
+
+    let _ = l337_child.kill().await;
+    let _ = l337_child.wait().await;
+    let _ = throttle_child.kill().await;
+    let _ = throttle_child.wait().await;
+    let _ = std::fs::remove_file(&fixture);
 }
 
 /// Obtain a valid bearer token by completing the challenge/redeem flow.

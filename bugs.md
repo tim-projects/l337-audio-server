@@ -1365,6 +1365,14 @@ the current fix doesn't fully address.
       probe time differs from current file size, not just on "grew since last rebuild" or
       "quiet for 3 s".
 
+**Integration test added 2026-11-12:** `tests/endpoints.rs::test_mkv_wedge_streaming`
+(`#[cfg(feature = "opus")]`) reproduces the wedge locally without YouTube rate limits: a Python
+throttled server (`scripts/throttle_server.py`) serves the WebM/Opus fixture at 32 KB/s, and the
+l337 server streams it via a `googlevideo.com/videoplayback` direct-stream URL. `position_sec`
+must advance beyond 0. **Currently FAILS** — position stays at 0 for the full 30 s poll window,
+confirming the wedge is still present with the reverted rate-limiting code. Will pass when the
+wedge is fixed.
+
 ## New issue — whole-track pre-download was the default (FIXED 2026-11-03: streaming is now the default, G3)
 
 **Reported as a product requirement:** playback should not have to download the whole track before
