@@ -421,58 +421,172 @@ setup_user_pipewire_services() {
 }
 
 # Seed WirePlumber user state with the ALSA card detected on this machine so
-# that l337's session exposes hardware audio sinks. Works generically: it
-# auto-detects the card name from aplay/pw-cli and writes default-profile /
-# default-nodes state files that WirePlumber reads on restart.
+# that l337's session exposes hardware audio sinks. The detection and
+# state-file generation logic is embedded below and written to a temp script
+# that runs as the target user (pw-cli must reach that user's PipeWire socket).
+# Embedding keeps the remote `curl | sudo bash` install path self-contained:
+# install.sh only downloads install-linux-pipewire.sh, with no sibling script
+# to fetch alongside it. Handles multiple devices via an interactive menu, or
+# auto-selects the first sink in non-interactive/CI mode.
 seed_wireplumber_state() {
     local user="$1"
     local user_home
     user_home=$(eval echo "~${user}")
     local state_dir="${user_home}/.local/state/wireplumber"
-    local card_name=""
-    local profile_name=""
-    local waited=0
 
-    # Wait for ALSA card to appear (udev may not have settled yet)
-    while [ $waited -lt 30 ]; do
-        card_name=$(run_as_user "$user" -- aplay -l 2>/dev/null \
-            | awk '/^card [0-9]+:/ {print $2; exit}')
-        [ -n "$card_name" ] && break
-        sleep 1
-        waited=$((waited + 1))
+    # Write the embedded detection+seeding script to a temp file so it can run
+    # as the target user. Quoted heredoc: content is literal, no expansion here.
+    local detect_script
+    detect_script=$(mktemp) || return 0
+    cat > "$detect_script" <<'WIREPLUMBER_DETECT_EOF'
+#!/bin/bash
+# Embedded audio-hardware detection + WirePlumber state seeding.
+# Runs as the target user so pw-cli reaches that user's PipeWire socket.
+set -euo pipefail
+STATE_DIR="${WIREPLUMBER_STATE_DIR:-${2:-$HOME/.local/state/wireplumber}}"
+NO_INTERACTIVE="${NO_INTERACTIVE:-0}"
+
+info()  { printf '%s\n' "$*" >&2; }
+ok()    { printf '%s\n' "$*" >&2; }
+warn()  { printf '%s\n' "$*" >&2; }
+fail()  { printf '%s\n' "$*" >&2; exit 1; }
+
+# Detect PipeWire playback sinks (alsa_output.* with media.class = Audio/Sink).
+# Output: "sink_name<TAB>card_name" per line. Prefers pw-cli; falls back to pactl.
+detect_sinks() {
+    if command -v pw-cli >/dev/null 2>&1; then
+        timeout 5 pw-cli list-objects 2>/dev/null | awk '
+            /^object id/ { flush(); mc=""; nn=""; cn="";
+                if (match($0, /"[^"]*"/)) nn=substr($0, RSTART+1, RLENGTH-2); }
+            /media\.class = / { if (match($0, /"[^"]*"/)) mc=substr($0, RSTART+1, RLENGTH-2); }
+            /node\.name = / { if (match($0, /"[^"]*"/)) nn=substr($0, RSTART+1, RLENGTH-2); }
+            /device\.name = / { if (match($0, /"[^"]*"/)) cn=substr($0, RSTART+1, RLENGTH-2); }
+            function flush() {
+                if (mc == "Audio/Sink" && nn ~ /^alsa_output\./) {
+                    if (cn == "") cn = sink_card_name(nn);
+                    printf "%s\t%s\n", nn, cn;
+                }
+            }
+            function sink_card_name(s,   rest, n, parts, i, card) {
+                rest = s; sub(/^alsa_output\./, "", rest); sub(/__sink$/, "", rest);
+                n = split(rest, parts, "."); card = parts[1];
+                for (i = 2; i < n; i++) card = card "." parts[i];
+                return "alsa_card." card;
+            }
+            END { flush(); }
+        ' | sort -u
+    elif command -v pactl >/dev/null 2>&1; then
+        pactl list short sinks 2>/dev/null | awk '{print $2}' | grep '^alsa_output\.' | \
+            while IFS= read -r sink; do
+                printf '%s\t%s\n' "$sink" "$(sink_card_name_bash "$sink")"
+            done || true
+    fi
+}
+
+# Best-effort card name from a sink name (pactl fallback path).
+# alsa_output.<card>.<profile>__<device>__sink -> alsa_card.<card>
+sink_card_name_bash() {
+    local sink="$1"
+    local rest="${sink#alsa_output.}"
+    rest="${rest%__sink}"
+    local -a parts
+    IFS='.' read -r -a parts <<< "$rest"
+    local card="${parts[0]:-}"
+    local i
+    for ((i = 1; i < ${#parts[@]} - 1; i++)); do
+        card+=".${parts[i]}"
     done
+    echo "alsa_card.${card}"
+}
 
-    if [ -z "$card_name" ]; then
-        warn "No ALSA card detected for $user; WirePlumber state not seeded"
+list_pipewire_sinks() { detect_sinks | awk -F'\t' '{print $1}'; }
+
+# List sink names, retrying for up to ~10s while WirePlumber enumerates cards.
+list_sinks_with_retry() {
+    local tries=10 i out
+    for ((i = 1; i <= tries; i++)); do
+        out=$(list_pipewire_sinks)
+        if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+        [ "$i" -lt "$tries" ] && sleep 1
+    done
+    return 1
+}
+
+# Pick a sink: print its name on stdout. Exits 1 if none available.
+prompt_for_sink() {
+    local sinks=("$@")
+    local count="${#sinks[@]}"
+    if [ "$count" -eq 0 ]; then warn "No PipeWire audio sinks detected."; return 1; fi
+    if [ "$count" -eq 1 ]; then info "Detected one audio sink: ${sinks[0]}"; printf '%s\n' "${sinks[0]}"; return 0; fi
+    if [ "$NO_INTERACTIVE" = "1" ] || [ ! -t 0 ]; then
+        info "Non-interactive mode: auto-selecting first sink: ${sinks[0]}"
+        printf '%s\n' "${sinks[0]}"; return 0
+    fi
+    echo "Multiple audio sinks detected. Select the default output sink:" >&2
+    local i=1 s
+    for s in "${sinks[@]}"; do printf '  %d) %s\n' "$i" "$s" >&2; i=$((i + 1)); done
+    local choice=""
+    while true; do
+        printf 'Select sink [1-%d]: ' "$count" >&2
+        read -r choice || return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+            printf '%s\n' "${sinks[$((choice - 1))]}"; return 0
+        fi
+        echo "Invalid choice, try again." >&2
+    done
+}
+
+# Write default-profile + default-nodes for the given sink into STATE_DIR.
+seed_state() {
+    local sink="$1"
+    local card_name
+    card_name=$(detect_sinks | awk -F'\t' -v s="$sink" '$1 == s {print $2; exit}')
+    [ -n "$card_name" ] || card_name=$(sink_card_name_bash "$sink")
+    mkdir -p "$STATE_DIR"
+    printf '[default-profile]\n%s=HiFi\n' "$card_name" > "$STATE_DIR/default-profile"
+    printf '[default-nodes]\ndefault.configured.audio.sink=%s\n' "$sink" > "$STATE_DIR/default-nodes"
+    ok "WirePlumber state seeded: sink=$sink card=$card_name (dir=$STATE_DIR)"
+}
+
+main() {
+    local mode="${1:-}"
+    STATE_DIR="${WIREPLUMBER_STATE_DIR:-${2:-$HOME/.local/state/wireplumber}}"
+    case "$mode" in
+        --seed-interactive|"")
+            local -a sinks
+            mapfile -t sinks < <(list_sinks_with_retry)
+            local sink
+            sink=$(prompt_for_sink "${sinks[@]}") || exit 1
+            seed_state "$sink"
+            printf '%s\n' "$sink"
+            ;;
+        *)
+            fail "Unknown option: $1"
+            ;;
+    esac
+}
+main "$@"
+WIREPLUMBER_DETECT_EOF
+    chmod 0755 "$detect_script"
+
+    # Detect sinks and select the default output sink, as the target user.
+    local selected_sink
+    selected_sink=$(run_as_user "$user" -- "$detect_script" --seed-interactive "$state_dir") || {
+        rm -f "$detect_script"
+        warn "No audio sink detected for $user; WirePlumber state not seeded"
+        return 0
+    }
+    rm -f "$detect_script"
+
+    if [ -z "$selected_sink" ]; then
+        warn "No audio sink selected for $user; WirePlumber state not seeded"
         return 0
     fi
-
-    # Detect a playback sink node name from PipeWire graph
-    profile_name=$(run_as_user "$user" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$user")" \
-        timeout 5 pw-cli list-objects 2>/dev/null | awk -v card="alsa_card.${card_name}" '
-            $0 ~ "device\\.name = \"" card "\"" { in_card=1 }
-            in_card && /media\\.class = "Audio\/Device"/ { found=1 }
-            found && /node\\.name = "alsa_output[^"]*"/ {
-                print; exit
-            }
-        ' | head -1 | sed 's/.*node\\.name = "\([^"]*\)".*/\1/')
-
-    mkdir -p "$state_dir"
-
-    # default-profile: map the detected card to the HiFi profile
-    printf '[default-profile]\nalsa_card.%s=HiFi\n' "$card_name" > "$state_dir/default-profile"
-
-    # default-nodes: map default sink to the detected playback node (if found)
-    if [ -n "$profile_name" ]; then
-        printf '[default-nodes]\ndefault.configured.audio.sink=%s\n' "$profile_name" > "$state_dir/default-nodes"
-    fi
-
-    chown -R "${user}:${user}" "$state_dir"
-    ok "WirePlumber state seeded for $user (card: ${card_name})"
 
     # Restart WirePlumber so it picks up the seeded state
     run_as_user "$user" -- systemctl --user restart wireplumber.service 2>/dev/null || true
     sleep 3
+    ok "WirePlumber state seeded for $user (sink: $selected_sink, dir: $state_dir)"
 }
 
 # ---------------------------------------------------------------------------

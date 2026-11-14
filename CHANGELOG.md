@@ -39,6 +39,18 @@ with the new version heading.
   in place; passes when the wedge is fixed.
 
 ### Fixed
+- Linux PipeWire installer: WirePlumber state seeding now reliably creates both
+  `default-profile` and `default-nodes` so the `l337` user's session exposes
+  hardware audio sink nodes. The old `seed_wireplumber_state()` keyed off the
+  wrong card name (`alsa_card.0` vs the PCI-based `alsa_card.pci-...`) and the
+  wrong media class (`Audio/Device` vs `Audio/Sink`), and had no handling for
+  multiple audio devices. Detection is embedded in `scripts/install-linux-pipewire.sh`
+  (run as the target user via a temp script, so the remote `curl | sudo bash` install
+  path needs no sibling file), which enumerates PipeWire `alsa_output.*` sinks with
+  `media.class = "Audio/Sink"` via `pw-cli`, maps each sink to its card via the
+  `device.name` property, presents an interactive menu when multiple devices exist
+  (auto-selecting the first in non-interactive/CI mode), and writes both state files
+  to `~/.local/state/wireplumber/`.
 - File playback no longer deadlocks/hangs for tracks whose decoded PCM exceeds the
   rebuffer window (e.g. long OGG/Vorbis): `load_and_play` starts backend
   consumption (`stream.play()`) before incremental decode so the decoder can
@@ -130,6 +142,9 @@ with the new version heading.
   (dead in product) was removed.
 
 ### Changed
+- `install.sh --uninstall` now warns to re-run with `--remove-data` when
+  `--remove-data` was not given, so configuration/data directories are not
+  silently left behind.
 - Installers no longer provision auth tokens (removed mixed-case unhyphenated
   32-char generation from Linux/macOS/Windows installers and deleted
   `scripts/generate-token.sh`). The server now generates a single standard token
