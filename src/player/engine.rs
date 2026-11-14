@@ -1934,12 +1934,31 @@ fn decode_file_incremental_blocking(
                     }
 
                     // Resample and append to buffer.
+                    // Ensure the output is stereo-interleaved (L,R,L,R,...) so the
+                    // backend (always configured for 2 channels) receives correctly-
+                    // framed data. Mono output (channels=1) is up-converted by
+                    // duplicating each sample to both left and right channels.
                     let resampled = resampler.process(&output);
                     if !resampled.is_empty() {
                         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                        ab.pcm.extend_from_slice(&resampled);
+                        if channels == 1 {
+                            // Convert mono to stereo: duplicate each sample to L&R
+                            let mut stereo = Vec::with_capacity(resampled.len() * 2);
+                            for &sample in &resampled {
+                                stereo.push(sample); // L
+                                stereo.push(sample); // R
+                            }
+                            ab.pcm.extend_from_slice(&stereo);
+                            ab.channels = 2;  // PCM is now stereo-interleaved
+                        } else {
+                            ab.pcm.extend_from_slice(&resampled);
+                        }
                         ab.notify_data();
-                        total_frames += (resampled.len() / channels as usize) as u64;
+                        // Frames are counted using the actual channel count stored
+                        // in ab.channels (2 after mono→stereo conversion), so that
+                        // total_frames, decoded_frames, and max_frames all remain
+                        // consistent with the actual PCM format written to the backend.
+                        total_frames += (resampled.len() / ab.channels as usize) as u64;
                     }
 
                     // Throttle if buffer exceeds rebuffer window: reclaim what the

@@ -2245,3 +2245,18 @@ has no `default-profile` (unlike other users' sessions).
 
 Fix: seed l337's WirePlumber state (`default-profile`/`default-nodes`/`default-routes`) from the
 detected ALSA card in `install-linux-pipewire.sh` (`seed_wireplumber_state()`), auto-detecting the
+Mono MP3 playback at double speed
+
+### MPD-001 — Mono MP3 playback at double speed on stereo device
+
+**Symptom.** Playing a mono MP3 file (1 channel, 44100 Hz sample rate) results in audio playback at approximately 2× speed (chipmunk effect, halved duration). The `PlayerStatus.speed` field reports `1.0`, and `set_speed()` was never called by the user. Other tracks (stereo MP3s, or mono files at other sample rates) play normally.
+
+**Root cause.** The affected MP3 is mono (1 channel) at 44100 Hz, while the server's audio device is configured at 48000 Hz, 2 channels (stereo). When the mono file is decoded via Symphonia and resampled from 44100→48000 Hz, a channel-count mismatch occurs between the decoded file's `channels=1` and the `AudioBuffer`/`backend` setup for `channels=2`. The `InterleavedResampler` and `buffer_position_sec` function use `buf.channels` in position calculations and sample framing, and the mono→stereo channel conversion during resampling appears to produce audio at double speed — likely because the ALSA/PipeWire writer loop expects stereo-interleaved samples (`L R L R …`) but receives mono samples, causing the effective sample rate to be halved or the channel counting to be off-by-one in the position math.
+
+**Evidence.** `hydrix - dayglo_13.mp3`: ffprobe reports duration 357.23 s, 1 channel, 44100 Hz. Server `start_stream` configures 48000 Hz, 2 channels. `PlayerStatus.speed` = 1.0 (never set via API). Other tracks play normally.
+
+**Fix hypothesis.** Ensure `buf.channels` consistently reflects the decoded file's channel count throughout the decode/resample/position pipeline. Add explicit mono→stereo channel conversion (duplicate mono sample to both L/R channels) before the `InterleavedResampler` or ALSA write path, so the backend always receives correctly-framed stereo data. Verify `buffer_position_sec` uses the correct channel count for position calculation. Test with both dummy and real-audio backends.
+
+**Verification.** Build custom binary with `--features alsa,opus`. Play the mono MP3 via Unix socket API. Confirm `position_sec` advances at 1× rate and audio duration matches ffprobe within ±2s. Compare with a stereo MP3 to verify the fix doesn't break normal playback.
+
+---\n
