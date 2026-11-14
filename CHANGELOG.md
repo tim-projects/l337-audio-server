@@ -221,6 +221,10 @@ with the new version heading.
   compiled with `--features opus`) and `capabilities.quality` signals the G2
   bandwidth API, so a front-end can drop its "assume AAC only" stopgap and expose
   quality presets.
+- `--uninstall` now stops any running `l337-audio-server` instance (SIGTERM,
+  then SIGKILL for stragglers) instead of refusing with "still running". The
+  process match is broadened beyond the install-dir binary path so a server
+  launched from a checkout or `/tmp` is also caught.
 
 ### Changed
 - **Platform installers now enable, start and verify the service.**

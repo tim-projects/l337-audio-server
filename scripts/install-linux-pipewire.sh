@@ -926,12 +926,26 @@ uninstall_user_service() {
 
     # Every user's service is stopped now. $INSTALL_DIR is shared, so it may
     # only go once no instance still holds the socket or the instance lock —
-    # a foreground run is invisible to systemctl and would survive it.
-    if pgrep -f "$binary_path" >/dev/null 2>&1; then
-        local pids
-        pids="$(pgrep -f "$binary_path" | tr '\n' ' ' || true)"
-        fail "A manually started l337-audio-server is still running (pid: ${pids}).
-Stop it and re-run:  kill ${pids}"
+    # a foreground run is invisible to systemctl and would survive it, so stop
+    # any manually started instance rather than refusing.
+    local pids=""
+    for pid in $(pgrep -f 'l337-audio-server' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)" in
+            *install-*) continue ;;
+        esac
+        pids="$pids $pid"
+    done
+    pids="${pids# }"
+    if [ -n "$pids" ]; then
+        info "Stopping running l337-audio-server instance(s): $pids"
+        kill $pids 2>/dev/null || true
+        sleep 1
+        for pid in $(pgrep -f 'l337-audio-server' 2>/dev/null || true); do
+            [ "$pid" = "$$" ] && continue
+            warn "Force-killing l337-audio-server instance (pid: $pid)"
+            kill -9 "$pid" 2>/dev/null || true
+        done
     fi
 
     rm -rf "$INSTALL_DIR"
@@ -965,7 +979,7 @@ if [ "$DRY_RUN" = true ]; then
         info "  Scan all users for installed l337-audio-server.service files"
         info "  For each user: stop, disable, remove service and runtime dir"
         info "  Remove PipeWire dmix config files (~/.config/wireplumber/, ~/.config/pipewire/)"
-        info "  Refuse if a manually started instance is still running"
+        info "  Stop any manually started instance still running"
         info "  Remove the shared binary at $INSTALL_DIR"
         info "  Note: /etc/asound.conf dmix configuration is NOT removed (may be shared)"
         if [ "$REMOVE_DATA" = true ]; then

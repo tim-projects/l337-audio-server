@@ -606,12 +606,26 @@ uninstall_linux() {
 
     # systemd only manages the service instance. A foreground instance is not
     # stopped by the unit, keeps the socket and the instance lock alive, and
-    # makes the next install fail to bind — so refuse instead of half-removing.
-    if pgrep -f "$binary_path" >/dev/null 2>&1; then
-        local pids
-        pids="$(pgrep -f "$binary_path" | tr '\n' ' ' || true)"
-        fail "A manually started l337-audio-server is still running (pid: ${pids}).
-Stop it and re-run:  kill ${pids}"
+    # makes the next install fail to bind — so stop any manually started
+    # instance instead of refusing.
+    local pids=""
+    for pid in $(pgrep -f 'l337-audio-server' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)" in
+            *install-*) continue ;;
+        esac
+        pids="$pids $pid"
+    done
+    pids="${pids# }"
+    if [ -n "$pids" ]; then
+        info "Stopping running l337-audio-server instance(s): $pids"
+        kill $pids 2>/dev/null || true
+        sleep 1
+        for pid in $(pgrep -f 'l337-audio-server' 2>/dev/null || true); do
+            [ "$pid" = "$$" ] && continue
+            warn "Force-killing l337-audio-server instance (pid: $pid)"
+            kill -9 "$pid" 2>/dev/null || true
+        done
     fi
 
     rm -f "$SYSTEMD_SERVICE"
@@ -664,7 +678,7 @@ if [ "$DRY_RUN" = true ]; then
     if [ "$UNINSTALL" = true ]; then
         info "  Remove the service and installed files"
         info "  Remove the runtime directories (/run/l337-audio-server, /run/user/*/l337-audio-server)"
-        info "  Refuse if a manually started instance is still running"
+        info "  Stop any manually started instance still running"
         if [ "$REMOVE_DATA" = true ]; then
             info "  Remove configuration and data directories"
         else
