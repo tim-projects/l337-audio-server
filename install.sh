@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
         --pipewire-user)            FORWARD_ARGS+=("--pipewire-user"); shift ;;
         --group-access)             FORWARD_ARGS+=("--group-access"); shift ;;
         --no-group-access)          FORWARD_ARGS+=("--no-group-access"); shift ;;
+        --dummy|--no-audio)         FORWARD_ARGS+=("--no-audio"); shift ;;
         -h|--help)
             echo "Usage: $0 [--pre-release] [--force] [--no-install-deps] [--dry-run] ... | --uninstall [--dry-run] [--remove-data]"
             echo ""
@@ -55,6 +56,8 @@ while [ $# -gt 0 ]; do
             echo "                      (shared /run/l337-audio-server, group=audio). Kept for compatibility."
             echo "  --no-group-access   Disable shared /run/l337-audio-server; per-user socket under"
             echo "                      /run/user/<uid>/l337.sock instead."
+            echo "  --dummy             Run the server in dummy mode (no audio hardware required)."
+            echo "                      Alias for --no-audio."
             echo ""
             echo "install.sh owns the release lookup and the binary download, so"
             echo "--pre-release is not forwarded to the platform installer."

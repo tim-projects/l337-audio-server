@@ -487,6 +487,7 @@ while [ $# -gt 0 ]; do
         --user) TARGET_USER="$2"; shift 2 ;;
         --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
         --no-audio) NO_AUDIO=true; shift ;;
+        --dummy)    NO_AUDIO=true; shift ;;
         --uninstall|-u) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         --force) FORCE_INSTALL=true; shift ;;
@@ -510,6 +511,7 @@ Options:
   --user <username>      Legacy: install user service for this user (default: $USER_NAME only)
   --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
+  --dummy                Alias for --no-audio (run in dummy mode without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   --force                Force reinstall of audio libraries even if already present
@@ -647,13 +649,42 @@ setup_systemd_user() {
     fi
 
     local config_file="$user_config_dir/server.ini"
+
+    # --- Detect ALSA hardware; prompt for dummy mode if none present ---
+    local alsa_hardware=false
+    if [ -d /dev/snd ] && compgen -G "/dev/snd/controlC*" > /dev/null 2>&1; then
+        alsa_hardware=true
+    elif command -v aplay >/dev/null 2>&1 && aplay -l 2>/dev/null | grep -q "^card"; then
+        alsa_hardware=true
+    fi
+
+    local force_dummy=false
+    if [ "$alsa_hardware" = false ] && [ "$NO_AUDIO" = "false" ]; then
+        # Skip the prompt if dummy mode is already enabled in the existing config
+        if [ -f "$config_file" ] && grep -qE '^dummy\s*=\s*true' "$config_file" 2>/dev/null; then
+            ok "ALSA hardware not detected, but dummy mode is already enabled in $config_file."
+        else
+            warn "No ALSA audio hardware cards detected."
+            local answer="n"
+            if [ -t 0 ]; then
+                printf "Set l337-audio-server to run in dummy mode? (y/n) ? "
+                read -r answer || answer="n"
+            else
+                warn "Non-interactive install: not prompting; dummy mode not enabled."
+            fi
+            if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+                force_dummy=true
+            fi
+        fi
+    fi
+
     info "Ensuring configuration at $config_file..."
     if [ ! -f "$config_file" ]; then
         # Do not provision a token here; the server generates one on first start
         # (src/main.rs load_or_create_token -> src/auth_challenge.rs generate_token)
         # so all tokens use the same standard hyphenated uppercase format.
         local dummy_value="false"
-        if [ "$NO_AUDIO" = "true" ]; then
+        if [ "$NO_AUDIO" = "true" ] || [ "$force_dummy" = "true" ]; then
             dummy_value="true"
         fi
         {
@@ -674,7 +705,7 @@ setup_systemd_user() {
         echo "========================================="
         echo
         fi
-    if [ "$NO_AUDIO" = "true" ]; then
+    if [ "$NO_AUDIO" = "true" ] || [ "$force_dummy" = "true" ]; then
         if grep -qE '^dummy\s*=' "$config_file" 2>/dev/null; then
             sed -i 's/^dummy\s*=.*/dummy = true/' "$config_file"
         else
@@ -694,6 +725,8 @@ Description=L337 Audio Server (user service, PipeWire, multi-user)
 Documentation=https://github.com/${REPO}
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -730,6 +763,8 @@ Description=L337 Audio Server (user service, PipeWire)
 Documentation=https://github.com/${REPO}
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple

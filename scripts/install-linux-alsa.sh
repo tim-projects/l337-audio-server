@@ -238,6 +238,7 @@ while [ $# -gt 0 ]; do
          --no-audio-group) NO_AUDIO_GROUP=true; shift ;;
          --prefix) PREFIX_INSTALL_DIR="$2"; shift 2 ;;
          --no-audio) NO_AUDIO=true; shift ;;
+         --dummy)    NO_AUDIO=true; shift ;;
          --uninstall|-u) UNINSTALL=true; shift ;;
          --remove-data) REMOVE_DATA=true; shift ;;
          --force) FORCE_INSTALL=true; shift ;;
@@ -261,6 +262,7 @@ Options:
   --no-audio-group       Do not add service user to the audio group
   --prefix <path>        Install base path (default: /opt/l337-audio-server)
   --no-audio             Set dummy = true in server.ini (run without audio hardware)
+  --dummy                Alias for --no-audio (run in dummy mode without audio hardware)
   --uninstall, -u        Remove the service and installed files
   --remove-data          Also remove configuration and data directories
   --force                Force reinstall of audio libraries even if already present
@@ -446,6 +448,40 @@ echo
     chmod 0640 "$config_file"
     ok "Configuration ready at $config_file"
 
+    # --- Detect ALSA hardware; prompt for dummy mode if none present ---
+    local alsa_hardware=false
+    if [ -d /dev/snd ] && compgen -G "/dev/snd/controlC*" > /dev/null 2>&1; then
+        alsa_hardware=true
+    elif command -v aplay >/dev/null 2>&1 && aplay -l 2>/dev/null | grep -q "^card"; then
+        alsa_hardware=true
+    fi
+
+    if [ "$alsa_hardware" = false ] && [ "$NO_AUDIO" = "false" ]; then
+        # Skip the prompt if dummy mode is already enabled in the existing config
+        if grep -qE '^dummy\s*=\s*true' "$config_file" 2>/dev/null; then
+            ok "ALSA hardware not detected, but dummy mode is already enabled in $config_file."
+        else
+            warn "No ALSA audio hardware cards detected."
+            local answer="n"
+            if [ -t 0 ]; then
+                printf "Set l337-audio-server to run in dummy mode? (y/n) ? "
+                read -r answer || answer="n"
+            else
+                warn "Non-interactive install: not prompting; dummy mode not enabled."
+            fi
+            if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+                if grep -qE '^dummy\s*=' "$config_file" 2>/dev/null; then
+                    sed -i 's/^dummy\s*=.*/dummy = true/' "$config_file"
+                else
+                    sed -i '/^\[server\]/a dummy = true' "$config_file"
+                fi
+                ok "Set dummy = true in $config_file — server will run without audio hardware."
+            else
+                warn "Dummy mode not enabled. The server may fail to start without ALSA hardware."
+            fi
+        fi
+    fi
+
     info "Writing systemd unit: $SYSTEMD_SERVICE"
     cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
@@ -453,6 +489,8 @@ Description=L337 Audio Server
 Documentation=https://github.com/${REPO}
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -468,6 +506,7 @@ CacheDirectory=l337-audio-server
 ConfigurationDirectory=l337-audio-server
 RuntimeDirectory=l337-audio-server
 RuntimeDirectoryMode=0750
+Environment=XDG_RUNTIME_DIR=/run/l337-audio-server
 
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -481,7 +520,7 @@ RestrictRealtime=false
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=false
-ReadWritePaths=${STATE_DIR} ${CACHE_DIR}
+ReadWritePaths=${STATE_DIR} ${CACHE_DIR} /run/l337-audio-server
 
 [Install]
 WantedBy=multi-user.target
