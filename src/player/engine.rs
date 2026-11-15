@@ -1954,11 +1954,11 @@ fn decode_file_incremental_blocking(
                             ab.pcm.extend_from_slice(&resampled);
                         }
                         ab.notify_data();
-                        // Frames are counted using the actual channel count stored
-                        // in ab.channels (2 after mono→stereo conversion), so that
-                        // total_frames, decoded_frames, and max_frames all remain
-                        // consistent with the actual PCM format written to the backend.
-                        total_frames += (resampled.len() / ab.channels as usize) as u64;
+                        // Frames are counted at the file's own channel count
+                        // (channels): mono output was duplicated to stereo for
+                        // the backend, but the frame count must reflect the
+                        // decoded frames, not the up-mixed sample count.
+                        total_frames += (resampled.len() / channels as usize) as u64;
                     }
 
                     // Throttle if buffer exceeds rebuffer window: reclaim what the

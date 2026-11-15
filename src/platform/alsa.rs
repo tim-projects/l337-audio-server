@@ -163,7 +163,10 @@ pub struct AlsaAudioOutputStream {
 impl AlsaAudioOutputStream {
     fn writer_loop(state: Arc<AlsaState>, funcs: AlsaFuncs) {
         const CHUNK_FRAMES: usize = 1024;
-        let silence_buf = vec![0u8; CHUNK_FRAMES * 4];
+        // Silence for up to CHUNK_FRAMES stereo frames (the widest device we
+        // write); each silence branch writes exactly CHUNK_FRAMES frames so we
+        // never read past the buffer on mono or stereo devices.
+        let silence_buf = vec![0u8; CHUNK_FRAMES * 2 * 4];
 
         loop {
             if state.cancel.load(Ordering::Relaxed) {
@@ -197,14 +200,18 @@ impl AlsaAudioOutputStream {
             let available = buf.pcm.len().saturating_sub(buf.read_pos);
 
             if available > 0 {
-                let to_copy = available.min(CHUNK_FRAMES);
-                let src = &buf.pcm[buf.read_pos..buf.read_pos + to_copy];
+                // CHUNK_FRAMES is in frames; pcm holds interleaved samples, so cap
+                // the copy at CHUNK_FRAMES * channels samples and writei by frames.
+                let channels = buf.channels.max(1) as usize;
+                let to_copy_samples = available.min(CHUNK_FRAMES * channels);
+                let to_copy_frames = to_copy_samples / channels;
+                let src = &buf.pcm[buf.read_pos..buf.read_pos + to_copy_samples];
                 let volume = *state.volume.lock().unwrap_or_else(|e| e.into_inner());
 
                 let samples: Vec<f32> = src.iter().map(|s| s * volume).collect();
 
                 let bytes = unsafe { samples.align_to::<u8>().1 };
-                buf.read_pos += to_copy;
+                buf.read_pos += to_copy_samples;
                 if buf.read_pos >= (1 << 20) {
                     buf.reclaim_consumed();
                 }
@@ -217,7 +224,7 @@ impl AlsaAudioOutputStream {
                     (funcs.snd_pcm_writei)(
                         pcm_ptr,
                         bytes.as_ptr() as *const std::os::raw::c_void,
-                        bytes.len() as u64 / 4,
+                        to_copy_frames as u64,
                     )
                 };
 
@@ -235,7 +242,7 @@ impl AlsaAudioOutputStream {
                     (funcs.snd_pcm_writei)(
                         pcm_ptr,
                         silence_buf.as_ptr() as *const std::os::raw::c_void,
-                        silence_buf.len() as u64 / 4,
+                        CHUNK_FRAMES as u64,
                     )
                 };
                 if result < 0 {
@@ -259,7 +266,7 @@ impl AlsaAudioOutputStream {
                     (funcs.snd_pcm_writei)(
                         pcm_ptr,
                         silence_buf.as_ptr() as *const std::os::raw::c_void,
-                        silence_buf.len() as u64 / 4,
+                        CHUNK_FRAMES as u64,
                     )
                 };
                 if result < 0 {

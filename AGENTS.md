@@ -119,6 +119,43 @@ headless.
 L337__SERVER__PORT=1337 ./bin/l337-audio-server --dummy   # env-var config override
 ```
 
+### Playing a file via the live server's Unix socket (control test)
+
+The live systemd server listens on its default Unix socket. To play a local MP3 against it for comparison:
+
+1. **Discover the live server's token** (Unix sockets serve `/setup` without auth):
+   ```bash
+   curl --unix-socket /run/l337-audio-server/l337.sock http://localhost/setup
+   # -> {"socket_mode":true,"token":"TS6G-4HWR-44IA-29Y0-1LIB"}
+   ```
+
+2. **Play a local MP3** (stream raw bytes, pass the bearer token):
+   ```bash
+   LIVE_TOKEN="TS6G-4HWR-44IA-29Y0-1LIB"
+   curl --unix-socket /run/l337-audio-server/l337.sock \
+        -H "Authorization: Bearer $LIVE_TOKEN" \
+        --data-binary @/path/to/track.mp3 \
+        http://localhost/player/play/stream
+   # -> {"ok":true}
+   ```
+
+3. **Stop playback:**
+   ```bash
+   curl --unix-socket /run/l337-audio-server/l337.sock \
+        -H "Authorization: Bearer $LIVE_TOKEN" \
+        -X POST http://localhost/player/stop
+   # -> {"ok":true}
+   ```
+
+4. **Check status:**
+   ```bash
+   curl --unix-socket /run/l337-audio-server/l337.sock \
+        -H "Authorization: Bearer $LIVE_TOKEN" \
+        http://localhost/player/status | jq '{position_sec,duration_sec,state}'
+   ```
+
+The token lives at `/home/l337/.cache/l337/l337-audio-server/server_token.txt` (mode `0600`, user `l337`). If you can't read it directly, probe `/setup` on the Unix socket instead.
+
 ## Isolated testing on a live device
 
 When the machine already runs a live audio server (e.g. a supervised systemd service

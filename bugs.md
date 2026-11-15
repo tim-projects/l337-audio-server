@@ -2251,15 +2251,39 @@ Mono MP3 playback at double speed
 
 **Symptom.** Playing a mono MP3 file (1 channel, 44100 Hz sample rate) results in audio playback at approximately 2× speed (chipmunk effect, halved duration). The `PlayerStatus.speed` field reports `1.0`, and `set_speed()` was never called by the user. Other tracks (stereo MP3s, or mono files at other sample rates) play normally.
 
-**Root cause.** The affected MP3 is mono (1 channel) at 44100 Hz, while the server's audio device is configured at 48000 Hz, 2 channels (stereo). When the mono file is decoded via Symphonia and resampled from 44100→48000 Hz, a channel-count mismatch occurs between the decoded file's `channels=1` and the `AudioBuffer`/`backend` setup for `channels=2`. The `InterleavedResampler` and `buffer_position_sec` function use `buf.channels` in position calculations and sample framing, and the mono→stereo channel conversion during resampling appears to produce audio at double speed — likely because the ALSA/PipeWire writer loop expects stereo-interleaved samples (`L R L R …`) but receives mono samples, causing the effective sample rate to be halved or the channel counting to be off-by-one in the position math.
+**Root cause.** The affected MP3 is mono (1 channel) at 44100 Hz, while the server's audio device is configured at 48000 Hz, 2 channels (stereo). The mono decode path up-converts mono→stereo (duplicating each sample to L/R) so the backend receives correctly-framed stereo data, but the frame counter divided the mono sample count by `ab.channels` (2 after up-conversion) instead of the file's own channel count (1). This halved the reported decoded frames → reported duration halved → position advanced at ~2× speed (chipmunk effect, halved duration) while `PlayerStatus.speed` reported 1.0. Stereo tracks pass through unchanged (channels=2, division correct).
 
-**Evidence.** `hydrix - dayglo_13.mp3`: ffprobe reports duration 357.23 s, 1 channel, 44100 Hz. Server `start_stream` configures 48000 Hz, 2 channels. `PlayerStatus.speed` = 1.0 (never set via API). Other tracks play normally.
+**Evidence.** `hydrix - dayglo_13.mp3`: ffprobe reports duration 357.23 s, 1 channel, 44100 Hz. Live server confirmed double speed (position advanced 2/sec, e.g. 1→3→5→15 s at 1-s polling). Server `start_stream` configures 48000 Hz, 2 channels. `PlayerStatus.speed` = 1.0 (never set via API). Other tracks play normally.
 
-**Fix hypothesis.** Ensure `buf.channels` consistently reflects the decoded file's channel count throughout the decode/resample/position pipeline. Add explicit mono→stereo channel conversion (duplicate mono sample to both L/R channels) before the `InterleavedResampler` or ALSA write path, so the backend always receives correctly-framed stereo data. Verify `buffer_position_sec` uses the correct channel count for position calculation. Test with both dummy and real-audio backends.
+**Fix.** In `src/player/engine.rs` `decode_file_incremental_blocking()`, count mono frames using the file's own channel count (`channels`, =1) instead of `ab.channels` (=2 after mono→stereo up-conversion): `total_frames += (resampled.len() / channels as usize) as u64`.
 
-**Verification.** Build custom binary with `--features alsa,opus`. Play the mono MP3 via Unix socket API. Confirm `position_sec` advances at 1× rate and audio duration matches ffprobe within ±2s. Compare with a stereo MP3 to verify the fix doesn't break normal playback.
+**Verification.** Build custom binary with `--features alsa,opus`. Play `hydrix - dayglo_13.mp3` via Unix socket API on an isolated instance (real ALSA backend, dummy=false). Confirm `position_sec` advances at ~1× rate (1/sec) and stops at ~357 s matching ffprobe within ±2s. Compare with a stereo MP3 to verify the fix doesn't break normal playback. Confirm audio quality is clean (no static/grain) at idle and during playback on the ALSA backend.
 
----\n
+**Status: FIXED** — human listening test confirmed (2026-11-15): `dayglo_13.mp3` plays at normal 1× speed with no chipmunk effect, no static at idle, no garble during playback. Isolated instance on socket `/tmp/l337-test/run/l337.sock` verified position advances at 1/sec.
 
-**Auditory confirmation needed.** Human listening test required to confirm audio quality and playback speed. The code fix resolves the channel-count mismatch, but final determination of whether the audio sounds correct requires a human listener with normal hearing to play the track via the ALSA backend and verify the absence of chipmunk effect or double-speed playback.
 ---
+
+# Part 8 — New findings — 2026-11-15
+
+## New issue — Playback position jumps forward while streaming a mono track (OPEN)
+
+**Reproduced 2026-11-15** on the fixed mono build, track `hydrix - dayglo_13.mp3` (ffprobe 357.23 s, mono 44100 Hz). During playback the `position_sec` reported by `GET /player/status` suddenly jumped forward (observed jumping by several seconds mid-track) instead of advancing smoothly at ~1×. The audio itself continued at normal speed and without static/garble, so this is a **position-reporting** defect, not a playback-speed defect.
+
+**Symptom.** `position_sec` discontinuously increases while `state` stays `playing`; the jump is not a seek (no `POST /player/seek`). After the jump, position continues advancing at ~1× from the new value.
+
+**Root cause hypothesis.** `buffer_position_sec` derives position from `consumed_total + read_pos` divided by `buf.channels`, then converts from `sample_rate` (device, 48000 Hz) back to `file_sample_rate` (44100 Hz). When `read_pos >= 1<<20`, `reclaim_consumed()` transfers `read_pos` into `consumed_total` and resets `read_pos` to 0. If the reclaim transfers the wrong number of samples (e.g. counts stereo samples while the source is mono, or double-counts the reclaimed prefix), the playhead jumps forward by the reclaimed amount. Related: `seek_and_resume` and `take_backend_error` reset `read_pos`/`consumed_total`/`decoded_frames` to 0 but `position_sec` is not always carried forward, so a seek/recovery can rewind or jump.
+
+**Evidence.** Isolated instance verified `position_sec` advances at 1/sec before the jump; the jump was witnessed aurally and via polling (position advanced 0→1→2→… then jumped ahead several seconds).
+
+**Fix needed.** Audit `reclaim_consumed()`, `buffer_position_sec`, `seek_and_resume`, and `take_backend_error` so that (a) `consumed_total + read_pos` is continuous across reclaim, (b) the channel count used for sample→frame conversion matches the source file's channel count (1 for mono, not the up-mixed 2), and (c) seeks/recoveries carry `position_sec` forward instead of resetting to the seek base.
+
+**Verification.** Play `dayglo_13.mp3` on an isolated instance and poll `GET /player/status` for the full 357 s; `position_sec` must advance monotonically at ~1/sec with no forward jumps and stop at ~357 s matching ffprobe within ±2s.
+
+---
+
+## Fixes shipped in this session (2026-11-15)
+
+- **MPD-001 (mono MP3 double speed)** — FIXED. `src/player/engine.rs`: count decoded frames using the file's own channel count (`channels`, =1 for mono) instead of `ab.channels` (=2 after mono→stereo up-conversion). Human listening test confirmed: `dayglo_13.mp3` plays at normal 1× speed, no static at idle, no garble.
+- **ALSA idle/static writei frame-count bug** — FIXED. `src/platform/alsa.rs`: all three `snd_pcm_writei` calls passed **samples** as **frames** (`bytes.len()/4`), causing garbage reads → static at idle and during playback on stereo devices. All three write paths now compute correct frame counts (`to_copy_samples/channels` for real data, `CHUNK_FRAMES` for silence).
+- **Docs** — `AGENTS.md`: added "Playing a file via the live server's Unix socket" control-test instructions. `bugs.md`: MPD-001 marked FIXED with verification steps; this Part 8 added.
+
