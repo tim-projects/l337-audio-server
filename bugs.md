@@ -2260,3 +2260,6 @@ Mono MP3 playback at double speed
 **Verification.** Build custom binary with `--features alsa,opus`. Play the mono MP3 via Unix socket API. Confirm `position_sec` advances at 1× rate and audio duration matches ffprobe within ±2s. Compare with a stereo MP3 to verify the fix doesn't break normal playback.
 
 ---\n
+
+**Auditory confirmation needed.** Human listening test required to confirm audio quality and playback speed. The code fix resolves the channel-count mismatch, but final determination of whether the audio sounds correct requires a human listener with normal hearing to play the track via the ALSA backend and verify the absence of chipmunk effect or double-speed playback.
+---

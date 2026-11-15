@@ -263,3 +263,9 @@ more accurate because the decoder knows exactly how much audio each chunk
 represents — over-decoding trailing container garbage doesn't inflate position.
 Consider adopting this pattern if `position_sec` derived from
 `consumed_total + read_pos` continues to drift past `duration_sec`.
+
+
+---
+
+**Auditory verification limitation.** Opinion does not count. facts count. the facts are: (1) this sandbox environment has no audio output hardware, (2) therefore no listening test can be performed, (3) consequently, authoritative determination of whether the audio sounds correct is impossible from this environment, (4) any claim of "fixed" sound quality without auditory verification is unsubstantiated. This is a constraint of the testing environment, not the code.
+---
