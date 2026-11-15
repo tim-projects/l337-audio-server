@@ -1772,17 +1772,11 @@ fn decode_file_incremental_blocking(
 
     let mut total_frames: u64 = 0;
 
-    // Estimate max reasonable decoded frames from file size to prevent
-    // trailing container garbage from inflating duration_sec.
-    // Decoded f32 PCM: sample_rate * channels * 4 bytes/sec.
-    // Typical compressed-to-decoded ratio for lossy audio: 15:1 to 25:1.
-    // Use 18:1 as a middle ground that keeps duration_sec within ~±2s
-    // of the true duration for typical MP3/AAC/Opus files.
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let decoded_bytes_per_sec = file_sample_rate as u64 * channels as u64 * 4;
-    let compressed_bytes_per_sec = decoded_bytes_per_sec / 18;
-    let max_duration_sec = file_size / compressed_bytes_per_sec.max(1);
-    let max_frames = max_duration_sec * file_sample_rate as u64;
+    // No max_frames clamp: we rely on PTS-based end detection (timestamp going
+    // backwards) to find the true end of audio. This allows indefinite-length
+    // streams (radio, live broadcasts) and pushed files to play to completion
+    // without artificial limits. The file-size-based heuristic was causing
+    // premature cutoff at ~2:20 for incrementally written files.
 
     // Opus: decode via libopus at 48 kHz, no resample needed.
     #[cfg(feature = "opus")]
@@ -1845,8 +1839,7 @@ fn decode_file_incremental_blocking(
                 }
             }
         }
-        let clamped_frames = total_frames.min(max_frames);
-        return Ok((48000, head.channels, codec, clamped_frames));
+        return Ok((48000, head.channels, codec, total_frames));
     }
 
     // Non-Opus: decode via Symphonia.
@@ -1907,10 +1900,6 @@ fn decode_file_incremental_blocking(
             }
         }
         last_pts = Some(ts);
-        packet_count += 1;
-        if packet_count > 10_000 {
-            break;
-        }
 
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
@@ -2051,15 +2040,14 @@ fn decode_file_incremental_blocking(
         }
     }
 
-    let clamped_frames = total_frames.min(max_frames);
-    // decoded_frames tracks frames actually written to the buffer (at
+// decoded_frames tracks frames actually written to the buffer (at
     // file_sample_rate). Used as an authoritative cap on reported position
     // (MPD pattern: chunk->time).
     {
         let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        ab.decoded_frames = clamped_frames;
+        ab.decoded_frames = total_frames;
     }
-    Ok((file_sample_rate, channels, codec, clamped_frames))
+    Ok((file_sample_rate, channels, codec, total_frames))
 }
 
 /// OPT-9: Blocking decode starting at a seek position instead of decoding the
