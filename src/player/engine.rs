@@ -137,6 +137,11 @@ pub struct PlayerEngine {
     file_sample_rate: u32,
     channels: u16,
     streaming: Option<StreamingPlayback>,
+    /// Cancellation flag for the file-decode path. `stop()` sets it; the decode
+    // loop checks it before each buffer write so an aborted decode cannot keep
+    // appending PCM while the next track starts — which previously mixed two
+    // tracks in the shared buffer (concurrent playback).
+    decode_cancel: Arc<AtomicBool>,
     /// Background file decode task handle, so `load_and_play` can return
     /// immediately instead of blocking on full-file decode (which can be
     /// throttled by the rebuffer window). Result is collected in `get_status`.
@@ -254,6 +259,7 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
             file_bytes_len: None,
             default_target_kbps,
@@ -306,6 +312,7 @@ impl PlayerEngine {
             file_sample_rate: 0,
             channels: 0,
             streaming: None,
+            decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
             file_bytes_len: None,
             default_target_kbps,
@@ -724,8 +731,16 @@ impl PlayerEngine {
             buf.sample_rate
         };
 
+        let decode_cancel = self.decode_cancel.clone();
         tokio::task::spawn_blocking(move || {
-            decode_file_incremental_blocking(&path, audio_buffer, speed, pitch, device_rate)
+            decode_file_incremental_blocking(
+                &path,
+                audio_buffer,
+                decode_cancel,
+                speed,
+                pitch,
+                device_rate,
+            )
         })
         .await
         .map_err(|e| format!("decode task join error: {e}"))?
@@ -791,8 +806,17 @@ impl PlayerEngine {
             buf.sample_rate
         };
 
+        let decode_cancel = self.decode_cancel.clone();
+        decode_cancel.store(false, Ordering::SeqCst);
         let decode_handle = tokio::task::spawn_blocking(move || {
-            decode_file_incremental_blocking(&path_clone, audio_buffer_clone, speed, pitch, device_rate)
+            decode_file_incremental_blocking(
+                &path_clone,
+                audio_buffer_clone,
+                decode_cancel,
+                speed,
+                pitch,
+                device_rate,
+            )
         });
         self.file_decode_handle = Some(decode_handle);
 
@@ -853,12 +877,22 @@ impl PlayerEngine {
         // Abort and wait for the background file decode task, if any, so a
         // wedged decode cannot keep appending PCM after stop().
         if let Some(handle) = self.file_decode_handle.take() {
-            handle.abort();
-            let _ = tokio::time::timeout(
+            // Signal the decode loop to stop writing to the shared buffer, then
+            // wait for it to observe the flag and exit. Aborting a
+            // spawn_blocking task does NOT stop its closure, so we rely on the
+            // cancel flag instead of abort().
+            self.decode_cancel.store(true, Ordering::SeqCst);
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 handle,
             )
-            .await;
+            .await
+            {
+                Ok(Ok(_)) | Ok(Err(_)) => {}
+                Err(_elapsed) => {
+                    tracing::warn!("file decode task did not stop within 5 s after cancel");
+                }
+            }
         }
         // Pause the backend stream instead of destroying it from the engine
         // thread. PipeWire stream/mainloop objects are not safe to tear down
@@ -1684,6 +1718,7 @@ pub(crate) fn decode_to_pcm(
 fn decode_file_incremental_blocking(
     path: &PathBuf,
     audio_buffer: Arc<Mutex<AudioBuffer>>,
+    cancel: Arc<AtomicBool>,
     speed: f32,
     pitch: f32,
     device_rate: u32,
@@ -1850,6 +1885,9 @@ fn decode_file_incremental_blocking(
     let mut last_pts: Option<u64> = None;
 
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(_) => break,
@@ -1984,29 +2022,33 @@ fn decode_file_incremental_blocking(
     }
 
     // Drain any remaining wsola output.
-    if let Some(ref mut stretcher) = stretcher {
-        loop {
-            let pulled = stretcher.pull(4096);
-            if pulled.is_empty() {
-                break;
-            }
-            let resampled = resampler.process(&pulled);
-            if !resampled.is_empty() {
-                let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                ab.pcm.extend_from_slice(&resampled);
-                ab.notify_data();
-                total_frames += (resampled.len() / channels as usize) as u64;
+    if !cancel.load(Ordering::SeqCst) {
+        if let Some(ref mut stretcher) = stretcher {
+            loop {
+                let pulled = stretcher.pull(4096);
+                if pulled.is_empty() {
+                    break;
+                }
+                let resampled = resampler.process(&pulled);
+                if !resampled.is_empty() {
+                    let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    ab.pcm.extend_from_slice(&resampled);
+                    ab.notify_data();
+                    total_frames += (resampled.len() / channels as usize) as u64;
+                }
             }
         }
     }
 
     // Flush resampler tail.
-    let tail = resampler.finish();
-    if !tail.is_empty() {
-        let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        ab.pcm.extend_from_slice(&tail);
-        ab.notify_data();
-        total_frames += (tail.len() / channels as usize) as u64;
+    if !cancel.load(Ordering::SeqCst) {
+        let tail = resampler.finish();
+        if !tail.is_empty() {
+            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            ab.pcm.extend_from_slice(&tail);
+            ab.notify_data();
+            total_frames += (tail.len() / channels as usize) as u64;
+        }
     }
 
     let clamped_frames = total_frames.min(max_frames);

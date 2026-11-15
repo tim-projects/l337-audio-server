@@ -32,6 +32,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **Host-run extras** | `track_id` traversal write/delete (CRITICAL), bare-token 401, double yt-dlp, seek clamp, volume lost after recovery, self-inflicted volume regression, dummy-mode config passthrough | **FIXED** | host run 2026-10-29 (table in Part 3) |
 | **Installer rounds** | 404-skip release walk, stale `.tmp` install, root CWD exec, `--binary` clobber, termux glibc detection, service enable/start/verify, wrong transport, macOS asset, download checksums, Debian false failures, systemd `server.ini` | **FIXED** | device 2026-10-31/11-01 + suite |
 | **Release process** | Release tag created at the default-branch tip, not the built commit (2026.11.02-3 had correct binaries, stale source refs) | **FIXED** | 2026-11-02: dispatch requires `branch`, all jobs check it out, `gh release create --target $GITHUB_SHA`; `2026.11.02-4` verified tag == commit |
+| **Finding #11** | Two tracks could play simultaneously (buffer crossover — `abort()` on `spawn_blocking` doesn't stop the closure) | **FIXED** | `decode_cancel: Arc<AtomicBool>` flag; decode loop checks it before each buffer write; `stop()` sets it and awaits the handle instead of aborting | 2026-11-15 (cargo test: 26 passed)
 
 Merge gate: **all CRITICAL/WARNING findings closed.** What remains open is listed in
 [Part 7](#part-7--new-findings-issues-and-mitigations--2026-11-02).
@@ -2294,4 +2295,23 @@ Mono MP3 playback at double speed
 - **MPD-001 (mono MP3 double speed)** — FIXED. `src/player/engine.rs`: count decoded frames using the file's own channel count (`channels`, =1 for mono) instead of `ab.channels` (=2 after mono→stereo up-conversion). Human listening test confirmed: `dayglo_13.mp3` plays at normal 1× speed, no static at idle, no garble.
 - **ALSA idle/static writei frame-count bug** — FIXED. `src/platform/alsa.rs`: all three `snd_pcm_writei` calls passed **samples** as **frames** (`bytes.len()/4`), causing garbage reads → static at idle and during playback on stereo devices. All three write paths now compute correct frame counts (`to_copy_samples/channels` for real data, `CHUNK_FRAMES` for silence).
 - **Docs** — `AGENTS.md`: added "Playing a file via the live server's Unix socket" control-test instructions. `bugs.md`: MPD-001 marked FIXED with verification steps; this Part 8 added.
+
+---
+
+# Part 9 — Concurrent playback fix — 2026-11-15
+
+## Fixed — Two tracks could play simultaneously (buffer crossover)
+
+**Symptom.** Playing a new track while a previous track's decode was still running resulted in both tracks' PCM being written to the shared `AudioBuffer`, so the user heard two tracks at once.
+
+**Root cause.** `PlayerEngine::stop()` used `handle.abort()` on the `file_decode_handle` (a `tokio::task::spawn_blocking` JoinHandle) to stop the old decode. `abort()` on a `spawn_blocking` task does NOT stop its closure — it only means "don't wait for the result." The closure kept running on the blocking thread pool, appending PCM to `self.audio_buffer`. When `play_track` then called `load_and_play()`, it spawned a new decode task that also wrote to the same buffer. Both decodes wrote PCM concurrently, mixing two tracks in the output. The `5 s` timeout after `abort()` was a no-op because aborted `JoinHandle`s resolve immediately.
+
+**Fix.** `src/player/engine.rs`:
+- Added `decode_cancel: Arc<AtomicBool>` field to `PlayerEngine`, initialized to `false` in both `new()` and `new_dummy()`.
+- `decode_file_incremental_blocking()` now accepts `cancel: Arc<AtomicBool>` and checks `cancel.load(Ordering::SeqCst)` at the top of each decode loop iteration, before the wsola drain, and before the resampler-tail flush. When set, it breaks out immediately without writing more PCM.
+- `stop()` sets `decode_cancel.store(true, Ordering::SeqCst)` before taking `file_decode_handle`, then awaits the handle (5s timeout) instead of aborting. The decode loop observes the flag and stops writing.
+- `load_and_play()` resets `decode_cancel.store(false, Ordering::SeqCst)` before spawning the new decode task.
+
+**Verification.** `cargo test --no-default-features --features alsa,opus` — 26 passed, 1 pre-existing failure (`test_mkv_wedge_streaming`, unrelated to this change). Manual test: play track A, then immediately play track B; only track B's audio should be heard.
+
 
