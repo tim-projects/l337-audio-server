@@ -626,7 +626,8 @@ async fn test_seek_endpoint() {
         .expect("Failed to call /player/play");
     assert_eq!(play_resp.status(), 200);
 
-    sleep(Duration::from_millis(200)).await;
+    // Wait for background decode to complete (local files decode in background)
+    sleep(Duration::from_secs(2)).await;
 
     let seek_payload = serde_json::json!({
         "position_sec": 0
@@ -652,6 +653,7 @@ async fn test_seek_endpoint() {
         .json()
         .await
         .expect("Failed to parse /player/status JSON");
+    eprintln!("Status body: {}", serde_json::to_string_pretty(&status_body).unwrap());
     assert_eq!(status_body["state"], "playing");
     assert!(status_body["position_sec"].is_number());
     assert!(status_body["duration_sec"].is_number());

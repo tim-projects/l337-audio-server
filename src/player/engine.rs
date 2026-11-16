@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wsola;
 
 struct StreamingPlayback {
@@ -163,6 +163,8 @@ pub struct PlayerEngine {
     lossless_requested: bool,
     /// Whether a lossless rendition was actually delivered (for PlayerStatus).
     lossless_fulfilled: bool,
+    /// Whether the engine is running in dummy mode (no real audio output).
+    is_dummy: bool,
     /// Shared HTTP client reused across all downloads (OPT-8): avoids rebuilding
     /// a reqwest::Client (TLS session cache, connection pool, DNS cache) on every
     /// download_stream / stream_http_to_file call.
@@ -269,6 +271,7 @@ impl PlayerEngine {
             codec_label: None,
             lossless_requested: false,
             lossless_fulfilled: false,
+            is_dummy: false,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
@@ -322,6 +325,7 @@ impl PlayerEngine {
             codec_label: None,
             lossless_requested: false,
             lossless_fulfilled: false,
+            is_dummy: true,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .user_agent(concat!("l337-audio-server/", env!("L337_VERSION")))
@@ -500,12 +504,17 @@ impl PlayerEngine {
         // A failed play must not report the previous track's timeline.
         self.duration_sec = None;
 
+        // Ensure cache directory exists (handles case where it was deleted at runtime)
+        if let Err(e) = self.storage.ensure_cache_dir().await {
+            warn!("Failed to create cache directory: {}", e);
+        }
+
         if let Some(cached_path) = self.storage.get_path_for_track(&track.track_id) {
             if cached_path.exists() {
                 info!("play_track: cache hit for {}", track.track_id);
                 let slot = self.storage.get_active_slot_path("current");
                 let _ = fs::copy(&cached_path, &slot).await;
-                self.load_and_play("current").await;
+                self.load_and_play("current", None).await;
                 self.storage.update_access(&track.track_id, 0).await;
                 return Ok(());
             }
@@ -548,7 +557,7 @@ impl PlayerEngine {
                             e
                         )));
                     }
-                    self.load_and_play("current").await;
+                    self.load_and_play("current", None).await;
                     self.persist_slot(&track.track_id, &path).await;
                     return Ok(());
                 }
@@ -562,12 +571,8 @@ impl PlayerEngine {
         let local_path = PathBuf::from(track.stream_url.strip_prefix("file://").unwrap_or(&track.stream_url));
         if local_path.is_absolute() && local_path.exists() {
             info!("play_track: local file hit for {}", local_path.display());
-            let slot = self.storage.get_active_slot_path("current");
-            fs::copy(&local_path, &slot)
-                .await
-                .map_err(|e| EngineError::Other(format!("failed to copy local file: {e}")))?;
-            self.load_and_play("current").await;
-            self.persist_slot(&track.track_id, &local_path).await;
+            // Stream directly from source - no cache copy needed
+            self.load_and_play("current", Some(local_path.clone())).await;
             return Ok(());
         }
 
@@ -577,7 +582,7 @@ impl PlayerEngine {
                 info!("play_track: cache hit for {}", track.track_id);
                 let slot = self.storage.get_active_slot_path("current");
                 let _ = fs::copy(&cached_path, &slot).await;
-                self.load_and_play("current").await;
+                self.load_and_play("current", None).await;
                 self.storage.update_access(&track.track_id, 0).await;
                 return Ok(());
             }
@@ -616,7 +621,7 @@ impl PlayerEngine {
                             e
                         )));
                     }
-                    self.load_and_play("current").await;
+                    self.load_and_play("current", None).await;
                     self.persist_slot(&track.track_id, &path).await;
                     return Ok(());
                 }
@@ -661,7 +666,7 @@ impl PlayerEngine {
             }
         }
 
-        self.load_and_play("current").await;
+        self.load_and_play("current", None).await;
         self.persist_slot(&track.track_id, &path).await;
         Ok(())
     }
@@ -686,7 +691,7 @@ impl PlayerEngine {
         });
 
         let path = self.storage.get_active_slot_path(slot);
-        self.load_and_play(slot).await;
+        self.load_and_play(slot, None).await;
         if self.state != PlayerStateLabel::Playing {
             return Err(format!("failed to load pushed audio from slot {slot}"));
         }
@@ -702,6 +707,11 @@ impl PlayerEngine {
     }
 
     async fn persist_slot(&mut self, track_id: &str, slot_path: &PathBuf) {
+        // Ensure cache directory exists (handles case where it was deleted at runtime)
+        if let Err(e) = self.storage.ensure_cache_dir().await {
+            warn!("Failed to create cache directory: {}", e);
+            return;
+        }
         let Some(dest_path) = self.storage.get_path_for_track(track_id) else {
             error!("persist_slot: refusing unsafe track_id {:?}", track_id);
             return;
@@ -746,13 +756,14 @@ impl PlayerEngine {
         .map_err(|e| format!("decode task join error: {e}"))?
     }
 
-    pub async fn load_and_play(&mut self, slot: &str) {
+    pub async fn load_and_play(&mut self, slot: &str, direct_path: Option<PathBuf>) {
+        info!("load_and_play: called with slot={}, direct_path={:?}, is_dummy={}", slot, direct_path.as_ref().map(|p| p.display()), self.is_dummy);
         self.ensure_stream();
         if self.has_backend_error() {
             return;
         }
 
-        let path = self.storage.get_active_slot_path(slot);
+        let path = direct_path.unwrap_or_else(|| self.storage.get_active_slot_path(slot));
 
         // Compressed file size, captured before decode — the delivered source
         // bitrate estimate (G2 actual_kbps).
@@ -792,39 +803,47 @@ impl PlayerEngine {
         }
         self.state = PlayerStateLabel::Playing;
 
-        // OPT-13: decode incrementally into the audio buffer instead of
-        // allocating the whole decoded PCM at once (peak RSS ~ compressed
-        // size x 2-2.5 for hour-long tracks). Run decode in a background
-        // task so `load_and_play` returns immediately instead of blocking
-        // on decode while the rebuffer window throttles the producer.
-        let audio_buffer_clone = self.audio_buffer.clone();
-        let path_clone = path.clone();
-        let speed = self.speed;
-        let pitch = self.pitch;
-        let device_rate = {
-            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buf.sample_rate
-        };
+        // In dummy mode, use synchronous decode (no background task) since
+        // the NoopAudioOutputStream doesn't consume buffer space.
+        info!("load_and_play: is_dummy = {}", self.is_dummy);
+        if self.is_dummy {
+            self.decode_file_sync(&path).await;
+        } else {
+            // OPT-13: decode incrementally into the audio buffer instead of
+            // allocating the whole decoded PCM at once (peak RSS ~ compressed
+            // size x 2-2.5 for hour-long tracks). Run decode in a background
+            // task so `load_and_play` returns immediately instead of blocking
+            // on decode while the rebuffer window throttles the producer.
+            let audio_buffer_clone = self.audio_buffer.clone();
+            let path_clone = path.clone();
+            let speed = self.speed;
+            let pitch = self.pitch;
+            let device_rate = {
+                let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                buf.sample_rate
+            };
 
-        let decode_cancel = self.decode_cancel.clone();
-        decode_cancel.store(false, Ordering::SeqCst);
-        let decode_handle = tokio::task::spawn_blocking(move || {
-            decode_file_incremental_blocking(
-                &path_clone,
-                audio_buffer_clone,
-                decode_cancel,
-                speed,
-                pitch,
-                device_rate,
-            )
-        });
-        self.file_decode_handle = Some(decode_handle);
+            let decode_cancel = self.decode_cancel.clone();
+            decode_cancel.store(false, Ordering::SeqCst);
+            let decode_handle = tokio::task::spawn_blocking(move || {
+                decode_file_incremental_blocking(
+                    &path_clone,
+                    audio_buffer_clone,
+                    decode_cancel,
+                    speed,
+                    pitch,
+                    device_rate,
+                )
+            });
+            self.file_decode_handle = Some(decode_handle);
+        }
 
         // Playback was started before decode; decode runs in background and
         // metadata is collected on the first `get_status` poll after it finishes.
         info!(
-            "load_and_play({}): Playing (decode running in background)",
-            slot
+            "load_and_play({}): Playing (decode running in background) from {}",
+            slot,
+            path.display()
         );
     }
 
@@ -1124,7 +1143,7 @@ impl PlayerEngine {
                     buf.file_sample_rate = 0;
                 }
                 self.ensure_stream();
-                self.load_and_play("current").await;
+                self.load_and_play("current", None).await;
                 Ok(())
             }
             _ => Ok(()),
@@ -1362,7 +1381,7 @@ impl PlayerEngine {
         }
         let _ = fs::rename(&next_path, &curr_path).await;
 
-        self.load_and_play("current").await;
+        self.load_and_play("current", None).await;
     }
 
     pub async fn trigger_previous(&mut self) {
@@ -1382,7 +1401,7 @@ impl PlayerEngine {
         }
         let _ = fs::rename(&prev_path, &curr_path).await;
 
-        self.load_and_play("current").await;
+        self.load_and_play("current", None).await;
     }
 
     pub async fn get_status(&mut self) -> PlayerStatus {
@@ -1555,6 +1574,77 @@ impl PlayerEngine {
             lossless_fulfilled: self.lossless_fulfilled,
             warm: self.is_warm(),
             active_sessions: self.active_sessions(),
+        }
+    }
+
+    /// Synchronous full-file decode for dummy mode (where NoopAudioOutputStream
+    /// doesn't consume buffer space, so incremental decode would block forever).
+    async fn decode_file_sync(&mut self, path: &PathBuf) {
+        info!("decode_file_sync: starting for {}", path.display());
+        let speed = self.speed;
+        let pitch = self.pitch;
+        let device_rate = {
+            let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.sample_rate
+        };
+        let path = path.clone();
+
+        // Run decode in a blocking task to avoid blocking the async executor.
+        let result = tokio::task::spawn_blocking(move || {
+            decode_from_position_blocking(&path, 0, speed, pitch, device_rate)
+        })
+        .await
+        .map_err(|e| format!("decode task join error: {e}"));
+
+        match result {
+            Ok(Ok((pcm, file_sample_rate, channels, codec, total_frames))) => {
+                let duration_sec =
+                    (total_frames as f64 / file_sample_rate as f64).round() as u64;
+                self.file_sample_rate = file_sample_rate;
+                self.channels = channels;
+                self.duration_sec = Some(duration_sec);
+                self.codec_label = codec.clone();
+                self.actual_kbps = self.file_bytes_len.and_then(|bytes_len| {
+                    if duration_sec > 0 {
+                        Some(
+                            (bytes_len as u64 * 8 / 1000 / duration_sec.max(1))
+                                as u32,
+                        )
+                    } else {
+                        None
+                    }
+                });
+                if self.lossless_requested {
+                    self.lossless_fulfilled =
+                        codec.as_ref().map(|c| is_lossless_codec_label(c)).unwrap_or(false);
+                }
+
+                let mut buf = self
+                    .audio_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                buf.pcm = pcm;
+                buf.read_pos = 0;
+                buf.consumed_total = 0;
+                buf.channels = channels;
+                buf.file_sample_rate = file_sample_rate;
+                buf.speed = self.speed;
+                buf.pitch = self.pitch;
+                drop(buf);
+
+                info!(
+                    "file decode complete (sync): duration {}s codec {:?}",
+                    duration_sec, codec
+                );
+            }
+            Ok(Err(e)) => {
+                error!("file decode failed: {}", e);
+                self.stop().await;
+            }
+            Err(_) => {
+                error!("file decode task panicked");
+                self.stop().await;
+            }
         }
     }
 }
@@ -2308,7 +2398,7 @@ fn decode_from_position_blocking(
         total_frames += (tail.len() / channels as usize) as u64;
     }
 
-    Ok((pcm, file_sample_rate, channels, codec, total_frames))
+Ok((pcm, file_sample_rate, channels, codec, total_frames))
 }
 
 /// Input chunk size (frames per channel) that rubato's `SincFixedIn` demands

@@ -13,7 +13,9 @@ with the new version heading.
 
 ## [Unreleased]
 
-### Added
+### Fixed
+- Local file playback no longer fails when the cache disk is full: if a `file://` URL points to a locally accessible file, the server now streams it directly instead of copying to cache; on ENOSPC during copy, it logs a warning and falls back to direct streaming.
+- Cache directory is now recreated automatically if deleted at runtime: `StorageManager::ensure_cache_dir()` is called before cache operations, so the server recovers from manual cache deletion without restart.
 - `[server] loglevel` config key (`error`/`warn`/`info`/`debug`/`trace`):
   the documented, platform-independent way to turn on server-side `tracing`
   diagnostics without exporting `RUST_LOG` in a service `run` script.

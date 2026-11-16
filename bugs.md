@@ -304,3 +304,37 @@ This clamp was designed to prevent trailing container garbage from inflating `du
 - Verify `duration_sec` is correctly reported for finite files (via background decode completion) and `null` for live streams (unknown duration)
 
 **Note:** The client-side issue remains — the l337-player should prefer `file://` URL for local files accessible to the server, only falling back to `/player/play/stream` when the server cannot access the file. This is tracked separately.
+
+---
+
+## Bug: Local file playback fails when cache disk is full (OPEN)
+
+**Reproduced 2026-11-16.** When the root filesystem (`/`) is 100% full, playing a local file via `file://` URL fails with:
+
+```
+{"error":"failed to copy local file: No space left on device (os error 28)","ok":false}
+```
+
+**Root cause.** The server's `/player/play` endpoint, when receiving a `file://` URL for a local file on the same machine, attempts to **copy the file to its cache directory** (`/home/l337/.cache/l337-audio-server/cache/`) before streaming. This copy is unnecessary for local files that the server can read directly — it only serves a purpose for:
+- Transcoding (format conversion)
+- Remote URLs (download first)
+- Seeking optimization (optional)
+
+When the cache filesystem is full (ENOSPC), the copy fails and the entire playback fails with 500, even though the source file is perfectly readable.
+
+**Expected behavior.** For `file://` URLs pointing to locally accessible files:
+1. **Stream directly from source** — open the file and stream it, no cache copy
+2. Only use cache when **transcoding is required** or for **remote URLs**
+3. If cache copy is attempted and fails with ENOSPC, **log a warning and fall back to direct streaming** — playback should succeed
+
+**Fix needed.** In the play endpoint handler, detect `file://` URLs and:
+- Check if the path is locally accessible (same filesystem/machine)
+- If yes, open the file directly and stream it
+- Only copy to cache if transcoding is needed or explicitly requested
+- Add ENOSPC handling: on `std::io::ErrorKind::OutOfSpace`, log warning and stream from source
+- Add ENOENT handling: if cache dir doesn't exist, create it or fall back to direct streaming
+- **Also:** report a clear error code + warning (e.g., `"error": "cache disk full"`) but **do not block playback** — stream directly from source instead of returning 500
+
+**Impact.** Users with full root disks cannot play local files, even though the files are on a separate mount with plenty of space (`/mnt/data2` has 6.7G free). This is a regression from the intended design where local files stream directly. Additionally, deleting the cache directory causes `ENOENT` errors instead of graceful recreation/fallback.
+
+**Verification.** Fill root disk, attempt to play a local file via `file://` URL — should play successfully with a warning log entry about cache space. Delete cache dir, attempt playback — should recreate dir or stream directly without error.

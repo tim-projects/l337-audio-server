@@ -206,6 +206,14 @@ impl StorageManager {
         Some(self.cache_dir.join(track_id))
     }
 
+    /// Ensure the cache directory exists (handles case where it was deleted at runtime).
+    pub async fn ensure_cache_dir(&self) -> std::io::Result<()> {
+        if !self.cache_dir.exists() {
+            fs::create_dir_all(&self.cache_dir).await?;
+        }
+        Ok(())
+    }
+
     pub fn get_active_slot_path(&self, slot: &str) -> PathBuf {
         self.cache_dir.join(format!("{}.stream", slot))
     }
