@@ -76,6 +76,9 @@ impl ChallengeState {
     pub async fn issue(&self) -> Result<(), ChallengeError> {
         let inner = self.inner.lock().await;
         let token = generate_token();
+        if let Some(parent) = inner.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         crate::secrets_fs::atomic_write_secret(&inner.path, &token)?;
         warn!("Issued new auth challenge token at {}", inner.path.display());
         Ok(())

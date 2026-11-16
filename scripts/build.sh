@@ -1,12 +1,13 @@
 #!/bin/bash
-# Build the L337 Audio Server and place the binary in ./bin
+# Build the L337 Audio Server.
 #
 # If cargo/rustc is not found on PATH, this script will download rustup and
 # install a minimal Rust toolchain into /tmp/cargo/ automatically.
 #
 # The build uses a scratch directory under /tmp (CARGO_TARGET_DIR) so it works
 # even when the in-tree ./target is a broken mount/symlink. The finished binary
-# is always copied to ./bin/l337-audio-server for the installer to deploy.
+# stays in the cargo target directory (default /tmp/l337-build/release/).
+# The run script (scripts/run-server.sh) picks it up from there.
 #
 # Usage:
 #   ./scripts/build.sh                                       # native release build
@@ -158,11 +159,7 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
-mkdir -p bin
-cp -f "$SRC" bin/l337-audio-server
-chmod +x bin/l337-audio-server
-
-echo "Build complete. Binary available at bin/l337-audio-server"
+echo "Build complete. Binary available at $SRC"
 
 # Run a fast compilation check to catch breakage before deployment.
 if [ "$NO_CHECK" -ne 1 ]; then
