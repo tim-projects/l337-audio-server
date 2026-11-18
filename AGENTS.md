@@ -214,6 +214,8 @@ the live server's socket, port, token, or runtime dir:
    rm -rf /tmp/l337-test
    ```
 
+**Playback failure rule:** If the user reports a failure (stutters, drops, silence, wrong speed, etc.) during a live playback test, **immediately stop/pause the playback** via `POST /player/stop` or `POST /player/pause` before continuing investigation. A running broken stream can mask the root cause (e.g., buffer state, decoder position) and wastes the user's time.
+
 To test with real audio output instead of dummy mode, drop `--dummy` and set
 `PIPEWIRE_RUNTIME_DIR`/`PULSE_SERVER` to your live user session's sockets — the
 socket/port/token isolation above still keeps it separate from the running server

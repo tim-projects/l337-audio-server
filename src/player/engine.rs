@@ -146,6 +146,8 @@ pub struct PlayerEngine {
     /// immediately instead of blocking on full-file decode (which can be
     /// throttled by the rebuffer window). Result is collected in `get_status`.
     file_decode_handle: Option<tokio::task::JoinHandle<Result<(u32, u16, Option<String>, u64), String>>>,
+    /// Vorbis decode thread handle (std thread with 8MB stack for libvorbis FFI).
+    vorbis_decode_handle: Option<std::thread::JoinHandle<()>>,
     /// Compressed file size of the currently playing file (for actual_kbps).
     file_bytes_len: Option<u64>,
     /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
@@ -263,6 +265,7 @@ impl PlayerEngine {
             streaming: None,
             decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
+            vorbis_decode_handle: None,
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -317,6 +320,7 @@ impl PlayerEngine {
             streaming: None,
             decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
+            vorbis_decode_handle: None,
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -732,6 +736,126 @@ impl PlayerEngine {
         &mut self,
         path: &PathBuf,
     ) -> Result<(u32, u16, Option<String>, u64), String> {
+        // For Vorbis with native libvorbis FFI: decode in main async context
+        // to avoid FFI segfaults in tokio blocking thread / custom thread.
+        // Detect Vorbis by file extension (simple and reliable for Ogg Vorbis).
+        let is_vorbis = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ogg"))
+            .unwrap_or(false);
+
+        #[cfg(feature = "vorbis")]
+        if is_vorbis {
+            // Decode Vorbis in main async context to avoid FFI issues in blocking thread
+            let (mut pcm, file_sample_rate, channels, _duration_sec) =
+                crate::player::vorbis::decode_vorbis_file(path)?;
+
+            // Upmix mono to stereo if needed (stream is always stereo)
+            if channels == 1 {
+                let mut stereo = Vec::with_capacity(pcm.len() * 2);
+                for &sample in &pcm {
+                    stereo.push(sample);
+                    stereo.push(sample);
+                }
+                pcm = stereo;
+            }
+
+            // Apply speed/pitch/resample if needed
+            let tempo = self.speed;
+            let mut stretcher = if tempo != 1.0 {
+                wsola::TimeStretch::new(file_sample_rate, 2)
+                    .ok()
+                    .map(|mut ts| {
+                        ts.set_tempo(tempo);
+                        ts
+                    })
+            } else {
+                None
+            };
+            let mut shifter = if self.pitch != 1.0 {
+                Some(pitch_shift::Shifter::new(Box::new(
+                    [0.0f32; pitch_shift::TOTAL_F32],
+                )))
+            } else {
+                None
+            };
+            let shift_semitones = if self.pitch != 1.0 {
+                Some(12.0 * (self.pitch as f64).log2() as f32)
+            } else {
+                None
+            };
+            let device_rate = {
+                let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                buf.sample_rate
+            };
+            let mut resampler = crate::player::engine::InterleavedResampler::new(2, file_sample_rate, device_rate);
+            let mut total_frames: u64 = 0;
+
+            if let Some(ref mut stretcher) = stretcher {
+                stretcher.push(&pcm);
+                let mut pulled = Vec::new();
+                loop {
+                    let batch = stretcher.pull(4096);
+                    if batch.is_empty() { break; }
+                    pulled.extend_from_slice(&batch);
+                }
+                pcm = pulled;
+            }
+            if let (Some(ref mut shifter), Some(semitones)) = (shifter.as_mut(), shift_semitones) {
+                let ch = 2;
+                let mut input_planar = vec![Vec::new(); ch];
+                for frame in pcm.chunks(ch) {
+                    for (c, &sample) in frame.iter().enumerate() {
+                        input_planar[c].push(sample);
+                    }
+                }
+                let mut pitched_planar: Vec<Vec<f32>> = vec![Vec::new(); ch];
+                for c in 0..ch {
+                    for chunk in input_planar[c].chunks(128) {
+                        let mut buf = [0.0f32; 128];
+                        for (i, &s) in chunk.iter().enumerate() {
+                            buf[i] = s;
+                        }
+                        let result = shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                        pitched_planar[c].extend_from_slice(result);
+                    }
+                }
+                let out_frames = pitched_planar[0].len();
+                pcm = Vec::with_capacity(out_frames * ch);
+                for f in 0..out_frames {
+                    for c in 0..ch {
+                        pcm.push(pitched_planar[c][f]);
+                    }
+                }
+            }
+            let resampled = resampler.process(&pcm);
+            let frames = (resampled.len() / 2) as u64;
+            total_frames += frames;
+
+            // Write to buffer with throttling
+            let audio_buffer = self.audio_buffer.clone();
+            let decode_cancel = self.decode_cancel.clone();
+            let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            ab.channels = 2;
+            ab.file_sample_rate = file_sample_rate;
+            ab.pcm.extend_from_slice(&resampled);
+            ab.notify_data();
+            total_frames += frames;
+            ab.decoded_frames = ab.decoded_frames.saturating_add(frames);
+            let over = ab.exceeds_window();
+            if over {
+                ab.reclaim_consumed();
+            }
+            let space_notify = ab.space_notify.clone();
+            drop(ab);
+            if over {
+                crate::platform::common::AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+            }
+
+            return Ok((file_sample_rate, 2, Some("vorbis".to_string()), total_frames));
+        }
+
+        // Non-Vorbis: use blocking thread for Opus/Symphonia
         let audio_buffer = self.audio_buffer.clone();
         let path = path.clone();
         let speed = self.speed;
@@ -742,22 +866,32 @@ impl PlayerEngine {
         };
 
         let decode_cancel = self.decode_cancel.clone();
-        tokio::task::spawn_blocking(move || {
-            decode_file_incremental_blocking(
-                &path,
-                audio_buffer,
-                decode_cancel,
-                speed,
-                pitch,
-                device_rate,
-            )
-        })
-        .await
-        .map_err(|e| format!("decode task join error: {e}"))?
+        let path = path.clone();
+        let audio_buffer = audio_buffer.clone();
+        
+        // Use custom thread with larger stack (8MB) to avoid stack overflow
+        // in libvorbis/opus FFI decode which uses significant stack space.
+        let handle = std::thread::Builder::new()
+            .name("l337-decode".into())
+            .stack_size(8 * 1024 * 1024) // 8MB
+            .spawn(move || {
+                decode_file_incremental_blocking(
+                    &path,
+                    audio_buffer,
+                    decode_cancel,
+                    speed,
+                    pitch,
+                    device_rate,
+                )
+            })
+            .map_err(|e| format!("failed to spawn decode thread: {e}"))?;
+        
+        handle.join().map_err(|e| format!("decode thread panicked: {e:?}"))?
     }
 
     pub async fn load_and_play(&mut self, slot: &str, direct_path: Option<PathBuf>) {
-        info!("load_and_play: called with slot={}, direct_path={:?}, is_dummy={}", slot, direct_path.as_ref().map(|p| p.display()), self.is_dummy);
+        let slot_owned = slot.to_owned();
+        info!("load_and_play: called with slot={}, direct_path={:?}, is_dummy={}", slot_owned, direct_path.as_ref().map(|p| p.display()), self.is_dummy);
         self.ensure_stream();
         if self.has_backend_error() {
             return;
@@ -809,33 +943,271 @@ impl PlayerEngine {
         if self.is_dummy {
             self.decode_file_sync(&path).await;
         } else {
-            // OPT-13: decode incrementally into the audio buffer instead of
-            // allocating the whole decoded PCM at once (peak RSS ~ compressed
-            // size x 2-2.5 for hour-long tracks). Run decode in a background
-            // task so `load_and_play` returns immediately instead of blocking
-            // on decode while the rebuffer window throttles the producer.
-            let audio_buffer_clone = self.audio_buffer.clone();
-            let path_clone = path.clone();
-            let speed = self.speed;
-            let pitch = self.pitch;
-            let device_rate = {
-                let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                buf.sample_rate
-            };
+            info!("load_and_play: not dummy, checking Vorbis");
+            // Check if Vorbis (Ogg) - decode natively in main async context to avoid
+            // FFI segfaults in tokio blocking thread. Other codecs use blocking task.
+            let is_vorbis = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("ogg"))
+                .unwrap_or(false);
+            info!("load_and_play: is_vorbis = {}", is_vorbis);
 
-            let decode_cancel = self.decode_cancel.clone();
-            decode_cancel.store(false, Ordering::SeqCst);
-            let decode_handle = tokio::task::spawn_blocking(move || {
-                decode_file_incremental_blocking(
-                    &path_clone,
-                    audio_buffer_clone,
-                    decode_cancel,
-                    speed,
-                    pitch,
-                    device_rate,
-                )
-            });
-            self.file_decode_handle = Some(decode_handle);
+            #[cfg(feature = "vorbis")]
+            if is_vorbis {
+                info!("load_and_play: Starting Vorbis incremental native decode in dedicated thread");
+                let audio_buffer = self.audio_buffer.clone();
+                let path = path.clone();
+                let speed = self.speed;
+                let pitch = self.pitch;
+                let device_rate = {
+                    let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    buf.sample_rate
+                };
+                let decode_cancel = self.decode_cancel.clone();
+                decode_cancel.store(false, Ordering::SeqCst);
+
+                let slot_for_thread = slot_owned.clone();
+                let slot_for_error = slot_for_thread.clone();
+                let decode_handle = std::thread::Builder::new()
+                    .name("l337-vorbis-decode".into())
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        // Wrap in catch_unwind to catch any panics
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // Incremental Vorbis decode using native libvorbis FFI
+                            let mut decoder = match crate::player::vorbis::VorbisDecoderHandle::open(&path) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    error!("load_and_play({}): Vorbis decoder open failed: {}", slot_for_thread, e);
+                                    return;
+                                }
+                            };
+                            let (channels, file_sample_rate, duration_sec, _total_samples) = match decoder.get_info() {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    error!("load_and_play({}): Vorbis get_info failed: {}", slot_for_thread, e);
+                                    return;
+                                }
+                            };
+                            info!("load_and_play({}): Vorbis info: channels={}, sample_rate={}, duration={:.1}s", slot_for_thread, channels, file_sample_rate, duration_sec);
+                            info!("load_and_play({}): After get_info, before stretch/pitch setup", slot_for_thread);
+
+                            // Upmix mono to stereo if needed (stream is always stereo)
+                            let target_channels = if channels == 1 { 2 } else { channels };
+                            let target_channels_usize = target_channels as usize;
+                            info!("load_and_play({}): target_channels={}", slot_for_thread, target_channels);
+                            
+                            // Prepare stretch/pitch/resample
+                            let tempo = speed;
+                            let mut stretcher = if tempo != 1.0 {
+                                wsola::TimeStretch::new(file_sample_rate, target_channels)
+                                    .ok()
+                                    .map(|mut ts| {
+                                        ts.set_tempo(tempo);
+                                        ts
+                                    })
+                            } else {
+                                None
+                            };
+                            let mut shifter = if pitch != 1.0 {
+                                Some(pitch_shift::Shifter::new(Box::new(
+                                    [0.0f32; pitch_shift::TOTAL_F32],
+                                )))
+                            } else {
+                                None
+                            };
+                            let shift_semitones = if pitch != 1.0 {
+                                Some(12.0 * (pitch as f64).log2() as f32)
+                            } else {
+                                None
+                            };
+                            let mut resampler = crate::player::engine::InterleavedResampler::new(target_channels, file_sample_rate, device_rate);
+                            let mut total_frames: u64 = 0;
+                            let chunk_size = 4096 * target_channels_usize; // frames * channels
+
+                            // Buffer for decoded PCM (interleaved, target_channels)
+                            let mut pcm_buffer = vec![0.0f32; chunk_size];
+
+                            let mut chunk_count = 0;
+                            loop {
+                                if decode_cancel.load(Ordering::SeqCst) {
+                                    info!("load_and_play({}): Vorbis decode cancelled", slot_for_thread);
+                                    break;
+                                }
+
+                                let samples_read = match decoder.read_chunk(&mut pcm_buffer) {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        error!("load_and_play({}): Vorbis read error: {}", slot_for_thread, e);
+                                        break;
+                                    }
+                                };
+                                if samples_read == 0 {
+                                    info!("load_and_play({}): Vorbis EOF reached after {} chunks (first read returned 0)", slot_for_thread, chunk_count);
+                                    break; // EOF
+                                }
+
+                                chunk_count += 1;
+                                if chunk_count <= 3 || chunk_count % 1000 == 0 {
+                                    info!("load_and_play({}): Vorbis chunk {}: samples_read={}", slot_for_thread, chunk_count, samples_read);
+                                }
+
+                                let frames = samples_read / target_channels_usize;
+                                let pcm_chunk = &pcm_buffer[..samples_read];
+
+                                // Upmix mono to stereo if needed
+                                let mut pcm_to_process: Vec<f32>;
+                                let mut pcm_ref = pcm_chunk;
+                                if channels == 1 && target_channels == 2 {
+                                    pcm_to_process = Vec::with_capacity(samples_read * 2);
+                                    for &sample in pcm_chunk {
+                                        pcm_to_process.push(sample);
+                                        pcm_to_process.push(sample);
+                                    }
+                                    pcm_ref = &pcm_to_process;
+                                }
+
+                                // Apply speed/pitch/resample
+                                let mut processed = pcm_ref.to_vec();
+                                if let Some(ref mut stretcher) = stretcher {
+                                    stretcher.push(pcm_ref);
+                                    let mut pulled = Vec::new();
+                                    loop {
+                                        let batch = stretcher.pull(4096);
+                                        if batch.is_empty() { break; }
+                                        pulled.extend_from_slice(&batch);
+                                    }
+                                    processed = pulled;
+                                }
+                                if let (Some(ref mut shifter), Some(semitones)) = (shifter.as_mut(), shift_semitones) {
+                                    let ch = target_channels_usize;
+                                    let mut input_planar = vec![Vec::new(); ch];
+                                    for frame in processed.chunks(ch) {
+                                        for (c, &sample) in frame.iter().enumerate() {
+                                            input_planar[c].push(sample);
+                                        }
+                                    }
+                                    let mut pitched_planar: Vec<Vec<f32>> = vec![Vec::new(); ch];
+                                    for c in 0..ch {
+                                        for chunk in input_planar[c].chunks(128) {
+                                            let mut buf = [0.0f32; 128];
+                                            for (i, &s) in chunk.iter().enumerate() {
+                                                buf[i] = s;
+                                            }
+                                            let result = shifter.shift(&buf, semitones, 128, file_sample_rate as f32);
+                                            pitched_planar[c].extend_from_slice(result);
+                                        }
+                                    }
+                                    let out_frames = pitched_planar[0].len();
+                                    processed = Vec::with_capacity(out_frames * ch);
+                                    for f in 0..out_frames {
+                                        for c in 0..ch {
+                                            processed.push(pitched_planar[c][f]);
+                                        }
+                                    }
+                                }
+                                let resampled = resampler.process(&processed);
+                                let frames = (resampled.len() / target_channels_usize) as u64;
+
+                                // Write to buffer with throttling
+                                let chunk_samples = 4096 * target_channels_usize;
+                                let mut off = 0;
+                                while off < resampled.len() {
+                                    let end = (off + chunk_samples).min(resampled.len());
+                                    let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                                    ab.channels = target_channels;
+                                    ab.file_sample_rate = file_sample_rate;
+                                    ab.pcm.extend_from_slice(&resampled[off..end]);
+                                    ab.notify_data();
+                                    let chunk_frames = ((end - off) / target_channels_usize) as u64;
+                                    total_frames += chunk_frames;
+                                    ab.decoded_frames = ab.decoded_frames.saturating_add(chunk_frames);
+                                    let over = ab.exceeds_window();
+                                    if over {
+                                        ab.reclaim_consumed();
+                                    }
+                                    let space_notify = ab.space_notify.clone();
+                                    drop(ab);
+                                    if over {
+                                        crate::platform::common::AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                                    }
+                                    off = end;
+                                }
+                            }
+
+                            // Flush resampler tail
+                            let tail = resampler.finish();
+                            if !tail.is_empty() {
+                                let chunk_samples = 4096 * target_channels_usize;
+                                let mut off = 0;
+                                while off < tail.len() {
+                                    let end = (off + chunk_samples).min(tail.len());
+                                    let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                                    ab.channels = target_channels;
+                                    ab.file_sample_rate = file_sample_rate;
+                                    ab.pcm.extend_from_slice(&tail[off..end]);
+                                    ab.notify_data();
+                                    let chunk_frames = ((end - off) / target_channels_usize) as u64;
+                                    total_frames += chunk_frames;
+                                    ab.decoded_frames = ab.decoded_frames.saturating_add(chunk_frames);
+                                    let over = ab.exceeds_window();
+                                    if over {
+                                        ab.reclaim_consumed();
+                                    }
+                                    let space_notify = ab.space_notify.clone();
+                                    drop(ab);
+                                    if over {
+                                        crate::platform::common::AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                                    }
+                                    off = end;
+                                }
+                            }
+
+                            info!("load_and_play({}): Vorbis decode complete: total_frames={}, chunks={}", slot_for_thread, total_frames, chunk_count);
+                        }));
+                        
+                        if let Err(e) = result {
+                            error!("load_and_play({}): Vorbis decode thread panicked: {:?}", slot_for_thread, e);
+                        }
+                    });
+
+                let decode_handle = match decode_handle {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("load_and_play({}): failed to spawn Vorbis decode thread: {}", slot_for_error, e);
+                        return;
+                    }
+                };
+                self.vorbis_decode_handle = Some(decode_handle);
+            } else {
+                // OPT-13: decode incrementally into the audio buffer instead of
+                // allocating the whole decoded PCM at once (peak RSS ~ compressed
+                // size x 2-2.5 for hour-long tracks). Run decode in a background
+                // task so `load_and_play` returns immediately instead of blocking
+                // on decode while the rebuffer window throttles the producer.
+                let audio_buffer_clone = self.audio_buffer.clone();
+                let path_clone = path.clone();
+                let speed = self.speed;
+                let pitch = self.pitch;
+                let device_rate = {
+                    let buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    buf.sample_rate
+                };
+
+                let decode_cancel = self.decode_cancel.clone();
+                decode_cancel.store(false, Ordering::SeqCst);
+                let decode_handle = tokio::task::spawn_blocking(move || {
+                    decode_file_incremental_blocking(
+                        &path_clone,
+                        audio_buffer_clone,
+                        decode_cancel,
+                        speed,
+                        pitch,
+                        device_rate,
+                    )
+                });
+                self.file_decode_handle = Some(decode_handle);
+            }
         }
 
         // Playback was started before decode; decode runs in background and
@@ -845,6 +1217,7 @@ impl PlayerEngine {
             slot,
             path.display()
         );
+        info!("load_and_play: returning ok response");
     }
 
     pub fn pause(&mut self) {
@@ -911,6 +1284,13 @@ impl PlayerEngine {
                 Err(_elapsed) => {
                     tracing::warn!("file decode task did not stop within 5 s after cancel");
                 }
+            }
+        }
+        // Also wait for Vorbis decode thread (std thread with 8MB stack)
+        if let Some(handle) = self.vorbis_decode_handle.take() {
+            self.decode_cancel.store(true, Ordering::SeqCst);
+            if let Err(_e) = handle.join() {
+                tracing::warn!("Vorbis decode thread panicked during stop");
             }
         }
         // Pause the backend stream instead of destroying it from the engine
@@ -1425,6 +1805,10 @@ impl PlayerEngine {
                 && self
                     .file_decode_handle
                     .as_ref()
+                    .map_or(true, |h| h.is_finished())
+                && self
+                    .vorbis_decode_handle
+                    .as_ref()
                     .map_or(true, |h| h.is_finished());
             let unconsumed = buf.pcm.len().saturating_sub(buf.read_pos);
             (decode_done, unconsumed)
@@ -1478,6 +1862,24 @@ impl PlayerEngine {
                         }
                         Err(_) => {
                             error!("file decode task panicked");
+                            self.stop().await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect Vorbis decode result when it finishes (std::thread handle)
+        if self.vorbis_decode_handle.is_some() {
+            if let Some(handle) = &self.vorbis_decode_handle {
+                if handle.is_finished() {
+                    let handle = self.vorbis_decode_handle.take().unwrap();
+                    match handle.join() {
+                        Ok(_) => {
+                            info!("Vorbis decode complete (thread joined)");
+                        }
+                        Err(_) => {
+                            error!("Vorbis decode thread panicked");
                             self.stop().await;
                         }
                     }
@@ -1904,14 +2306,22 @@ fn decode_file_incremental_blocking(
             }
             last_pts = Some(ts);
             packet_count += 1;
-            if packet_count > 10_000 {
-                break;
-            }
             let out = opus_dec.push(packet.buf());
             if !out.is_empty() {
-                let frames = (out.len() / head.channels as usize) as u64;
+                // Opus path: upmix mono to stereo so the buffer matches the
+                // stereo stream (same as Symphonia path at lines 2060-2071).
+                let mut write_out = out;
+                if head.channels == 1 {
+                    let mut stereo = Vec::with_capacity(out.len() * 2);
+                    for &sample in &out {
+                        stereo.push(sample); // L
+                        stereo.push(sample); // R
+                    }
+                    write_out = stereo;
+                }
+                let frames = (write_out.len() / 2) as u64; // always stereo frames
                 let mut ab = audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
-                ab.pcm.extend_from_slice(&out);
+                ab.pcm.extend_from_slice(&write_out);
                 ab.notify_data();
                 total_frames += frames;
                 ab.decoded_frames = ab.decoded_frames.saturating_add(frames);
@@ -1929,10 +2339,18 @@ fn decode_file_incremental_blocking(
                 }
             }
         }
-        return Ok((48000, head.channels, codec, total_frames));
+        return Ok((48000, 2, codec, total_frames));
+    }
+// Vorbis: use symphonia incremental decode (native FFI is one-shot, causes writer starvation).
+    // The native vorbis path via libvorbis FFI decodes entire file before pushing PCM,
+    // which starves the writer for ~track_length/11 seconds. Symphonia's pure-Rust
+    // Vorbis decoder is slower but incremental, so writer gets data continuously.
+    #[cfg(feature = "vorbis")]
+    if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_VORBIS {
+        info!("decode_file_incremental_blocking: Vorbis using symphonia path (native FFI skipped)");
     }
 
-    // Non-Opus: decode via Symphonia.
+    // Non-Opus/Vorbis: decode via Symphonia.
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &Default::default())
         .map_err(|e| format!("decoder init: {e}"))?;

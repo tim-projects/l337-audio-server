@@ -3,7 +3,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::common::{AudioBackend, AudioOutputStream, AudioBuffer};
 
@@ -53,16 +53,15 @@ const PA_STREAM_AUTO_TIMING_UPDATE: u32 = 0x0008;
 
 /// Target sink-side buffer, in milliseconds.
 ///
-/// A ~100 ms delay is inaudible for music and works like a jitter buffer: it
-/// absorbs short writer stalls (the device report of whole-process freezes,
-/// and ordinary scheduler jitter) that a just-in-time writer would otherwise
-/// pass straight to the sink as a drop. PulseAudio tunes this *down* to
-/// whatever the device allows unless the stream asks for a specific latency,
-/// and it overrides the request while PA_STREAM_ADJUST_LATENCY is set — so the
-/// request has to be explicit and that flag must go. maxlength stays bounded
-/// (see the buffer_attr below) so the backlog can never grow without limit
-/// (the BUG-2 property).
-const PULSE_SINK_TARGET_MSECS: u32 = 60;
+/// A ~200 ms delay is inaudible for music and works like a jitter buffer: it
+/// absorbs writer stalls (process freezes, scheduler jitter) that a tight
+/// 60 ms buffer would pass straight to the sink as a drop. PulseAudio tunes
+/// this down to whatever the device allows unless the stream asks for a
+/// specific latency, and it overrides the request while PA_STREAM_ADJUST_LATENCY
+/// is set — so the request has to be explicit and that flag must go.
+/// maxlength stays bounded (see the buffer_attr below) so the backlog can never
+/// grow without limit (the BUG-2 property).
+const PULSE_SINK_TARGET_MSECS: u32 = 200;
 
 // pa_seek_mode_t
 const PA_SEEK_RELATIVE: c_int = 0;
@@ -225,7 +224,8 @@ pub struct PulseAudioAudioOutputStream {
 }
 
 impl PulseAudioAudioOutputStream {
-    fn writer_loop(state: Arc<PulseAudioState>, rate: u32, channels: u16) {
+fn writer_loop(state: Arc<PulseAudioState>, rate: u32, channels: u16) {
+        tracing::info!("PulseAudio: writer_loop started (rate={}, channels={})", rate, channels);
         // Consecutive starved polls during playback. One poll (~10 ms) is
         // inside the sink's own buffer and inaudible; a sustained drain is a
         // real drop, and this also skips the end-of-track tail (the writer
@@ -238,12 +238,18 @@ impl PulseAudioAudioOutputStream {
         // shared buffer: the buffer's `channels` is 0 before the engine fills it
         // and can disagree with the negotiated sample spec. A 2026-11-06 device
         // report traced audible drops to exactly that — a 2ch stream paced with
-        // a 1ch assumption wrote 42.7 ms of audio every 85 ms, so the sink's
+        // a 1ch assumption wrote 42.7 ms audio every 85 ms, so the sink's
         // ~43 ms buffer ran dry twice per chunk.
         let rate = rate.max(1);
         let channels = channels.max(1);
 
+        let mut iteration: u64 = 0;
         loop {
+            iteration += 1;
+            if iteration % 100 == 0 {
+                tracing::info!("PulseAudio: writer loop iteration {}", iteration);
+            }
+            let start = std::time::Instant::now();
             if state.cancel.load(Ordering::Relaxed) || state.backend_error.load(Ordering::SeqCst) {
                 break;
             }
@@ -277,57 +283,83 @@ impl PulseAudioAudioOutputStream {
             // Returns frames of audio written this iteration (0 = silence/starved),
             // so the writer can pace itself to the device clock (G4).
             let outcome: Result<usize, String> = (|| {
-                let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
-                let available = buf.pcm.len().saturating_sub(buf.read_pos);
+                // Step 1: Prepare data while holding locks
+                let (to_write, to_copy_frames, is_silence, silence_len) = {
+                    let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    let available = buf.pcm.len().saturating_sub(buf.read_pos);
+                    tracing::debug!("PulseAudio: available={}, read_pos={}, playing={}", available, buf.read_pos, playing);
 
-                if available > 0 {
-                    let to_copy = available.min(CHUNK_FRAMES);
-                    let volume = *state.volume.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut samples = vec![0.0f32; to_copy];
-                    for (dst, src) in samples
-                        .iter_mut()
-                        .zip(buf.pcm[buf.read_pos..buf.read_pos + to_copy].iter())
-                    {
-                        *dst = src * volume;
+                    if available > 0 {
+                        tracing::debug!("PulseAudio: writing audio, available={}", available);
+                        let to_copy = available.min(CHUNK_FRAMES);
+                        let volume = *state.volume.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut samples = vec![0.0f32; to_copy];
+                        for (dst, src) in samples
+                            .iter_mut()
+                            .zip(buf.pcm[buf.read_pos..buf.read_pos + to_copy].iter())
+                        {
+                            *dst = src * volume;
+                        }
+                        let data = unsafe { samples.align_to::<u8>().1 };
+                        let to_write = data.to_vec(); // Copy to owned Vec for use after unlock
+                        drop(buf);
+                        (Some(to_write), to_copy, false, 0)
+                    } else if !playing {
+                        drop(buf);
+                        (None, 0, true, silence.len())
+                    } else {
+                        tracing::warn!("PulseAudio: starved while playing, available=0, playing=true");
+                        drop(buf);
+                        (None, 0, true, silence.len())
                     }
-                    let data = unsafe { samples.align_to::<u8>().1 };
-                    buf.read_pos += to_copy;
+                };
+
+                // Step 2: Write WITHOUT holding the mainloop lock (prevents deadlock)
+                let wrote = if let Some(data) = to_write.as_ref() {
+                    unsafe {
+                        pa_stream_write(
+                            stream_ptr,
+                            data.as_ptr() as *const c_void,
+                            data.len(),
+                            std::ptr::null(),
+                            0,
+                            PA_SEEK_RELATIVE,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        pa_stream_write(stream_ptr, silence.as_ptr() as *const c_void, silence_len, std::ptr::null(), 0, PA_SEEK_RELATIVE)
+                    }
+                };
+
+                if wrote < 0 {
+                    return Err("pa_stream_write failed".to_string());
+                }
+
+                // Step 3: Re-lock and update state
+                if to_write.is_some() {
+                    // pa_stream_write returns 0 on success (not bytes written).
+                    // We assume all frames were accepted since we passed the full buffer.
+                    let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    buf.read_pos += to_copy_frames;
                     // Reclaim consumed samples at a checkpoint so the Vec shrinks
                     // (keep memory bounded, independent of track length — G4).
                     if buf.read_pos >= (1 << 20) {
                         buf.reclaim_consumed();
                     }
-                    drop(buf);
-                    // pa_stream_write with a NULL free callback copies the data.
-                    if unsafe {
-                        pa_stream_write(stream_ptr, data.as_ptr() as *const c_void, data.len(), std::ptr::null(), 0, PA_SEEK_RELATIVE)
-                    } < 0
-                    {
-                        return Err("pa_stream_write failed".to_string());
-                    }
-                    Ok(to_copy as usize)
+                    Ok(to_copy_frames)
                 } else if !playing {
-                    drop(buf);
-                    // Keep the device awake with silence while paused.
-                    if unsafe {
-                        pa_stream_write(stream_ptr, silence.as_ptr() as *const c_void, silence.len(), std::ptr::null(), 0, PA_SEEK_RELATIVE)
-                    } < 0
-                    {
-                        return Err("pa_stream_write (silence) failed".to_string());
-                    }
+                    tracing::debug!("PulseAudio: paused, writing silence");
                     // Report the samples written so the caller paces this like
                     // audio: an unpaced keep-alive writes ~8x real time and piles
                     // a ~1000 s backlog into the sink-input, which is what made
                     // a *paused* stream look like the unbounded-buffer bug.
                     Ok(silence.len() / 4)
                 } else {
-                    drop(buf);
-                    // Edge-triggered: the writer had nothing to write while
-                    // playback is running, so the sink's buffer ran dry. One
-                    // diagnostic per episode (a device report showed the pacing
-                    // reading the buffer's channel count and starving twice per
-                    // chunk; 60 lines/s made that invisible, one per episode
-                    // does not).
+                    tracing::warn!("PulseAudio: starved while playing, available=0, playing=true");
+                    // Sink buffer ran dry while playing: write silence to keep
+                    // the sink fed instead of letting it underrun (audible gap).
+                    // One diagnostic per starvation episode.
                     let polls = starved_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if polls >= 3 && !starved_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         tracing::warn!(
@@ -335,7 +367,7 @@ impl PulseAudioAudioOutputStream {
                             polls * 10
                         );
                     }
-                    Ok(0)
+                    Ok(silence.len() / 4)
                 }
             })();
 
@@ -349,8 +381,13 @@ impl PulseAudioAudioOutputStream {
                     // Writing again ends any starvation episode.
                     starved_polls.store(0, std::sync::atomic::Ordering::Relaxed);
                     starved_logged.store(false, std::sync::atomic::Ordering::Relaxed);
-                    // Pace to the device clock: read_pos now advances at ~1x (G4).
-                    thread::sleep(Duration::from_secs_f64(pace_seconds(n, rate, channels)));
+                    // Pace to the device clock: account for time spent in the
+                    // write+lock section so the effective rate stays at 1x.
+                    let target = Duration::from_secs_f64(pace_seconds(n, rate, channels));
+                    let elapsed = start.elapsed();
+                    if elapsed < target {
+                        thread::sleep(target - elapsed);
+                    }
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
@@ -533,9 +570,20 @@ impl AudioBackend for PulseAudioAudioBackend {
                 }),
             });
 
+            tracing::info!("PulseAudio: writer thread starting");
             let state_clone = state.clone();
             let thread = thread::spawn(move || {
-                PulseAudioAudioOutputStream::writer_loop(state_clone, sample_rate, channels);
+                tracing::info!("PulseAudio: writer thread spawned");
+                let state_for_loop = state_clone.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracing::info!("PulseAudio: entering writer_loop");
+                    PulseAudioAudioOutputStream::writer_loop(state_for_loop, sample_rate, channels);
+                    tracing::info!("PulseAudio: writer_loop returned normally");
+                }));
+                if result.is_err() {
+                    tracing::error!("PulseAudio: writer thread panicked!");
+                }
+                tracing::info!("PulseAudio: writer thread exiting");
             });
 
             Ok(Box::new(PulseAudioAudioOutputStream {

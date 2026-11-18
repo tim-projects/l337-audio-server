@@ -16,6 +16,9 @@ pulseaudio = ["backend"]
 # Termux it comes from `pkg install libopus`, surfaced via LD_LIBRARY_PATH=$PREFIX/lib).
 # Not enabled by default so cross targets that lack libopus are not forced to link it.
 opus = []
+# Server-side Vorbis decoding via native libvorbis/vorbisfile/ogg (Symphonia's
+# pure-Rust Vorbis is slow on ARM). Requires Termux libvorbis/vorbisfile/ogg.
+vorbis = []
 # Optional QR rendering for pairing (text/Unicode output only; no image encoding).
 qr = ["dep:qrcode"]
 

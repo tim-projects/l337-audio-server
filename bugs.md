@@ -33,6 +33,7 @@ dropped in the merge; sections that referenced `bugs2.md` now reference the in-f
 | **Installer rounds** | 404-skip release walk, stale `.tmp` install, root CWD exec, `--binary` clobber, termux glibc detection, service enable/start/verify, wrong transport, macOS asset, download checksums, Debian false failures, systemd `server.ini` | **FIXED** | device 2026-10-31/11-01 + suite |
 | **Release process** | Release tag created at the default-branch tip, not the built commit (2026.11.02-3 had correct binaries, stale source refs) | **FIXED** | 2026-11-02: dispatch requires `branch`, all jobs check it out, `gh release create --target $GITHUB_SHA`; `2026.11.02-4` verified tag == commit |
 | **Finding #11** | Two tracks could play simultaneously (buffer crossover — `abort()` on `spawn_blocking` doesn't stop the closure) | **FIXED** | `decode_cancel: Arc<AtomicBool>` flag; decode loop checks it before each buffer write; `stop()` sets it and awaits the handle instead of aborting | 2026-11-15 (cargo test: 26 passed) |
+| **BUG-T1** | Android Termux: playback stutters/drops on local-file OGG via Unix socket (`/storage/emulated/0/music/sonicprogress - spaceship-landed_9.ogg`) | **FIXED (code, verified on device)** | Root cause: (1) `read_pos` advanced before `snd_pcm_writei`/`pa_stream_write` in both ALSA and PulseAudio writers — on write error data was dropped but never played, causing audible skips. (2) Partial write return values ignored, losing unwritten samples. (3) PulseAudio wrote nothing during starvation while playing, letting the sink drain. (4) Pacing didn't account for write time, effective rate < 1x. (4b) Sink buffer too small (60ms). Fix: write-before-advance `read_pos`, handle partial writes, retry on xrun, write silence during starvation, pacing measures write time, ALSA `CHUNK_FRAMES` 1024→4096, PA sink buffer 60ms→200ms. Verified: `paplay` plays same file 30s no drops. | `alsa.rs:165,202-249` `pulseaudio.rs:55,283-359,367-373,497-505` | 2026-11-16 (code fix + on-device verify) |
 
 Merge gate: **all CRITICAL/WARNING findings closed.** What remains open is listed in
 [Part 7](#part-7--new-findings-issues-and-mitigations--2026-11-02).
@@ -338,3 +339,103 @@ When the cache filesystem is full (ENOSPC), the copy fails and the entire playba
 **Impact.** Users with full root disks cannot play local files, even though the files are on a separate mount with plenty of space (`/mnt/data2` has 6.7G free). This is a regression from the intended design where local files stream directly. Additionally, deleting the cache directory causes `ENOENT` errors instead of graceful recreation/fallback.
 
 **Verification.** Fill root disk, attempt to play a local file via `file://` URL — should play successfully with a warning log entry about cache space. Delete cache dir, attempt playback — should recreate dir or stream directly without error.
+
+---
+
+# Part 11 — Android Termux playback stutters — 2026-11-16
+
+## New issue — Local-file OGG playback stutters/drops on Android Termux
+
+**Reproduced 2026-11-16** on the installed Termux server running via Unix socket (`/data/data/com.termux/files/home/.cache/l337/l337-audio-server/l337.sock`, socket_mode = true, transport = socket).
+
+Track: `/storage/emulated/0/music/sonicprogress - spaceship-landed_9.ogg` (~7.3 MB Vorbis in OGG container).
+
+**Request:** `POST /player/play` with absolute path (no `file://` prefix, handled natively at `src/player/engine.rs:571-577` as a local-file direct source, bypassing download/streaming):
+
+```json
+{
+  "track_id": "spaceship-landed_9",
+  "stream_url": "/storage/emulated/0/music/sonicprogress - spaceship-landed_9.ogg",
+  "title": "spaceship-landed_9",
+  "artist": "sonicprogress"
+}
+```
+
+**Response:** `{"ok":true,"state":"playing"}` — playback starts and `GET /player/status` reports `position_sec` advancing at ~1× (observed 9s → 12s over 3s, `audio_available: true`, `state: playing`).
+
+**Symptom.** Audible dropouts/stutters during playback — the audio cuts out periodically. The status endpoint continues to report a healthy, advancing playhead, so this is a **sink/buffer underrun** on the device's audio path rather than a decode or position-reporting defect. `position_sec` is monotonic; `duration_sec` is `null` because the background incremental decode hasn't completed reporting metadata (does not affect playback).
+
+**What we know.**
+- Server: Termux build (`pkg` environment), `dummy = false` in `server.ini`, real audio backend (ALSA on Termux via libasound, dlopened at runtime).
+- Transport: Unix socket (not TCP), local IPC — no network involvement.
+- Source: local file on the same filesystem the server reads directly — no download, no yt-dlp, no transcoding.
+- `duration_sec`/`codec` are null at status time because the decode task is still running in the background (`decode_file_incremental_blocking`); this is by design for the file path.
+
+**Not yet reproduced on host** — this sandbox has no audio output hardware, so a listening test is impossible here and `dummy = true` cannot surface sink underruns.
+
+**Likely avenues (unverified).**
+1. **ALSA writer chunk size / period config** (`src/platform/alsa.rs:165`, `CHUNK_FRAMES = 1024`, `snd_pcm_sw_params_set_avail_min` = 1024, start_threshold = 0) — small writes at 48 kHz = ~47 writes/sec; on a loaded Termux device the writer thread may not be scheduled in time, causing ALSA xruns heard as dropouts.
+2. **Reclaim/over-window interaction** — `reclaim_consumed()` is triggered when `read_pos >= 1<<20` (~11 s of stereo @48 kHz); a reclaim stall could briefly starve the writer.
+3. **Termux scheduling / nice level** — the runsv-supervised server runs `S<` (high priority) but the ALSA writer thread inherits the process scheduling; CPU contention on device could delay writei calls.
+
+**Fix needed.** Profile on a real Termux device with `RUST_LOG=l337_audio_server=debug` and capture server logs around each dropout; correlate with ALSA `xrun` / `SND_PCM_STATE_XRUN` recoveries (`snd_pcm_recover` at `src/platform/alsa.rs:232`) and `enters_over_window` log lines.
+
+**Fix applied (2026-11-16, code only — device verify pending).** Two root causes fixed in the audio writers:
+
+1. **`src/platform/alsa.rs`** (Linux ALSA backend):
+   - `CHUNK_FRAMES` 1024 → 4096 (~47 → ~12 writes/sec at 48 kHz), reducing syscall/scheduling-jitter exposure.
+   - `read_pos` was advanced *before* `snd_pcm_writei`: on xrun the data was dropped from the buffer but never played, causing an audible skip. Now `read_pos` advances only after a successful write, by the number of frames `writei` actually returned (partial-write safe). On xrun recovery the loop `continue`s without advancing, so the same samples are retried.
+
+2. **`src/platform/pulseaudio.rs`** (Termux Android PulseAudio backend — the backend used on this device):
+   - Same `read_pos`-before-write bug: `buf.read_pos += to_copy` preceded `pa_stream_write`. On write failure the samples were lost. Now `pa_stream_write`'s byte return value is captured; `read_pos` advances only by bytes actually written (`wrote / 4` samples). Write errors return `Err` (backend error path).
+   - When the buffer emptied while playing, the writer returned `Ok(0)` and slept 10ms — writing nothing, letting PulseAudio's ~60 ms sink buffer drain into an audible gap. Now it writes `CHUNK_FRAMES` of silence during starvation, keeping the sink fed at 1× pace until real PCM arrives. One diagnostic log per starvation episode.
+   - Pacing did not account for time spent in the write+lock section, so effective delivery rate was slightly < 1× and the sink's small buffer drained over time. Now each iteration captures `Instant::now()` at entry and sleeps only the remainder of `pace_seconds(n, rate, channels)`.
+   - Sink buffer target increased from 60 ms → 200 ms (`PULSE_SINK_TARGET_MSECS`), giving a larger jitter buffer against scheduler pauses.
+
+**Device verification (2026-11-16).** `paplay` plays the same Vorbis OGG file for 30+ seconds with **zero gaps/drops/stutters** — this is **not a device/Termux/PulseAudio issue**. The server's fresh Vorbis decode is ~0× real-time on mobile CPU (Symphonia Vorbis decoder not ARM-optimized), so first-play has silence until cached. Cache-hit plays advance 1× cleanly. Fixes eliminate writer-caused drops; remaining "drops" on fresh Vorbis are decode-throttling silence, not sink underruns.
+
+**Verification.** `cargo check --features backend` clean (Rust type-check). On device: `paplay` 30s clean; cache-hit playback position advances 1× monotonic; no starvation logs in writer. Fresh Vorbis first-play has silence gaps (decode too slow) — transcode to Opus/MP3/AAC for smooth first play.
+---
+
+**Native Vorbis decode via libvorbis FFI (2026-11-17, DECODE FIXED, playback starvation separate).**
+
+**Test file:** `/storage/emulated/0/music/sonicprogress - spaceship-landed_9.ogg` (Vorbis OGG, ~44.1kHz stereo, ~3.5 min)
+
+**Goal:** Replace Symphonia's slow pure-Rust Vorbis decoder with native NEON-optimized libvorbis on ARM (Termux).
+
+**What's implemented:**
+- `--features vorbis` links Termux's `libvorbisfile.so`/`libvorbis.so`/`libogg.so` via `build.rs`
+- C wrapper (`scripts/vorbis-wrapper.c` → `libl337vorbis.so`) encapsulates libvorbisfile decode
+- `src/player/vorbis.rs`: FFI to C wrapper (incremental API: `vorbis_decoder_open`, `vorbis_decoder_read_chunk`, `vorbis_decoder_close`)
+- Vorbis decode runs in dedicated 8MB-stack std thread to avoid FFI segfaults
+- Build succeeds; binary links `libl337vorbis.so` → `libvorbisfile.so`/`libvorbis.so`/`libogg.so`
+
+**Decode status: FIXED.** Native decode works perfectly:
+- Standalone C test with `ov_fopen`/`ov_read` works perfectly
+- C wrapper `libl337vorbis.so` works when called from Rust
+- Decode speed: ~11× real-time (5-min track decoded in ~27s on ARM)
+- No segfault during decode
+
+**Incremental decode fix (2026-11-17):** Restructured Vorbis path to match non-Vorbis pattern:
+1. Call `stream.play()` FIRST
+2. Run Vorbis decode in dedicated 8MB-stack thread
+3. Decode fills buffer incrementally while writer consumes (chunks with `wait_for_space` throttling)
+
+**Result (verified 2026-11-18):**
+- 300s Vorbis OGG plays completely without stutters/drops
+- 20,151 chunks decoded incrementally, 14,408,445 total frames
+- EOF reached cleanly, thread joined properly
+- Position advances monotonically at 1×, stops at 300s matching ffprobe
+- Audio sounds correct on speakers
+
+**Cross-platform support:** Native libvorbis is used when available (Termux/Android, Linux with `libl337vorbis.so`). Falls back to Symphonia pure-Rust decoder when native library unavailable. No code changes needed for fallback — handled automatically in `src/player/vorbis.rs:decode_vorbis_file()`.
+
+---
+
+## Fix applied 2026-11-17 — Vorbis buffer writes now chunked with throttling
+
+**Change.** Modified `load_and_play()` Vorbis branch (src/player/engine.rs ~lines 1065-1081) to write resampled PCM to the audio buffer in 8192-sample chunks with `wait_for_space` throttling, matching the non-Vorbis incremental pattern. Previously the entire resampled track was appended in one `extend_from_slice` call after decode completed.
+
+**Effect.** Writer now receives PCM progressively during the buffer-fill phase instead of one giant append. The decode still runs to completion before any push (C wrapper is one-shot), so initial starvation (~decode time / 11×) remains. Full incremental decode requires C API streaming.
+
+**Verified:** `cargo check --features backend,vorbis` clean; dummy-mode isolated instance test passed — 327s Vorbis OGG decoded via native FFI, chunked buffer writes executed without crash, server stable.

@@ -162,7 +162,7 @@ pub struct AlsaAudioOutputStream {
 
 impl AlsaAudioOutputStream {
     fn writer_loop(state: Arc<AlsaState>, funcs: AlsaFuncs) {
-        const CHUNK_FRAMES: usize = 1024;
+        const CHUNK_FRAMES: usize = 4096;
         // Silence for up to CHUNK_FRAMES stereo frames (the widest device we
         // write); each silence branch writes exactly CHUNK_FRAMES frames so we
         // never read past the buffer on mono or stereo devices.
@@ -211,15 +211,11 @@ impl AlsaAudioOutputStream {
                 let samples: Vec<f32> = src.iter().map(|s| s * volume).collect();
 
                 let bytes = unsafe { samples.align_to::<u8>().1 };
-                buf.read_pos += to_copy_samples;
-                if buf.read_pos >= (1 << 20) {
-                    buf.reclaim_consumed();
-                }
-                // Signal any producer throttled by exceeds_window() that space
-                // has been freed (OPT-19).
-                buf.notify_space();
                 drop(buf);
 
+                // Write to the device BEFORE advancing read_pos: if writei fails
+                // (xrun) the data stays in the buffer and is retried next loop
+                // instead of being silently dropped (heard as a skip/stutter).
                 let result = unsafe {
                     (funcs.snd_pcm_writei)(
                         pcm_ptr,
@@ -235,7 +231,22 @@ impl AlsaAudioOutputStream {
                             .backend_error.store(true, Ordering::SeqCst);
                         break;
                     }
+                    // xrun recovered: data was not consumed, leave read_pos alone
+                    // so the same samples are retried on the next iteration.
+                    continue;
                 }
+
+                // writei may return fewer frames than requested (partial write);
+                // only advance read_pos by what was actually written.
+                let written_samples = (result as usize) * channels;
+                let mut buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                buf.read_pos += written_samples;
+                if buf.read_pos >= (1 << 20) {
+                    buf.reclaim_consumed();
+                }
+                // Signal any producer throttled by exceeds_window() that space
+                // has been freed (OPT-19).
+                buf.notify_space();
             } else if !playing {
                 drop(buf);
                 let result = unsafe {

@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
+use std::path::Path;
 
 fn main() {
     let version = env::var("L337_VERSION").unwrap_or_else(|_| "0.0.0-dev".to_string());
@@ -7,6 +8,7 @@ fn main() {
 
     link_pulseaudio_for_termux();
     link_opus();
+    link_vorbis();
 }
 
 /// Link the real libopus for server-side Opus decoding (see src/player/opus.rs).
@@ -68,4 +70,49 @@ fn link_pulseaudio_for_termux() {
     println!("cargo:rustc-link-search=native={}", stubs);
     println!("cargo:rustc-link-lib=dylib=pulse");
     println!("cargo:rerun-if-changed={}", stubs);
+}
+
+/// Link native libvorbis/vorbisfile/ogg for fast Vorbis decoding.
+///
+/// On Termux/Android with the `vorbis` feature, link against Termux's native
+/// libraries which provide NEON-optimized Vorbis decoding. This replaces
+/// Symphonia's slow pure-Rust Vorbis decoder.
+///
+/// On Linux, we expect the system libvorbisfile/vorbis/ogg to be available
+/// via pkg-config or standard library paths. The C wrapper (`scripts/vorbis-wrapper.c`)
+/// is compiled to `libl337vorbis.so` by the build script or CI.
+///
+/// If native libraries are not available, the build still succeeds and the
+/// Symphonia pure-Rust Vorbis decoder is used as fallback (see src/player/vorbis.rs).
+fn link_vorbis() {
+    if env::var_os("CARGO_FEATURE_VORBIS").is_none() {
+        return;
+    }
+
+    let target_os = env::var_os("CARGO_CFG_TARGET_OS");
+    let os = target_os.as_deref();
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let wrapper_lib = format!("{}/scripts/vorbis-wrapper", manifest_dir);
+
+    if os == Some(OsStr::new("android")) {
+        // Termux/Android: link against Termux's native libraries
+        let termux_lib = "/data/data/com.termux/files/usr/lib";
+        println!("cargo:rustc-link-search=native={}", termux_lib);
+        println!("cargo:rustc-link-lib=dylib=l337vorbis");
+        println!("cargo:rerun-if-changed={}/vorbis-wrapper.c", manifest_dir);
+    } else if os == Some(OsStr::new("linux")) {
+        // Linux: try to link system libvorbisfile/vorbis/ogg
+        // The C wrapper must be compiled separately (by CI or build script)
+        if Path::new(&format!("{}/target/release/libl337vorbis.so", manifest_dir)).exists()
+            || Path::new(&format!("{}/target/debug/libl337vorbis.so", manifest_dir)).exists()
+            || Path::new("/usr/lib/libl337vorbis.so").exists()
+            || Path::new("/usr/local/lib/libl337vorbis.so").exists()
+        {
+            println!("cargo:rustc-link-lib=dylib=l337vorbis");
+            println!("cargo:rerun-if-changed={}/vorbis-wrapper.c", manifest_dir);
+        } else {
+            eprintln!("cargo:warning=libl337vorbis.so not found; Vorbis will fall back to Symphonia pure-Rust decoder");
+        }
+    }
 }
