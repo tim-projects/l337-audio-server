@@ -1077,6 +1077,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "cc",
  "chrono",
  "config",
  "coreaudio-rs",
