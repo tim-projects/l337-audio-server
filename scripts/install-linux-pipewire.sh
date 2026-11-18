@@ -762,6 +762,25 @@ setup_systemd_user() {
         fi
     fi
 
+    # --- Configure sudoers for player user to restart the l337 user's service ---
+    if [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" &>/dev/null; then
+        local l337_uid
+        l337_uid=$(id -u "$real_user" 2>/dev/null || echo "")
+        if [ -n "$l337_uid" ]; then
+            local sudoers_file="/etc/sudoers.d/l337-audio-server-restart"
+            cat > "$sudoers_file" <<SUDOERS_EOF
+# Allow ${SUDO_USER} to manage l337-audio-server user service as l337 user
+${SUDO_USER} ALL=(l337) NOPASSWD: \\
+    /usr/bin/systemctl --user start l337-audio-server.service, \\
+    /usr/bin/systemctl --user stop l337-audio-server.service, \\
+    /usr/bin/systemctl --user restart l337-audio-server.service, \\
+    /usr/bin/systemctl --user is-active l337-audio-server.service
+SUDOERS_EOF
+            chmod 0440 "$sudoers_file"
+            info "Created sudoers rule: $sudoers_file"
+        fi
+    fi
+
     local config_file="$user_config_dir/server.ini"
 
     # --- Detect ALSA hardware; prompt for dummy mode if none present ---
@@ -1071,6 +1090,9 @@ uninstall_user_service() {
         rm -rf "$shared_runtime_dir"
         ok "Shared runtime removed: $shared_runtime_dir"
     fi
+
+    # Remove sudoers rule
+    rm -f /etc/sudoers.d/l337-audio-server-restart
 
     # A download that fell back to /tmp leaves the whole binary there.
     # A download that fell back to /tmp leaves the whole binary there.

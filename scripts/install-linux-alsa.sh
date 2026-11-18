@@ -393,6 +393,21 @@ setup_systemd() {
         done
     fi
 
+    # --- Configure sudoers for player user to restart the system service ---
+    if [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" &>/dev/null; then
+        local sudoers_file="/etc/sudoers.d/l337-audio-server-restart"
+        cat > "$sudoers_file" <<SUDOERS_EOF
+# Allow ${SUDO_USER} to manage l337-audio-server system service
+${SUDO_USER} ALL=(root) NOPASSWD: \\
+    /usr/bin/systemctl start l337-audio-server.service, \\
+    /usr/bin/systemctl stop l337-audio-server.service, \\
+    /usr/bin/systemctl restart l337-audio-server.service, \\
+    /usr/bin/systemctl is-active l337-audio-server.service
+SUDOERS_EOF
+        chmod 0440 "$sudoers_file"
+        info "Created sudoers rule: $sudoers_file"
+    fi
+
     mkdir -p "$INSTALL_DIR" "$STATE_DIR" "$CACHE_DIR" "$CONFIG_DIR"
     chmod 0755 "$CONFIG_DIR"
 
@@ -641,6 +656,9 @@ uninstall_linux() {
         rm -rf "$runtime"
         ok "Runtime removed: $runtime"
     done
+
+    # Remove sudoers rule
+    rm -f /etc/sudoers.d/l337-audio-server-restart
 
     # The binary install.sh downloads lands in TMPDIR; tidy it on uninstall.
     rm -f "${L337_BINARY_PATH:-}" "/tmp/l337-audio-server-download"
