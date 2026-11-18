@@ -143,6 +143,20 @@ pub struct SeekPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SinkInfo {
+    pub name: String,
+    pub description: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SinkSettings {
+    /// Sink name to use (e.g. "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink").
+    /// If empty/null, WirePlumber auto-picks.
+    pub sink: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PoolSettings {
     pub max_disk_pool_bytes: u64,
     #[serde(default)]

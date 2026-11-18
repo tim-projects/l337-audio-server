@@ -1,7 +1,11 @@
 use crate::platform::common::{AudioBackend, AudioBuffer, AudioOutputStream, ensure_runtime_dir};
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -343,6 +347,217 @@ impl AudioOutputStream for PipeWireAudioOutputStream {
 
 pub fn init() {
     ensure_runtime_dir();
+}
+
+/// Get the l337 user's WirePlumber state directory.
+fn wireplumber_state_dir() -> PathBuf {
+    // l337 user's home is typically /home/l337
+    // But we should detect it properly
+    if let Ok(output) = StdCommand::new("getent").args(["passwd", "l337"]).output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            if let Some(home) = s.split(':').nth(5) {
+                return PathBuf::from(home).join(".local/state/wireplumber");
+            }
+        }
+    }
+    // Fallback
+    PathBuf::from("/home/l337/.local/state/wireplumber")
+}
+
+/// List available PipeWire sinks with descriptions.
+/// Returns (sink_name, description, is_default)
+pub async fn list_pipewire_sinks() -> Vec<(String, String, bool)> {
+    let mut sinks = Vec::new();
+    
+    // Try pw-cli first
+    if let Ok(output) = StdCommand::new("pw-cli").args(["list-objects"]).output() {
+        if let Ok(text) = String::from_utf8(output.stdout) {
+            let mut current_sink: Option<String> = None;
+            let mut current_desc: Option<String> = None;
+            let mut current_card: Option<String> = None;
+            let mut current_port: Option<String> = None;
+            let mut in_sink = false;
+            
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("object id") {
+                    // Flush previous
+                    if in_sink && current_sink.is_some() {
+                        let desc = current_port
+                            .or(current_desc)
+                            .unwrap_or_else(|| current_sink.clone().unwrap_or_default());
+                        let is_default = check_if_default_sink(current_sink.as_ref().unwrap());
+                        sinks.push((current_sink.unwrap(), desc, is_default));
+                    }
+                    current_sink = None;
+                    current_desc = None;
+                    current_card = None;
+                    current_port = None;
+                    in_sink = false;
+                } else if line.starts_with("node.name =") {
+                    if let Some(val) = line.split('"').nth(1) {
+                        if val.starts_with("alsa_output.") {
+                            in_sink = true;
+                            current_sink = Some(val.to_string());
+                        }
+                    }
+                } else if in_sink && line.starts_with("node.description =") {
+                    if let Some(val) = line.split('"').nth(1) {
+                        current_desc = Some(val.to_string());
+                    }
+                } else if in_sink && line.starts_with("device.name =") {
+                    if let Some(val) = line.split('"').nth(1) {
+                        current_card = Some(val.to_string());
+                    }
+                } else if in_sink && line.starts_with("port.name =") {
+                    if let Some(val) = line.split('"').nth(1) {
+                        current_port = Some(val.to_string());
+                    }
+                }
+            }
+            // Flush last
+            if in_sink && current_sink.is_some() {
+                let desc = current_port
+                    .or(current_desc)
+                    .unwrap_or_else(|| current_sink.clone().unwrap_or_default());
+                let is_default = check_if_default_sink(current_sink.as_ref().unwrap());
+                sinks.push((current_sink.unwrap(), desc, is_default));
+            }
+        }
+    }
+    
+    // Fallback to pactl
+    if sinks.is_empty() {
+        if let Ok(output) = StdCommand::new("pactl").args(["list", "sinks"]).output() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let mut current_sink: Option<String> = None;
+                let mut current_desc: Option<String> = None;
+                let mut current_port: Option<String> = None;
+                
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.starts_with("Name: ") {
+                        let name = line[6..].trim().to_string();
+                        if name.starts_with("alsa_output.") {
+                            if let Some(s) = current_sink.take() {
+                                let desc = current_port
+                                    .or(current_desc)
+                                    .unwrap_or_else(|| s.clone());
+                                let is_default = check_if_default_sink(&s);
+                                sinks.push((s, desc, is_default));
+                            }
+                            current_sink = Some(name);
+                            current_desc = None;
+                            current_port = None;
+                        }
+                    } else if line.starts_with("Description: ") && current_sink.is_some() {
+                        current_desc = Some(line[13..].trim().to_string());
+                    } else if line.starts_with("Port: ") && current_sink.is_some() {
+                        current_port = Some(line[6..].trim().to_string());
+                    }
+                }
+                // Flush last
+                if let Some(s) = current_sink {
+                    let desc = current_port
+                        .or(current_desc)
+                        .unwrap_or_else(|| s.clone());
+                    let is_default = check_if_default_sink(&s);
+                    sinks.push((s, desc, is_default));
+                }
+            }
+        }
+    }
+    
+    // Sort: default first, then by description
+    sinks.sort_by(|a, b| {
+        match (a.2, b.2) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.1.cmp(&b.1),
+        }
+    });
+    
+    sinks
+}
+
+fn check_if_default_sink(sink_name: &str) -> bool {
+    let state_dir = wireplumber_state_dir();
+    let default_nodes = state_dir.join("default-nodes");
+    if let Ok(content) = fs::read_to_string(default_nodes) {
+        for line in content.lines() {
+            if line.starts_with("default.configured.audio.sink=") {
+                let default = line.split('=').nth(1).unwrap_or("").trim();
+                return default == sink_name;
+            }
+        }
+    }
+    false
+}
+
+/// Get the currently configured sink from WirePlumber state.
+pub async fn get_current_sink() -> Option<String> {
+    let state_dir = wireplumber_state_dir();
+    let default_nodes = state_dir.join("default-nodes");
+    if let Ok(content) = fs::read_to_string(default_nodes) {
+        for line in content.lines() {
+            if line.starts_with("default.configured.audio.sink=") {
+                return Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Set the PipeWire sink by writing WirePlumber state and restarting wireplumber.
+pub async fn set_pipewire_sink(sink: Option<String>) -> Result<(), String> {
+    let state_dir = wireplumber_state_dir();
+    
+    // Ensure state directory exists
+    fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("Failed to create wireplumber state dir: {}", e))?;
+    
+    // Write default-profile (keep existing or create basic)
+    let default_profile = state_dir.join("default-profile");
+    let profile_content = if sink.is_some() {
+        // Try to extract card from sink name
+        let card = sink.as_ref().unwrap()
+            .strip_prefix("alsa_output.")
+            .and_then(|s| s.split('.').next())
+            .map(|c| format!("alsa_card.{}", c))
+            .unwrap_or_else(|| "alsa_card.auto".to_string());
+        format!("{} = HiFi\n", card)
+    } else {
+        String::new()
+    };
+    fs::write(&default_profile, profile_content)
+        .map_err(|e| format!("Failed to write default-profile: {}", e))?;
+    
+    // Write default-nodes
+    let default_nodes = state_dir.join("default-nodes");
+    let nodes_content = if let Some(sink_name) = sink {
+        format!("default.configured.audio.sink={}\n", sink_name)
+    } else {
+        String::new()
+    };
+    fs::write(&default_nodes, nodes_content)
+        .map_err(|e| format!("Failed to write default-nodes: {}", e))?;
+    
+    // Restart wireplumber as l337 user
+    // Note: This needs to run as l337 user. The engine runs as l337, so this should work.
+    let output = StdCommand::new("systemctl")
+        .args(["--user", "restart", "wireplumber.service"])
+        .output()
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("wireplumber restart failed: {}", stderr);
+        // Not a hard error - state is written, will take effect on next restart
+    } else {
+        info!("WirePlumber restarted successfully");
+    }
+    
+    Ok(())
 }
 
 #[cfg(test)]

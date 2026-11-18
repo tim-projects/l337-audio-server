@@ -54,6 +54,10 @@ struct ServerSettings {
     buffer_max_bytes: Option<u64>,
     #[serde(default)]
     default_target_kbps: Option<u32>,
+    /// Optional: PipeWire sink name to use (e.g. "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink").
+    /// If empty/unset, WirePlumber auto-picks. Can be changed at runtime via PUT /player/settings.
+    #[serde(default)]
+    sink: Option<String>,
     /// Rust log level for `tracing` (`error`/`warn`/`info`/`debug`/`trace`).
     /// An explicit `RUST_LOG` env var wins over this; an unset/invalid value
     /// keeps the crate default (`warn`). `off` is deliberately NOT accepted
@@ -234,7 +238,7 @@ fn parse_transport_cli() -> Option<String> {
 /// not a whole track: consumed samples are reclaimed as playback advances (G4),
 /// so a generous window never OOMs a long track. `default_target_kbps = 0` means
 /// `best` (no ceiling) — see G2.
-const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n# Rebuffer window (~24 MiB), not a whole-track buffer (see G4).\nbuffer_max_bytes = 25165824\n# Bandwidth ceiling in kbps; 0 = best / no ceiling (see G2).\ndefault_target_kbps = 0\n# Rust log level: error | warn | info | debug | trace. Default verbosity is\n# warn (errors and warnings only); set debug while hunting bugs. An explicit\n# RUST_LOG environment variable overrides this (RUST_LOG wins, see init_tracing).\nloglevel = \"warn\"\n";
+const DEFAULT_CONFIG: &str = "[server]\nhost = \"127.0.0.1\"\nport = 1337\ndummy = false\ntransport = \"auto\"\n# Rebuffer window (~24 MiB), not a whole-track buffer (see G4).\nbuffer_max_bytes = 25165824\n# Bandwidth ceiling in kbps; 0 = best / no ceiling (see G2).\ndefault_target_kbps = 0\n# Optional: PipeWire sink name to use (e.g. \"alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink\").\n# If empty/unset, WirePlumber auto-picks. Can be changed at runtime via PUT /player/settings.\nsink = \"\"\n# Rust log level: error | warn | info | debug | trace. Default verbosity is\n# warn (errors and warnings only); set debug while hunting bugs. An explicit\n# RUST_LOG environment variable overrides this (RUST_LOG wins, see init_tracing).\nloglevel = \"warn\"\n";
 
 fn load_settings() -> Result<Settings, config::ConfigError> {
     let mut builder = config::Config::builder();
@@ -524,12 +528,17 @@ async fn main() {
     let storage = StorageManager::new(max_pool, settings.storage.cache_dir.clone()).await;
     let buffer_max_bytes = settings.server.buffer_max_bytes.unwrap_or(24 * 1024 * 1024);
     let default_target_kbps = settings.server.default_target_kbps.unwrap_or(0);
+    let sink_config = settings.server.sink.clone().filter(|s| !s.is_empty());
     let engine = if dummy_mode {
         tracing::warn!("Running in DUMMY output mode. No audio will be produced. Testing only.");
-        PlayerEngine::new_dummy(storage, buffer_max_bytes, default_target_kbps)
+        {
+            let mut e = PlayerEngine::new_dummy(storage, buffer_max_bytes, default_target_kbps);
+            e.sink = sink_config;
+            e
+        }
     } else {
         match PlayerEngine::new(storage, buffer_max_bytes, default_target_kbps) {
-            Ok(engine) => engine,
+            Ok(mut engine) => { engine.sink = sink_config; engine }
             Err(e) => {
                 tracing::error!(
                     "Failed to initialize audio device: {}. \
@@ -676,6 +685,9 @@ async fn main() {
         )
         .route("/player/status", get(handlers::get_status))
         .route("/player/settings", put(handlers::set_settings))
+        .route("/player/sinks", get(handlers::list_sinks))
+        .route("/player/sink", get(handlers::get_sink_settings))
+        .route("/player/sink", put(handlers::set_sink))
         .route("/auth/challenge", post(handlers::auth_challenge))
         .route("/auth/redeem", post(handlers::auth_redeem));
     #[cfg(feature = "qr")]

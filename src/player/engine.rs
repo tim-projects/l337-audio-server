@@ -158,6 +158,8 @@ pub struct PlayerEngine {
     file_bytes_len: Option<u64>,
     /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
     default_target_kbps: u32,
+    /// Optional PipeWire sink name to use.
+    pub sink: Option<String>,
     /// Runtime-mutable default ceiling (kbps); per-track `target_kbps`/`quality`
     /// override it per request. `0` = best. Set via `POST /player/target`.
     runtime_target_kbps: u32,
@@ -279,6 +281,7 @@ impl PlayerEngine {
             runtime_target_kbps: default_target_kbps,
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
+            sink: None,
             codec_label: None,
             lossless_requested: false,
             lossless_fulfilled: false,
@@ -336,6 +339,7 @@ impl PlayerEngine {
             runtime_target_kbps: default_target_kbps,
             effective_target_kbps: default_target_kbps,
             actual_kbps: None,
+            sink: None,
             codec_label: None,
             lossless_requested: false,
             lossless_fulfilled: false,
@@ -5432,5 +5436,76 @@ exit 1
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Sink management methods (PipeWire only)
+impl PlayerEngine {
+    pub async fn list_sinks(&self) -> Vec<crate::api::models::SinkInfo> {
+        #[cfg(all(target_os = "linux", feature = "backend"))]
+        {
+            crate::platform::linux::list_pipewire_sinks()
+                .await
+                .into_iter()
+                .map(|(name, desc, is_default)| crate::api::models::SinkInfo {
+                    name,
+                    description: desc,
+                    is_default,
+                })
+                .collect()
+        }
+        #[cfg(not(all(target_os = "linux", feature = "backend")))]
+        {
+            Vec::new()
+        }
+    }
+
+    pub async fn get_sink_setting(&self) -> Option<String> {
+        self.sink.clone()
+    }
+
+    pub async fn set_sink(&mut self, sink: Option<String>) -> Result<(), String> {
+        #[cfg(all(target_os = "linux", feature = "backend"))]
+        {
+            crate::platform::linux::set_pipewire_sink(sink.clone()).await?;
+            self.sink = sink.clone();
+            self.persist_sink_config(&sink).await?;
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "linux", feature = "backend")))]
+        {
+            Err("Sink management only available on Linux with PipeWire backend".into())
+        }
+    }
+
+    async fn persist_sink_config(&self, sink: &Option<String>) -> Result<(), String> {
+        let config_path = crate::platform::common::get_config_path()
+            .ok_or("Could not determine config path")?;
+        let mut content = std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|_| String::new());
+        let sink_line = if let Some(s) = sink {
+            format!("sink = \"{}\"", s)
+        } else {
+            "sink = \"\"".to_string()
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut new_lines = Vec::new();
+        let mut found = false;
+        for line in lines {
+            if line.trim_start().starts_with("sink") {
+                new_lines.push(sink_line.as_str());
+                found = true;
+            } else {
+                new_lines.push(line);
+            }
+        }
+        if !found {
+            new_lines.push("");
+            new_lines.push(&sink_line);
+        }
+        let new_content = new_lines.join("\n");
+        std::fs::write(&config_path, new_content)
+            .map_err(|e| format!("Failed to write config: {}", e))?;
+        Ok(())
     }
 }

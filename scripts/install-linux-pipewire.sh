@@ -451,20 +451,24 @@ ok()    { printf '%s\n' "$*" >&2; }
 warn()  { printf '%s\n' "$*" >&2; }
 fail()  { printf '%s\n' "$*" >&2; exit 1; }
 
-# Detect PipeWire playback sinks (alsa_output.* with media.class = Audio/Sink).
-# Output: "sink_name<TAB>card_name" per line. Prefers pw-cli; falls back to pactl.
+# Detect PipeWire playback sinks with human-readable descriptions.
+# Output: "sink_name<TAB>card_name<TAB>description" per line.
 detect_sinks() {
     if command -v pw-cli >/dev/null 2>&1; then
         timeout 5 pw-cli list-objects 2>/dev/null | awk '
-            /^object id/ { flush(); mc=""; nn=""; cn="";
+            /^object id/ { flush(); mc=""; nn=""; cn=""; desc=""; port="";
                 if (match($0, /"[^"]*"/)) nn=substr($0, RSTART+1, RLENGTH-2); }
             /media\.class = / { if (match($0, /"[^"]*"/)) mc=substr($0, RSTART+1, RLENGTH-2); }
             /node\.name = / { if (match($0, /"[^"]*"/)) nn=substr($0, RSTART+1, RLENGTH-2); }
             /device\.name = / { if (match($0, /"[^"]*"/)) cn=substr($0, RSTART+1, RLENGTH-2); }
+            /node\.description = / { if (match($0, /"[^"]*"/)) desc=substr($0, RSTART+1, RLENGTH-2); }
+            /port\.name = / { if (match($0, /"[^"]*"/)) port=substr($0, RSTART+1, RLENGTH-2); }
             function flush() {
                 if (mc == "Audio/Sink" && nn ~ /^alsa_output\./) {
                     if (cn == "") cn = sink_card_name(nn);
-                    printf "%s\t%s\n", nn, cn;
+                    # Prefer port name, then node description, then sink name
+                    display = (port != "") ? port : (desc != "" ? desc : nn);
+                    printf "%s\t%s\t%s\n", nn, cn, display;
                 }
             }
             function sink_card_name(s,   rest, n, parts, i, card) {
@@ -476,10 +480,27 @@ detect_sinks() {
             END { flush(); }
         ' | sort -u
     elif command -v pactl >/dev/null 2>&1; then
-        pactl list short sinks 2>/dev/null | awk '{print $2}' | grep '^alsa_output\.' | \
-            while IFS= read -r sink; do
-                printf '%s\t%s\n' "$sink" "$(sink_card_name_bash "$sink")"
-            done || true
+        pactl list sinks 2>/dev/null | awk '
+            /^Sink #/ { flush(); sink=""; desc=""; port="";
+                if (match($0, /#([0-9]+)/)) sink_num=substr($0, RSTART+1, RLENGTH-1); }
+            /Name: / { sink=substr($0, index($0,$2)) }
+            /Description: / { desc=substr($0, index($0,$2)) }
+            /Port: / { port=substr($0, index($0,$2)) }
+            function flush() {
+                if (sink != "" && sink ~ /^alsa_output\./) {
+                    display = (port != "") ? port : (desc != "" ? desc : sink);
+                    card = sink_card_name_bash(sink);
+                    printf "%s\t%s\t%s\n", sink, card, display;
+                }
+            }
+            function sink_card_name_bash(s,   rest, n, parts, i, card) {
+                rest = s; sub(/^alsa_output\./, "", rest); sub(/__sink$/, "", rest);
+                n = split(rest, parts, "."); card = parts[1];
+                for (i = 2; i < n; i++) card = card "." parts[i];
+                return "alsa_card." card;
+            }
+            END { flush(); }
+        ' | sort -u
     fi
 }
 
@@ -522,15 +543,52 @@ prompt_for_sink() {
         info "Non-interactive mode: auto-selecting first sink: ${sinks[0]}"
         printf '%s\n' "${sinks[0]}"; return 0
     fi
-    echo "Multiple audio sinks detected. Select the default output sink:" >&2
-    local i=1 s
-    for s in "${sinks[@]}"; do printf '  %d) %s\n' "$i" "$s" >&2; i=$((i + 1)); done
+
+    # Build grouped display: group sinks by card/device
+    # detect_sinks output: sink_name<TAB>card_name<TAB>description
+    local -a display_lines=()
+    local -a sink_map=()  # maps display index to sink name
+    local current_card=""
+    local card_display=""
+
+    while IFS=$'\t' read -r sink_name card_name description; do
+        if [ "$card_name" != "$current_card" ]; then
+            if [ -n "$current_card" ]; then
+                display_lines+=("")  # blank line between cards
+            fi
+            current_card="$card_name"
+            # Extract card label from card_name (alsa_card.pci-xxx -> pci-xxx)
+            local card_label="${card_name#alsa_card.}"
+            display_lines+=("=== $card_label ===")
+        fi
+        display_lines+=("  $description")
+        sink_map+=("$sink_name")
+    done < <(detect_sinks | awk -F'\t' -v sinks="${sinks[*]}" '
+        BEGIN { split(sinks, a, " "); for (i in a) wanted[a[i]]=1 }
+        $1 in wanted { print }
+    ')
+
+    echo "Multiple audio output devices detected. Select the default output:" >&2
+    echo "  (Hint: Headphones/Speaker = analog output, HDMI = TV/monitor)" >&2
+    echo "  (You can change this later in the l337-player settings)" >&2
+    local i=1
+    for line in "${display_lines[@]}"; do
+        if [[ "$line" == "==="* ]]; then
+            echo "$line" >&2
+        elif [ -z "$line" ]; then
+            echo "" >&2
+        else
+            printf '  %d) %s\n' "$i" "$line" >&2
+            i=$((i + 1))
+        fi
+    done
+
     local choice=""
     while true; do
-        printf 'Select sink [1-%d]: ' "$count" >&2
+        printf 'Select output [1-%d]: ' "${#sink_map[@]}" >&2
         read -r choice || return 1
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
-            printf '%s\n' "${sinks[$((choice - 1))]}"; return 0
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#sink_map[@]}" ]; then
+            printf '%s\n' "${sink_map[$((choice - 1))]}"; return 0
         fi
         echo "Invalid choice, try again." >&2
     done

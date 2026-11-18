@@ -264,6 +264,29 @@ pub fn ensure_runtime_dir() {
     }
 }
 
+/// Get the server.ini config file path.
+pub fn get_config_path() -> Option<PathBuf> {
+    // Try /etc/l337-audio-server/server.ini first (system install)
+    let system_path = PathBuf::from("/etc/l337-audio-server/server.ini");
+    if system_path.exists() {
+        return Some(system_path);
+    }
+    // Try current directory (dev)
+    let local_path = PathBuf::from("server.ini");
+    if local_path.exists() {
+        return Some(local_path);
+    }
+    // Try user config dir
+    if let Some(config_dir) = dirs::config_dir() {
+        let user_path = config_dir.join("l337-audio-server/server.ini");
+        if user_path.exists() {
+            return Some(user_path);
+        }
+    }
+    // Default to system path (may not exist yet)
+    Some(system_path)
+}
+
 pub trait AudioOutputStream: Send + Sync {
     fn play(&mut self) -> Result<(), String>;
     fn pause(&mut self) -> Result<(), String>;

@@ -1,6 +1,6 @@
 use crate::api::models::{
-    AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SpeedPayload,
-    TargetPayload, Track, VolumePayload,
+    AuthChallengeResponse, AuthRedeemResponse, PoolSettings, SeekPayload, SinkInfo, SinkSettings,
+    SpeedPayload, TargetPayload, Track, VolumePayload,
 };
 use crate::player::engine::{PlayerEngine, download_stream};
 use axum::{
@@ -460,6 +460,39 @@ pub async fn set_settings(
 ) -> impl IntoResponse {
     let mut engine = state.0.lock().await;
     engine.storage.max_pool_size = settings.max_disk_pool_bytes;
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// List available PipeWire sinks. Requires authentication.
+pub async fn list_sinks(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let engine = state.0.lock().await;
+    let sinks = (*engine).list_sinks().await;
+    Json(serde_json::json!({"sinks": sinks})).into_response()
+}
+
+/// Get/set the PipeWire sink. Requires authentication.
+pub async fn get_sink_settings(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let engine = state.0.lock().await;
+    let sink = (*engine).get_sink_setting().await;
+    Json(serde_json::json!({"sink": sink})).into_response()
+}
+
+pub async fn set_sink(
+    State(state): State<AppState>,
+    Json(settings): Json<SinkSettings>,
+) -> impl IntoResponse {
+    let mut engine = state.0.lock().await;
+    if let Err(e) = (*engine).set_sink(settings.sink).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response();
+    }
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
