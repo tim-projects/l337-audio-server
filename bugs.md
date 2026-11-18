@@ -439,3 +439,112 @@ Track: `/storage/emulated/0/music/sonicprogress - spaceship-landed_9.ogg` (~7.3 
 **Effect.** Writer now receives PCM progressively during the buffer-fill phase instead of one giant append. The decode still runs to completion before any push (C wrapper is one-shot), so initial starvation (~decode time / 11×) remains. Full incremental decode requires C API streaming.
 
 **Verified:** `cargo check --features backend,vorbis` clean; dummy-mode isolated instance test passed — 327s Vorbis OGG decoded via native FFI, chunked buffer writes executed without crash, server stable.
+
+---
+
+## Test Plan — Intel Linux (x86_64) Native Vorbis Verification
+
+### Prerequisites
+- Intel/AMD x86_64 Linux host (Debian 12 / Ubuntu 24.04+ recommended for glibc 2.36 compatibility)
+- `libvorbis-dev libogg-dev pkg-config` installed
+- `ffprobe` / `ffmpeg` for duration verification
+- PulseAudio or PipeWire running (for audio output test)
+
+### 1. Build Verification
+```bash
+# Clean build with vorbis feature
+CARGO_HOME=/tmp/cargo cargo build --release --features backend,vorbis
+
+# Verify static linking of C wrapper (no libl337vorbis.so NEEDED)
+readelf -d target/release/l337-audio-server | grep -E "vorbis|ogg"
+# Expected: libvorbisfile.so, libvorbis.so, libogg.so (system libs)
+# NOT expected: libl337vorbis.so (C wrapper embedded statically)
+
+# Verify Opus linkage still present
+readelf -d target/release/l337-audio-server | grep libopus
+```
+
+### 2. Unit & Integration Tests
+```bash
+CARGO_HOME=/tmp/cargo cargo test --features backend,vorbis
+# All 26 tests must pass
+```
+
+### 3. Native Vorbis Decode Path Verification
+Start isolated server instance:
+```bash
+rm -rf /tmp/l337-test && mkdir -p /tmp/l337-test/run /tmp/l337-test/state /tmp/l337-test/cache
+L337_RUNTIME_DIR=/tmp/l337-test/run \
+L337__SERVER__TOKEN=test-token \
+L337__SERVER__PORT=13370 \
+RUST_LOG=l337_audio_server=debug \
+./target/release/l337-audio-server --transport=socket \
+> /tmp/l337-test/server.log 2>&1 &
+```
+
+Play a Vorbis OGG file (use the test file or any .ogg):
+```bash
+curl --unix-socket /tmp/l337-test/run/l337.sock \
+  -H "Authorization: Bearer test-token" \
+  -X POST http://localhost/player/play \
+  -H "Content-Type: application/json" \
+  -d '{"track_id":"test","stream_url":"/path/to/test.ogg","title":"test","artist":"test"}'
+```
+
+Check logs for **native decode** (not Symphonia fallback):
+```bash
+grep "vorbis.*native\|native.*decode\|Vorbis chunk" /tmp/l337-test/server.log | head -5
+# Expected:
+# "load_and_play: Starting Vorbis incremental native decode"
+# "Vorbis info: channels=2, sample_rate=44100, duration=..."
+# "Vorbis chunk 1: samples_read=..."
+# NOT: "falling back to Symphonia"
+```
+
+### 4. Playback Correctness (Duration Match)
+Poll status until stopped:
+```bash
+# Wait for playback to complete (track length + buffer)
+sleep <track_duration_secs + 10>
+
+curl --unix-socket /tmp/l337-test/run/l337.sock \
+  -H "Authorization: Bearer test-token" \
+  http://localhost/player/status | jq '.position_sec, .duration_sec, .state'
+
+# Verify: position_sec at stopped state == ffprobe duration ±2 seconds
+ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 /path/to/test.ogg
+```
+
+### 5. Incremental Decode Verification
+```bash
+grep "Vorbis chunk" /tmp/l337-test/server.log | wc -l
+# Should show thousands of chunks (incremental, not one-shot)
+
+grep "Vorbis decode complete" /tmp/l337-test/server.log
+# Expected: total_frames matching duration × sample_rate
+```
+
+### 6. Audio Output Verification (Speakers)
+- Listen to playback: **no stutters, drops, static, wrong speed**
+- `pactl list sink-inputs` during playback shows active uncorked stream
+- Buffer latency decreases in real time (audio reaching speaker)
+
+### 7. Fallback Verification (Symphonia)
+Temporarily remove native library access:
+```bash
+# Move libvorbis if installed locally, or run on clean container without libvorbis-dev
+CARGO_HOME=/tmp/cargo cargo build --release --features backend,vorbis
+# Should still build, logs show "falling back to Symphonia"
+# Playback still works (slower decode, but functional)
+```
+
+### 8. Cross-Platform CI Gate
+The GitHub Actions workflow must pass for:
+- `x86_64-linux-pipewire` (backend + opus + vorbis)
+- `x86_64-linux-alsa` (alsa + opus + vorbis)
+- `aarch64-linux-pipewire` (backend + opus + vorbis)
+- `aarch64-linux-alsa` (alsa + opus + vorbis)
+- `armv7-linux-alsa` (alsa only, no opus/vorbis - expected)
+- `riscv64-linux-alsa` (alsa only, no opus/vorbis - expected)
+
+All Linux jobs must show `libvorbisfile.so` + `libvorbis.so` + `libogg.so` in `readelf -d` NEEDED.
