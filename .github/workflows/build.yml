@@ -140,10 +140,10 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: "--features backend,opus"
+            features: "--features backend,opus,vorbis"
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
-            features: "--no-default-features --features alsa,opus"
+            features: "--no-default-features --features alsa,opus,vorbis"
             pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
@@ -173,6 +173,16 @@ jobs:
           echo "::error::${{ matrix.variant }} built with --features opus but not linked against libopus.so"
           exit 1
         fi
+    - name: Verify Vorbis linkage
+      if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
+      run: |
+        BIN=target/x86_64-unknown-linux-gnu/release/l337-audio-server
+        for lib in libvorbisfile.so libvorbis.so libogg.so; do
+          if ! readelf -d "$BIN" | grep -q "$lib"; then
+            echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against $lib"
+            exit 1
+          fi
+        done
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -251,10 +261,10 @@ jobs:
         variant: [pipewire, alsa]
         include:
           - variant: pipewire
-            features: "--features backend,opus"
+            features: "--features backend,opus,vorbis"
             pkg_deps: libpipewire-0.3-dev libspa-0.2-dev libopus-dev libclang-dev clang
           - variant: alsa
-            features: "--no-default-features --features alsa,opus"
+            features: "--no-default-features --features alsa,opus,vorbis"
             pkg_deps: libopus-dev
     env:
       L337_VERSION: ${{ needs.determine-version.outputs.version }}
@@ -284,6 +294,16 @@ jobs:
           echo "::error::${{ matrix.variant }} built with --features opus but not linked against libopus.so"
           exit 1
         fi
+    - name: Verify Vorbis linkage
+      if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
+      run: |
+        BIN=target/aarch64-unknown-linux-gnu/release/l337-audio-server
+        for lib in libvorbisfile.so libvorbis.so libogg.so; do
+          if ! readelf -d "$BIN" | grep -q "$lib"; then
+            echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against $lib"
+            exit 1
+          fi
+        done
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
