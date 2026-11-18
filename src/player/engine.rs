@@ -2375,7 +2375,7 @@ fn decode_file_incremental_blocking(
                 // stereo stream (same as Symphonia path at lines 2060-2071).
                 let mut write_out = out;
                 if head.channels == 1 {
-                    let mut stereo = Vec::with_capacity(out.len() * 2);
+                    let mut stereo = Vec::with_capacity(write_out.len() * 2);
                     for &sample in &out {
                         stereo.push(sample); // L
                         stereo.push(sample); // R
