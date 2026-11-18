@@ -151,6 +151,9 @@ pub struct PlayerEngine {
     /// Current decode position from Vorbis decoder (seconds), updated by the
     /// decode thread using ov_time_tell for accurate timestamp reporting.
     vorbis_position_sec: Arc<AtomicU64>,
+    /// Seek request for Vorbis native decoder. Set by seek_and_resume; the
+    /// decode thread checks this and calls ov_time_seek to jump to the new position.
+    vorbis_seek_request_sec: Arc<AtomicU64>,
     /// Compressed file size of the currently playing file (for actual_kbps).
     file_bytes_len: Option<u64>,
     /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
@@ -270,6 +273,7 @@ impl PlayerEngine {
             file_decode_handle: None,
             vorbis_decode_handle: None,
             vorbis_position_sec: Arc::new(AtomicU64::new(0)),
+            vorbis_seek_request_sec: Arc::new(AtomicU64::new(0)),
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -326,6 +330,7 @@ impl PlayerEngine {
             file_decode_handle: None,
             vorbis_decode_handle: None,
             vorbis_position_sec: Arc::new(AtomicU64::new(0)),
+            vorbis_seek_request_sec: Arc::new(AtomicU64::new(0)),
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -417,7 +422,27 @@ impl PlayerEngine {
     }
     }
 
+
     fn seek_and_resume(&mut self, position: u64) -> Result<(), String> {
+        // If Vorbis native decode is running, use its seek capability
+        if self.codec_label.as_deref() == Some("vorbis") && self.vorbis_decode_handle.is_some() {
+            info!("seek_and_resume: using native Vorbis seek to {}s", position);
+            self.vorbis_seek_request_sec.store(position, Ordering::SeqCst);
+            self.vorbis_position_sec.store(position, Ordering::SeqCst);
+            
+            // Clear buffer so writer starts fresh from new position
+            let mut buf = self.audio_buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.pcm.clear();
+            buf.read_pos = 0;
+            buf.consumed_total = 0;
+            buf.decoded_frames = 0;
+            drop(buf);
+            
+            self.position_sec = position;
+            return Ok(());
+        }
+
+        // Fallback: full re-decode for other codecs
         let path = self.storage.get_active_slot_path("current");
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let decode =
@@ -460,7 +485,6 @@ impl PlayerEngine {
         self.position_sec = position;
         Ok(())
     }
-
     pub(crate) fn try_recover(&mut self) -> Result<(), String> {
         let position = match self.take_backend_error() {
             Some(pos) => pos,
@@ -978,10 +1002,12 @@ impl PlayerEngine {
                 decode_cancel.store(false, Ordering::SeqCst);
                 // Reset Vorbis position for new track
                 self.vorbis_position_sec.store(0, Ordering::SeqCst);
+                self.vorbis_seek_request_sec.store(0, Ordering::SeqCst);
 
                 let slot_for_thread = slot_owned.clone();
                 let slot_for_error = slot_for_thread.clone();
                 let vorbis_position_sec = self.vorbis_position_sec.clone();
+                let vorbis_seek_request_sec = self.vorbis_seek_request_sec.clone();
                 let decode_handle = std::thread::Builder::new()
                     .name("l337-vorbis-decode".into())
                     .stack_size(8 * 1024 * 1024)
@@ -1047,6 +1073,22 @@ impl PlayerEngine {
                                 if decode_cancel.load(Ordering::SeqCst) {
                                     info!("load_and_play({}): Vorbis decode cancelled", slot_for_thread);
                                     break;
+                                }
+
+                                // Check for seek request
+                                let seek_request_sec = vorbis_seek_request_sec.load(Ordering::SeqCst);
+                                if seek_request_sec > 0 {
+                                    info!("load_and_play({}): Vorbis seek requested to {}s", slot_for_thread, seek_request_sec);
+                                    if let Err(e) = decoder.seek_time(seek_request_sec as f64) {
+                                        error!("load_and_play({}): Vorbis seek failed: {}", slot_for_thread, e);
+                                    }
+                                    // Reset seek request
+                                    vorbis_seek_request_sec.store(0, Ordering::SeqCst);
+                                    // After seek, update position
+                                    let vorbis_time = decoder.get_time();
+                                    if vorbis_time >= 0.0 {
+                                        vorbis_position_sec.store(vorbis_time as u64, Ordering::SeqCst);
+                                    }
                                 }
 
                                 let samples_read = match decoder.read_chunk(&mut pcm_buffer) {
