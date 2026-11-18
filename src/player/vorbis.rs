@@ -24,6 +24,10 @@ unsafe extern "C" {
         max_samples: c_int,
         out_samples_read: *mut c_int,
     ) -> c_int;
+    fn vorbis_decoder_get_time(dec: *mut VorbisDecoder) -> c_double;
+    fn vorbis_decoder_get_pcm_pos(dec: *mut VorbisDecoder) -> c_long;
+    fn vorbis_decoder_seek_pcm(dec: *mut VorbisDecoder, pcm_pos: c_long) -> c_int;
+    fn vorbis_decoder_seek_time(dec: *mut VorbisDecoder, time_sec: c_double) -> c_int;
     fn vorbis_decoder_close(dec: *mut VorbisDecoder);
     fn decode_vorbis_file_c(
         path: *const c_char,
@@ -76,6 +80,34 @@ impl VorbisDecoderHandle {
             return Err("Vorbis read error".into());
         }
         Ok(samples_read as usize)
+    }
+
+    /// Get the current decode position in seconds using Vorbisfile's ov_time_tell
+    pub fn get_time(&self) -> f64 {
+        unsafe { vorbis_decoder_get_time(self.ptr) }
+    }
+
+    /// Get the current decode position in PCM samples using Vorbisfile's ov_pcm_tell
+    pub fn get_pcm_pos(&self) -> i64 {
+        unsafe { vorbis_decoder_get_pcm_pos(self.ptr) }
+    }
+
+    /// Seek to a specific PCM sample position
+    pub fn seek_pcm(&mut self, pcm_pos: i64) -> Result<(), String> {
+        let ret = unsafe { vorbis_decoder_seek_pcm(self.ptr, pcm_pos) };
+        if ret < 0 {
+            return Err("Vorbis PCM seek failed".into());
+        }
+        Ok(())
+    }
+
+    /// Seek to a specific time position in seconds
+    pub fn seek_time(&mut self, time_sec: f64) -> Result<(), String> {
+        let ret = unsafe { vorbis_decoder_seek_time(self.ptr, time_sec) };
+        if ret < 0 {
+            return Err("Vorbis time seek failed".into());
+        }
+        Ok(())
     }
 }
 

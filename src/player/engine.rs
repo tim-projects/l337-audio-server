@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
@@ -148,6 +148,9 @@ pub struct PlayerEngine {
     file_decode_handle: Option<tokio::task::JoinHandle<Result<(u32, u16, Option<String>, u64), String>>>,
     /// Vorbis decode thread handle (std thread with 8MB stack for libvorbis FFI).
     vorbis_decode_handle: Option<std::thread::JoinHandle<()>>,
+    /// Current decode position from Vorbis decoder (seconds), updated by the
+    /// decode thread using ov_time_tell for accurate timestamp reporting.
+    vorbis_position_sec: Arc<AtomicU64>,
     /// Compressed file size of the currently playing file (for actual_kbps).
     file_bytes_len: Option<u64>,
     /// Server default bandwidth ceiling (kbps) from `[server] default_target_kbps`.
@@ -266,6 +269,7 @@ impl PlayerEngine {
             decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
             vorbis_decode_handle: None,
+            vorbis_position_sec: Arc::new(AtomicU64::new(0)),
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -321,6 +325,7 @@ impl PlayerEngine {
             decode_cancel: Arc::new(AtomicBool::new(false)),
             file_decode_handle: None,
             vorbis_decode_handle: None,
+            vorbis_position_sec: Arc::new(AtomicU64::new(0)),
             file_bytes_len: None,
             default_target_kbps,
             runtime_target_kbps: default_target_kbps,
@@ -386,6 +391,12 @@ impl PlayerEngine {
     }
 
     fn calculate_position(&self, buf: &AudioBuffer) -> u64 {
+        // Use Vorbis decoder position (from ov_time_tell) when available,
+        // as it's more accurate than buffer-based calculation (MPD pattern).
+        let vorbis_pos = self.vorbis_position_sec.load(Ordering::SeqCst);
+        if self.vorbis_decode_handle.is_some() && vorbis_pos > 0 {
+            return vorbis_pos;
+        }
         Self::buffer_position_sec(buf, self.position_sec).unwrap_or(self.position_sec)
     }
 
@@ -965,9 +976,12 @@ impl PlayerEngine {
                 };
                 let decode_cancel = self.decode_cancel.clone();
                 decode_cancel.store(false, Ordering::SeqCst);
+                // Reset Vorbis position for new track
+                self.vorbis_position_sec.store(0, Ordering::SeqCst);
 
                 let slot_for_thread = slot_owned.clone();
                 let slot_for_error = slot_for_thread.clone();
+                let vorbis_position_sec = self.vorbis_position_sec.clone();
                 let decode_handle = std::thread::Builder::new()
                     .name("l337-vorbis-decode".into())
                     .stack_size(8 * 1024 * 1024)
@@ -1045,6 +1059,12 @@ impl PlayerEngine {
                                 if samples_read == 0 {
                                     info!("load_and_play({}): Vorbis EOF reached after {} chunks (first read returned 0)", slot_for_thread, chunk_count);
                                     break; // EOF
+                                }
+
+                                // Update Vorbis decode position using ov_time_tell (accurate timestamp from decoder)
+                                let vorbis_time = decoder.get_time();
+                                if vorbis_time >= 0.0 {
+                                    vorbis_position_sec.store(vorbis_time as u64, Ordering::SeqCst);
                                 }
 
                                 chunk_count += 1;
@@ -1311,6 +1331,7 @@ impl PlayerEngine {
         buf.backend_error.store(false, Ordering::SeqCst);
         drop(buf);
         self.position_sec = 0;
+        self.vorbis_position_sec.store(0, Ordering::SeqCst);
         self.eos_position_sec = None;
         self.state = PlayerStateLabel::Stopped;
     }

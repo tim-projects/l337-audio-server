@@ -74,6 +74,26 @@ int vorbis_decoder_read_chunk(VorbisDecoder* dec, float* out_buffer, int max_sam
     return 1; // more data available
 }
 
+double vorbis_decoder_get_time(VorbisDecoder* dec) {
+    if (!dec || !dec->initialized) return -1.0;
+    return ov_time_tell(&dec->vf);
+}
+
+long vorbis_decoder_get_pcm_pos(VorbisDecoder* dec) {
+    if (!dec || !dec->initialized) return -1;
+    return ov_pcm_tell(&dec->vf);
+}
+
+int vorbis_decoder_seek_pcm(VorbisDecoder* dec, long pcm_pos) {
+    if (!dec || !dec->initialized) return -1;
+    return ov_pcm_seek(&dec->vf, pcm_pos);
+}
+
+int vorbis_decoder_seek_time(VorbisDecoder* dec, double time_sec) {
+    if (!dec || !dec->initialized) return -1;
+    return ov_time_seek(&dec->vf, time_sec);
+}
+
 void vorbis_decoder_close(VorbisDecoder* dec) {
     if (dec) {
         if (dec->initialized) {

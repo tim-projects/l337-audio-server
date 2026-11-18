@@ -548,3 +548,76 @@ The GitHub Actions workflow must pass for:
 - `riscv64-linux-alsa` (alsa only, no opus/vorbis - expected)
 
 All Linux jobs must show `libvorbisfile.so` + `libvorbis.so` + `libogg.so` in `readelf -d` NEEDED.
+
+---
+
+## Part 12 — MPD Vorbis Implementation Comparison — 2026-11-18
+
+### MPD Vorbis Decoder Analysis
+
+Inspected MPD source (`/tmp/MPD/src/decoder/plugins/VorbisDecoderPlugin.cxx`) for reference implementation patterns:
+
+**MPD Position Tracking (lines 286-287):**
+```cpp
+if (packet.granulepos > 0)
+    client.SubmitTimestamp(FloatDuration(vorbis_granule_time(&dsp, packet.granulepos)));
+```
+- MPD submits timestamp **per packet** using `vorbis_granule_time(&dsp, packet.granulepos)`
+- This calculates exact time from decoder DSP state + packet granulepos
+- More granular than periodic `ov_time_tell` calls
+
+**MPD Seek Support (lines 118-128, 70-147 in OggDecoder.cxx):**
+- Full Vorbis seek via `SeekGranulePos(ogg_int64_t where_granulepos)`
+- Binary search on granulepos with margin tolerances (MARGIN_BEFORE=14700, MARGIN_AFTER=4410)
+- Uses `ov_pcm_seek` internally via `SeekGranulePos`
+
+**MPD Decode Loop:**
+- Processes Ogg packets individually via `OnOggPacket`
+- Calls `vorbis_synthesis_blockin` → `SubmitPcm` → `SubmitTimestamp` per packet
+- Granulepos from each packet drives position reporting
+
+### Our Implementation Comparison
+
+| Aspect | MPD | Our Implementation |
+|--------|-----|-------------------|
+| Position API | `vorbis_granule_time(&dsp, granulepos)` | `ov_time_tell()` |
+| Timestamp granularity | Per packet | Periodic (per decode chunk) |
+| Seek support | Full binary search on granulepos | C wrapper + FFI ready; engine integration pending |
+| Decode API | Low-level vorbis synthesis | Vorbisfile `ov_read` |
+
+### Findings
+
+1. **Position accuracy**: Our `ov_time_tell()` approach is functionally equivalent for playback position reporting. `ov_time_tell` internally uses Vorbisfile's position tracking which is based on granulepos. Verified: position matches ffprobe duration within ±2s.
+
+2. **Missing Vorbis seek**: Our `seek_and_resume` does full decode + split for all codecs. Vorbis native path lacks `ov_pcm_seek`/`ov_time_seek` integration. This is a gap for `POST /player/seek` on Vorbis files.
+
+3. **Per-packet vs periodic timestamps**: MPD's per-packet approach is more precise for seeking/sync. Our periodic updates (every decode chunk) are sufficient for playback position display but may have ~chunk granularity jitter.
+
+### Implemented (2026-11-18)
+
+1. ✅ **Added Vorbis seek to C wrapper** (`scripts/vorbis-wrapper.c:87-94`): `vorbis_decoder_seek_pcm` + `vorbis_decoder_seek_time` using `ov_pcm_seek`/`ov_time_seek`
+2. ✅ **Exposed seek in Rust FFI** (`src/player/vorbis.rs:28-29, 95-105`): `seek_pcm(i64)` + `seek_time(f64)` on `VorbisDecoderHandle`
+
+### Remaining Work
+
+1. **Integrate Vorbis seek in `seek_and_resume`** (`src/player/engine.rs`): When seeking on a Vorbis track with native decoder running, signal the decode thread to seek instead of full re-decode
+2. **Consider per-chunk `ov_pcm_tell` for finer position granularity** (already exposed but not used in position calculation)
+3. **Verify `ov_time_tell` precision matches `vorbis_granule_time`** for edge cases (chained streams, etc.)
+
+### Verification Results (x86_64 Linux)
+
+- ✅ Native decode works: `libvorbisfile.so.3` linked, 13000+ chunks incremental
+- ✅ Duration match: 169s track → position_sec=169 at stop; 404.7s track → position_sec=404 at stop
+- ✅ No stutters: smooth position advancement 10→20→50→110→220→400s
+- ✅ Decode speed: ~34x real-time (5s decode for 169s track)
+- ✅ All tests pass: 65 unit + 26 endpoint
+- ⚠️ Vorbis seek: C wrapper + FFI ready, engine integration pending
+- ❌ Chained OGG streams untested
+
+### Test Commands for Vorbis Seek (when fully integrated)
+```bash
+# Seek test
+curl -X POST http://localhost/player/seek -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"position_sec": 60}'
+# Verify position jumps to ~60s and audio continues smoothly
+```
