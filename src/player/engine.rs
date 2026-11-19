@@ -2380,7 +2380,7 @@ fn decode_file_incremental_blocking(
                 let mut write_out = out;
                 if head.channels == 1 {
                     let mut stereo = Vec::with_capacity(write_out.len() * 2);
-                    for &sample in &out {
+                    for &sample in &write_out {
                         stereo.push(sample); // L
                         stereo.push(sample); // R
                     }

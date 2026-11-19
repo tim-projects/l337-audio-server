@@ -600,9 +600,9 @@ if (packet.granulepos > 0)
 
 ### Remaining Work
 
-1. **Integrate Vorbis seek in `seek_and_resume`** (`src/player/engine.rs`): When seeking on a Vorbis track with native decoder running, signal the decode thread to seek instead of full re-decode
+1. ~~**Integrate Vorbis seek in `seek_and_resume`**~~ — DONE (commit `17743d0`): `vorbis_seek_request_sec: Arc<AtomicU64>` on `PlayerEngine` (`src/player/engine.rs:156`), set by `seek_and_resume` (`engine.rs:434`), consumed by the decode loop which calls `VorbisDecoderHandle::seek_time` and clears the flag (`engine.rs:1083-1090`).
 2. **Consider per-chunk `ov_pcm_tell` for finer position granularity** (already exposed but not used in position calculation)
-3. **Verify `ov_time_tell` precision matches `vorbis_granule_time`** for edge cases (chained streams, etc.)
+3. **Verify `ov_time_tell` precision matches `vorbis_granule_time`** for edge cases (chained streams, etc.) — chained OGG streams remain untested
 
 ### Verification Results (x86_64 Linux)
 
@@ -621,3 +621,55 @@ curl -X POST http://localhost/player/seek -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"position_sec": 60}'
 # Verify position jumps to ~60s and audio continues smoothly
 ```
+---
+
+# Part 13 — CI prerelease run failures — 2026-11-18 (run `44373750925`)
+
+**Trigger.** `gh workflow run "Build Release Binaries" -f branch=main -f target=all`
+(prerelease; all 11 platform jobs). Windows, macOS and the version/installer-validate
+jobs passed; **every Linux + Android job failed.**
+
+## Failures found (all jobs, identical root causes)
+
+| Job(s) | Failure | Root cause |
+|---|---|---|
+| `armv7-linux (alsa)`, `riscv64-linux (alsa)` | apt: `E: Unable to locate package libvorbis-dev:armhf` / `:riscv64` (and `libogg-dev`) | The apt steps requested **arch-qualified `libvorbis-dev:armhf` / `libogg-dev:armhf` / `libvorbis-dev:riscv64` / `libogg-dev:riscv64`** packages. Debian's armhf/riscv64 ports do not publish those packages. |
+| `x86_64-linux (alsa/pipewire)`, `aarch64-linux (alsa/pipewire)`, `aarch64-linux-android (termux)` (and the two earlier runs `44341491009`, `44271575749`) | `error[E0382]: borrow of moved value: \`out\`` at `src/player/engine.rs:2383` (2379 on the older commit) | `let mut write_out = out;` moves the `Vec<f32>`, then `for &sample in &out` borrows the moved value. |
+
+The Android jobs in run `44373750925` only showed `cancelled` because the matrix
+runs `fail-fast: true` (Finding #8) — the older runs prove the Android job hits the
+same E0382 error, not a third failure mode.
+
+## Fixes applied (this commit)
+
+1. `.github/workflows/build.yml` — armv7/riscv64 "Install dependencies and Rust
+   target" steps no longer install the vorbis/ogg packages. These targets build
+   `--no-default-features --features alsa` (no `vorbis` feature), and `build.rs:91`
+   (`link_vorbis`) is gated on `CARGO_FEATURE_VORBIS`, so libvorbis is never linked
+   there. The jobs keep `pkg-config` + the cross toolchains, which they do need to
+   link `libasound`.
+2. `src/player/engine.rs:2383` — the mono→stereo upmix loop now iterates
+   `&write_out` instead of the moved `&out`, matching the other two upmix sites
+   (`engine.rs:795`, `engine.rs:2549`). No clone, no extra allocation; behavior
+   unchanged.
+
+## Risks carried by these fixes (know before merging)
+
+1. **No compile verification on this host.** This environment has no Rust
+   toolchain (`cargo` is not installed, and AGENTS.md forbids building into the
+   repo `target/`), so the E0382 fix is verified by inspection against the two
+   working sibling sites, not by `cargo check`. If CI still reports E0382, the
+   fix is wrong.
+2. **Cross-libvorbis debt for armv7/riscv64.** If either target ever enables the
+   `vorbis` feature, it needs a real cross-compiled libvorbis (stub or ports
+   package) — re-adding the deleted apt lines will fail again. Not needed today.
+3. **Prior failed runs not re-examined for other failure modes.** Runs
+   `44341491009` / `44271575749` were checked only at job level; both showed the
+   same two causes, but only their failing Linux jobs' final error lines were
+   inspected.
+4. **Unverifiable from this sandbox:** any playback-quality claim (stutter/speed/
+   duration match) still requires a device or a host with audio output hardware;
+   the prerelease build only proves compilation + linkage.
+5. Chained-OGG Vorbis streams remain untested (Part 12), and the Part 8 mono
+   position-jump item was last reproduced on an older build — both need a device
+   re-test, not CI.

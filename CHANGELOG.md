@@ -14,6 +14,17 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- CI: Linux and Android release builds no longer fail to compile. The native
+  Opus mono→stereo upmix in the Rust Opus decode path
+  (`src/player/engine.rs:2383`) borrowed `out` after it was moved into
+  `write_out` (`error[E0382]`); it now iterates `write_out`, matching the two
+  other upmix sites (`engine.rs:795`, `engine.rs:2549`).
+- CI: the `armv7-linux` and `riscv64-linux` release builds no longer fail at
+  dependency install. They build `--no-default-features --features alsa`
+  (no `vorbis` feature), so `link_vorbis()` in `build.rs` is skipped; the
+  previously requested `libvorbis-dev:armhf` / `libogg-dev:armhf` and
+  `libvorbis-dev:riscv64` / `libogg-dev:riscv64` packages do not exist in
+  Debian's armhf/riscv64 ports and are now removed from the apt steps.
 - Local file playback no longer fails when the cache disk is full: if a `file://` URL points to a locally accessible file, the server now streams it directly instead of copying to cache; on ENOSPC during copy, it logs a warning and falls back to direct streaming.
 - Cache directory is now recreated automatically if deleted at runtime: `StorageManager::ensure_cache_dir()` is called before cache operations, so the server recovers from manual cache deletion without restart.
 - `[server] loglevel` config key (`error`/`warn`/`info`/`debug`/`trace`):
