@@ -14,6 +14,11 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- Dummy-mode duration match: seeking on the file path recomputed the remaining
+  duration from the resampler's device-rate (48 kHz) output while dividing by
+  the file's rate, so a seek to 30 s of a 44.1 kHz track reported 33 s
+  remaining. `seek()` now divides the device-rate frame count by the device
+  rate, matching the primary duration fix below.
 - Dummy-mode duration match: `decode_from_position_blocking` counted the
   resampler's device-rate (48 kHz) output frames while returning the file's own
   sample rate, inflating `duration_sec` by `device_rate/file_rate` — a 44.1 kHz

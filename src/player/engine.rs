@@ -1786,8 +1786,11 @@ impl PlayerEngine {
 
         // Clamp position to track duration so the reported playhead is always
         // reachable (seeking at/past the end leaves nothing to play).
+        // `pcm` is resampler output, i.e. device-rate frames: dividing by the
+        // file's rate would inflate the clamp bound and the remaining duration
+        // by device_rate/file_rate (30 s remaining reported as 33 s).
         let total_frames = pcm.len() / (channels as usize);
-        let total_sec = (total_frames as f64 / file_sample_rate as f64).round() as u64;
+        let total_sec = (total_frames as f64 / device_rate as f64).round() as u64;
         let position = position.min(total_sec);
 
         self.file_sample_rate = file_sample_rate;
@@ -1807,7 +1810,7 @@ impl PlayerEngine {
         self.position_sec = position;
         let remaining_frames = total_frames;
         self.duration_sec =
-            Some((remaining_frames as f64 / file_sample_rate as f64).round() as u64);
+            Some((remaining_frames as f64 / device_rate as f64).round() as u64);
         self.state = PlayerStateLabel::Playing;
     }
 
