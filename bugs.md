@@ -706,3 +706,11 @@ step already tolerates the "No prerelease" outcome but not rate limiting.
 3. armv7/riscv64 and both Android jobs passing proves compilation + linkage
    only — playback quality is still unverifiable from this sandbox (Part 13
    risk 4).
+
+## Verified green — 2026-11-19 (run `44487063514`, tag from commit `ac06ad2`)
+
+All 13 jobs pass (version/installer-validate, 11 platform builds, publish),
+including the previously failing `x86_64/aarch64` x `alsa/pipewire` Vorbis
+linkage checks and the rate-limit-prone installer dry-run. Release published as
+a prerelease with all platform assets. Nothing in this run exercises playback
+quality (Part 13 risk 4 still stands).
