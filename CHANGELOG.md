@@ -14,6 +14,13 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- Dummy-mode duration match: `decode_from_position_blocking` counted the
+  resampler's device-rate (48 kHz) output frames while returning the file's own
+  sample rate, inflating `duration_sec` by `device_rate/file_rate` — a 44.1 kHz
+  60 s Vorbis reported 65 s, and the 30 s remaining after a seek reported 33 s.
+  Frames are now counted at the file's rate (the resampler input), matching the
+  Opus path and the returned `file_sample_rate`. Reproduced on a live dummy-mode
+  server.
 - CI: the release Linux jobs no longer fail the post-build Vorbis linkage
   check. `scripts/vorbis-wrapper.c` calls the libvorbisfile `ov_*` API only, so
   under Debian's default `--as-needed` the link emits a `libvorbisfile.so`
