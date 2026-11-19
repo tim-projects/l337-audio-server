@@ -2852,10 +2852,15 @@ fn decode_from_position_blocking(
                         }
                     }
 
+                    // Count frames at the file's own rate: total_frames is later
+                    // divided by file_sample_rate, so counting the resampler's
+                    // device-rate output would inflate duration by
+                    // device_rate/file_sample_rate (60 s -> 65 s for 44.1 kHz
+                    // on a 48 kHz device).
+                    total_frames += (output.len() / channels as usize) as u64;
                     let resampled = resampler.process(&output);
                     if !resampled.is_empty() {
                         pcm.extend_from_slice(&resampled);
-                        total_frames += (resampled.len() / channels as usize) as u64;
                     }
                 }
             }
@@ -2869,10 +2874,10 @@ fn decode_from_position_blocking(
             if pulled.is_empty() {
                 break;
             }
+            total_frames += (pulled.len() / channels as usize) as u64;
             let resampled = resampler.process(&pulled);
             if !resampled.is_empty() {
                 pcm.extend_from_slice(&resampled);
-                total_frames += (resampled.len() / channels as usize) as u64;
             }
         }
     }
