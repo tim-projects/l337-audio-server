@@ -176,13 +176,15 @@ jobs:
     - name: Verify Vorbis linkage
       if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
       run: |
+        # Only assert the DIRECT dependency: scripts/vorbis-wrapper.c calls the
+        # libvorbisfile ov_* API, and Debian's default --as-needed drops the
+        # libvorbis.so/libogg.so NEEDED entries (they load transitively as
+        # libvorbisfile's own dependencies).
         BIN=target/x86_64-unknown-linux-gnu/release/l337-audio-server
-        for lib in libvorbisfile.so libvorbis.so libogg.so; do
-          if ! readelf -d "$BIN" | grep -q "$lib"; then
-            echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against $lib"
-            exit 1
-          fi
-        done
+        if ! readelf -d "$BIN" | grep -q 'libvorbisfile.so'; then
+          echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against libvorbisfile.so"
+          exit 1
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -297,13 +299,15 @@ jobs:
     - name: Verify Vorbis linkage
       if: ${{ matrix.variant == 'pipewire' || matrix.variant == 'alsa' }}
       run: |
+        # Only assert the DIRECT dependency: scripts/vorbis-wrapper.c calls the
+        # libvorbisfile ov_* API, and Debian's default --as-needed drops the
+        # libvorbis.so/libogg.so NEEDED entries (they load transitively as
+        # libvorbisfile's own dependencies).
         BIN=target/aarch64-unknown-linux-gnu/release/l337-audio-server
-        for lib in libvorbisfile.so libvorbis.so libogg.so; do
-          if ! readelf -d "$BIN" | grep -q "$lib"; then
-            echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against $lib"
-            exit 1
-          fi
-        done
+        if ! readelf -d "$BIN" | grep -q 'libvorbisfile.so'; then
+          echo "::error::${{ matrix.variant }} built with --features vorbis but not linked against libvorbisfile.so"
+          exit 1
+        fi
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:

@@ -640,6 +640,25 @@ The Android jobs in run `44373750925` only showed `cancelled` because the matrix
 runs `fail-fast: true` (Finding #8) — the older runs prove the Android job hits the
 same E0382 error, not a third failure mode.
 
+## Second run after those fixes (run `44485649236`, commit `a613aa7`)
+
+armv7, riscv64, both Android jobs, Windows and both macOS jobs now **PASS**.
+Four Linux jobs (`x86_64/aarch64` x `alsa/pipewire`) failed at the post-build
+**Verify Vorbis linkage** step: `built with --features vorbis but not linked
+against libvorbis.so`. Cause: the check demanded `libvorbisfile.so`,
+`libvorbis.so` **and** `libogg.so` as `DT_NEEDED` entries of the executable.
+`scripts/vorbis-wrapper.c` only calls the libvorbisfile `ov_*` API, so under
+Debian's default `--as-needed` the linker emits the `libvorbisfile.so` NEEDED
+entry (which the check saw pass) and drops `libvorbis.so`/`libogg.so` — they
+load transitively as libvorbisfile's own dependencies. The link itself is
+correct; the check was stricter than the linker semantics. The step now asserts
+the direct dependency only.
+
+Separately, **Validate installer scripts** failed: `scripts/install.ps1
+-DryRun -PreRelease` got `API rate limit exceeded` from the unauthenticated
+GitHub Releases API on the shared runner IP. Transient infra, not code — the
+step already tolerates the "No prerelease" outcome but not rate limiting.
+
 ## Fixes applied (this commit)
 
 1. `.github/workflows/build.yml` — armv7/riscv64 "Install dependencies and Rust
@@ -673,3 +692,17 @@ same E0382 error, not a third failure mode.
 5. Chained-OGG Vorbis streams remain untested (Part 12), and the Part 8 mono
    position-jump item was last reproduced on an older build — both need a device
    re-test, not CI.
+
+### Follow-up risks (run 44485649236, 2026-11-19)
+
+1. **Linkage check now proves less than before.** Asserting only
+   `libvorbisfile.so` still proves the native Vorbis path is linked (Symphonia
+   fallback would have no NEEDED entry at all), but if a future refactor makes
+   the wrapper call `vorbis_synthesis_*` directly, `libvorbis.so` would become
+   the direct dependency and this check must be widened back.
+2. **The rate-limit failure can recur** on any workflow run that shells out to
+   `install.ps1 -DryRun`; it is tolerated only for prerelease-absence, so a
+   re-run may be needed for a fully green run even with all code fixes in.
+3. armv7/riscv64 and both Android jobs passing proves compilation + linkage
+   only — playback quality is still unverifiable from this sandbox (Part 13
+   risk 4).

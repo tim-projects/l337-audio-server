@@ -14,6 +14,13 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- CI: the release Linux jobs no longer fail the post-build Vorbis linkage
+  check. `scripts/vorbis-wrapper.c` calls the libvorbisfile `ov_*` API only, so
+  under Debian's default `--as-needed` the link emits a `libvorbisfile.so`
+  `DT_NEEDED` entry and drops `libvorbis.so`/`libogg.so` (transitive deps of
+  libvorbisfile). The check required all three and now asserts the direct
+  dependency, which still proves the native Vorbis path is linked rather than
+  the Symphonia fallback.
 - CI: Linux and Android release builds no longer fail to compile. The native
   Opus mono→stereo upmix in the Rust Opus decode path
   (`src/player/engine.rs:2383`) borrowed `out` after it was moved into
