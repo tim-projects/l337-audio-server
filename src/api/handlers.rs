@@ -254,6 +254,9 @@ pub async fn cache_next(
     tokio::spawn(async move {
         let (dest, track_id, ceiling) = {
             let engine = state_clone.0.lock().await;
+            // Recreate the cache dir if it was deleted at runtime (ENOENT
+            // otherwise). Same guard as upload_stream.
+            let _ = engine.storage.ensure_cache_dir().await;
             (
                 engine.storage.get_active_slot_path("next"),
                 track.track_id.clone(),
@@ -306,6 +309,9 @@ pub async fn cache_previous(
     tokio::spawn(async move {
         let (dest, track_id, ceiling) = {
             let engine = state_clone.0.lock().await;
+            // Recreate the cache dir if it was deleted at runtime (ENOENT
+            // otherwise). Same guard as upload_stream.
+            let _ = engine.storage.ensure_cache_dir().await;
             (
                 engine.storage.get_active_slot_path("prev"),
                 track.track_id.clone(),
@@ -577,6 +583,17 @@ pub async fn upload_stream(
 
     let dest = {
         let engine = state.0.lock().await;
+        // The cache dir may have been deleted while the server was running;
+        // without this the slot file cannot be opened and the upload fails
+        // with a bare "upload failed" (same ENOENT class as play_track).
+        if let Err(e) = engine.storage.ensure_cache_dir().await {
+            error!("upload_stream: failed to recreate cache dir: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": "upload failed"})),
+            )
+                .into_response();
+        }
         engine.storage.get_active_slot_path(&slot)
     };
 

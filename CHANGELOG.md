@@ -14,6 +14,12 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- Stream uploads (`/player/play/stream`, `/player/cache/{next,previous}/stream`)
+  no longer fail with `{"error":"upload failed"}` when the cache directory was
+  deleted while the server was running: the handlers now recreate the cache dir
+  before opening the slot file, the same guard `play_track` already had.
+  Reproduced on a live dummy-mode instance (cache dir removed mid-run → upload
+  failed, dir not recreated); fixed and re-verified on `2026.11.19-5`.
 - Dummy-mode duration match: seeking on the file path recomputed the remaining
   duration from the resampler's device-rate (48 kHz) output while dividing by
   the file's rate, so a seek to 30 s of a 44.1 kHz track reported 33 s
