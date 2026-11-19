@@ -714,3 +714,68 @@ including the previously failing `x86_64/aarch64` x `alsa/pipewire` Vorbis
 linkage checks and the rate-limit-prone installer dry-run. Release published as
 a prerelease with all platform assets. Nothing in this run exercises playback
 quality (Part 13 risk 4 still stands).
+
+---
+
+# Part 14 — Live dummy-mode access + verification pass — 2026-11-19
+
+## Access confirmed (live systemd install, run 7)
+
+The installed server is `l337.audio-server` under systemd (`User=l337`,
+`PrivateTmp=true`, `ProtectSystem=strict`), version **2026.11.19-2** (the fixed
+prerelease from Part 13), dummy mode, Unix-socket transport. Token obtained from
+`GET /setup` (unauthenticated). **The live socket is
+`/run/l337-audio-server/l337-audio-server/l337.sock`** — AGENTS.md documented
+`/run/l337-audio-server/l337.sock`, which does not exist; AGENTS.md has been
+corrected. `PrivateTmp=true` also means the server cannot see host `/tmp` or
+`/var/tmp` (a bare-path play returns `Failed to download track: builder error`
+because reqwest parses the path as a relative URL); use
+`POST /player/play/stream` with the raw bytes.
+
+**Endpoints verified live:** `/version`, `/health` (200, capability advert incl.
+`yt_dlp: true`), `/player/status`, `/player/play`, `/player/play/stream`,
+`/player/seek`, `/player/pause`, `/player/stop`.
+
+## What dummy mode can and cannot verify (established here)
+
+- **Cannot:** `position_sec` advance (stays 0 — no writer consumes the buffer, so
+  `read_pos` never advances), EOS/stopped transition after natural end of track
+  (state stays `playing` forever — expected dummy semantics, AGENTS.md), the
+  ±2 s duration match criterion (which is defined by position at `stopped`).
+- **Can:** decode correctness per codec, `duration_sec`, `codec`, seek position
+  and remaining duration, error handling. Anything longer than the rebuffer
+  window (~24 MiB ≈ 68 s of 44.1 kHz stereo decoded PCM) stalls the decode in
+  dummy mode — a **dummy-mode artifact, not a bug** (a 180 s OGG hung the
+  stream-upload response; the same file on a real backend drains via the writer).
+- **Caution:** a never-consuming writer means local-file/stream playback in dummy
+  mode *blocks* the HTTP response until the whole file fits the window.
+
+## Defects found and fixed this pass (all reproduced live / on isolated dummy instances)
+
+| # | Defect | Root cause | Fix | Verified |
+|---|---|---|---|---|
+| 1 | 44.1 kHz file reported duration 65 s for a 60 s track (ffprobe 60.000) | `decode_from_position_blocking` counted the resampler's **device-rate** (48 kHz) output frames and returned them with the file's own rate; `decode_file_sync` divides by `file_sample_rate` → +8.8 % | count the resampler **input** frames (file rate) at all three Symphonia sites, matching the Opus path and the returned rate | isolated dummy instance on `2026.11.19-3`: 60 s (was 65), MP3 44.1 kHz 30 s exact, mono Opus 48 kHz 12 s exact |
+| 2 | Seek to 30 s of the same track reported 33 s remaining | `seek()` divides `pcm.len()` — resampler output, i.e. device-rate frames — by `file_sample_rate` for both the clamp bound and the remaining duration | divide by `device_rate` (the pcm's own rate) | isolated dummy instance on `2026.11.19-4`: position 30, duration 30 |
+| 3 | Stream upload failed (`{"error":"upload failed"}`) whenever the cache dir was absent/deleted at runtime | `upload_stream` (and the "cache next/previous stream" background tasks) opened the slot file without recreating the cache dir — the `ensure_cache_dir()` guard existed only in `play_track`, which runs *after* the upload | recreate the cache dir inside `upload_stream` and both background cache tasks before touching the slot path | isolated dummy instance on `2026.11.19-5`: upload succeeds with the dir absent at boot **and** deleted mid-run; cached track + duration 60 correct |
+
+Untouched on purpose (unreachable or device-only):
+- `decode_file_incremental` (the one-shot Vorbis branch, incl. a double
+  `total_frames += frames`) has **no callers** — dead code, left as-is.
+- The native-Vorbis decode thread (real backend) logs `duration_sec` from
+  `get_info()` but never writes it to the engine, so `duration_sec` may stay
+  `null` for native-Vorbis playback on device — **unverified here, device-only
+  path**; the live dummy instance always used the Symphonia path.
+- The Vorbis 180 s mid-dummy stall (Part 14 note above) is a dummy artifact.
+
+## Risks carried by this pass
+
+1. Fixes 1 and 2 change dummy-mode duration math only; the real-backend paths
+   (`decode_file_incremental_blocking`, which returns a hardcoded 48 000) were
+   left untouched, so a device rate ≠ 48 kHz still skews any position math that
+   divides device frames by the file rate elsewhere.
+2. The duration numbers are exact to ±1 s against ffprobe on 44.1 kHz and 48 kHz
+   synthetic files; chained OGG, VBR MP3 edge and the MPD-style position
+   timeline still need a real backend/device to re-verify (sandbox has no audio
+   hardware).
+3. AGENTS.md's socket path was wrong; the corrected path is inside the systemd
+   `RuntimeDirectory`, which an operator renaming that unit would move again.
