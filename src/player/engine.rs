@@ -1196,6 +1196,9 @@ impl PlayerEngine {
                                     drop(ab);
                                     if over {
                                         crate::platform::common::AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                                        if decode_cancel.load(Ordering::SeqCst) {
+                                            break;
+                                        }
                                     }
                                     off = end;
                                 }
@@ -1224,6 +1227,9 @@ impl PlayerEngine {
                                     drop(ab);
                                     if over {
                                         crate::platform::common::AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                                        if decode_cancel.load(Ordering::SeqCst) {
+                                            break;
+                                        }
                                     }
                                     off = end;
                                 }
@@ -2406,6 +2412,9 @@ fn decode_file_incremental_blocking(
                 drop(ab);
                 if over {
                     AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
             }
         }
@@ -2581,6 +2590,9 @@ fn decode_file_incremental_blocking(
                     }; // ab dropped here so callback can consume
                     if over {
                         AudioBuffer::wait_for_space_var(&space_notify, std::time::Duration::from_millis(20));
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
                     }
                 }
             }
