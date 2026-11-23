@@ -779,3 +779,31 @@ Untouched on purpose (unreachable or device-only):
    hardware).
 3. AGENTS.md's socket path was wrong; the corrected path is inside the systemd
    `RuntimeDirectory`, which an operator renaming that unit would move again.
+
+---
+
+## NEW: Seek not working for local file playback (file:// URLs)
+
+**Date:** 2026-11-23
+
+**Issue:** `POST /player/seek` with `position_sec` returns `{"ok": true}` but does not actually seek when playing local files (`file://` URLs). The position stays the same or continues advancing normally.
+
+**Client behavior (verified working):**
+- Client correctly fetches current position from `/player/status`
+- Adds relative offset (+10/-10) to get absolute position
+- Sends `{"position_sec": <absolute>}` to `/player/seek`
+- Server responds `{"ok": true}`
+
+**Server behavior (bug):**
+- Returns 200 OK but position does not change
+- Works for streaming URLs (YouTube, etc.) — unverified but expected to work
+- Does NOT work for `file://` local file playback
+
+**Root cause hypothesis:** The server's seek handler likely only implements seeking for streaming sources (which use a downloader/decoder that supports seeking) but not for local files which may use a different playback path (direct file access via Symphonia/ffmpeg).
+
+**Files to check:**
+- Server seek endpoint handler
+- Local file playback path vs streaming playback path
+- Whether `file://` URLs use a different decoder that doesn't support seeking
+
+**Verification:** Test with `curl --unix-socket /run/l337-audio-server/l337.sock http://localhost/player/seek -X POST -H "Content-Type: application/json" -d '{"position_sec": 100}'` while playing a local file.

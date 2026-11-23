@@ -447,7 +447,7 @@ impl PlayerEngine {
         }
 
         // Fallback: full re-decode for other codecs
-        let path = self.storage.get_active_slot_path("current");
+        let path = self.get_seek_path();
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let decode =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_to_pcm(bytes)));
@@ -1747,6 +1747,16 @@ impl PlayerEngine {
         true
     }
 
+    fn get_seek_path(&self) -> PathBuf {
+        if let Some(track) = &self.current_track {
+            let local_path = PathBuf::from(track.stream_url.strip_prefix("file://").unwrap_or(&track.stream_url));
+            if local_path.is_absolute() && local_path.exists() {
+                return local_path;
+            }
+        }
+        self.storage.get_active_slot_path("current")
+    }
+
     pub fn seek(&mut self, position: u64) {
         if self.check_backend_error() {
             let _ = self.try_recover();
@@ -1760,7 +1770,7 @@ impl PlayerEngine {
         // Seek refills the buffer, so it needs a live writer to drain it.
         self.ensure_stream();
 
-        let path = self.storage.get_active_slot_path("current");
+        let path = self.get_seek_path();
         let path_clone = path.clone();
         let speed = self.speed;
         let pitch = self.pitch;
