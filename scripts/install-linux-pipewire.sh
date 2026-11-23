@@ -828,11 +828,12 @@ setup_systemd_user() {
             local sudoers_file="/etc/sudoers.d/l337-audio-server-restart"
             cat > "$sudoers_file" <<SUDOERS_EOF
 # Allow ${SUDO_USER} to manage l337-audio-server user service as l337 user
-${SUDO_USER} ALL=(l337) NOPASSWD: \\
+${SUDO_USER} ALL=(l337) SETENV: NOPASSWD: \\
     /usr/bin/systemctl --user start l337-audio-server.service, \\
     /usr/bin/systemctl --user stop l337-audio-server.service, \\
     /usr/bin/systemctl --user restart l337-audio-server.service, \\
-    /usr/bin/systemctl --user is-active l337-audio-server.service
+    /usr/bin/systemctl --user is-active l337-audio-server.service, \
+    /usr/bin/systemctl --user status l337-audio-server.service \
 SUDOERS_EOF
             chmod 0440 "$sudoers_file"
             info "Created sudoers rule: $sudoers_file"
@@ -1250,6 +1251,15 @@ fi
 # The binary was downloaded into TMPDIR by install.sh: drop it once it is
 # safely deployed.
 [ "$BINARY_INPUT" != "$INSTALL_DIR/l337-audio-server" ] && rm -f "$BINARY_INPUT"
+
+# Show final systemd status
+if [ -n "$TARGET_USER" ]; then
+    info "Final systemd status for $TARGET_USER:"
+    run_as_user "$real_user" -- systemctl --user status l337-audio-server.service --no-pager 2>/dev/null || true
+else
+    info "Final systemd status for $USER_NAME:"
+    run_as_user "$USER_NAME" -- systemctl --user status l337-audio-server.service --no-pager 2>/dev/null || true
+fi
 
 echo
 if [ -n "$TARGET_USER" ]; then
