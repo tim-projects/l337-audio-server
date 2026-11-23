@@ -659,7 +659,7 @@ async fn main() {
         .route("/health", get(handlers::health))
         .route("/version", get(handlers::version))
         .route("/setup", get(handlers::setup))
-        .route("/", get(|| async { "L337 Audio Server" }))
+        .route("/", get(handlers::root))
         .route("/player/play", post(handlers::play))
         .route("/player/play/stream", post(handlers::upload_stream))
         .route("/player/pause", post(handlers::pause))

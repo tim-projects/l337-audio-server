@@ -22,10 +22,44 @@ pub struct SendableEngine(pub Mutex<PlayerEngine>);
 
 pub type AppState = Arc<SendableEngine>;
 
-pub async fn version() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "version": env!("L337_VERSION")
-    }))
+pub async fn version(
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Health;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": env!("L337_VERSION")
+        })),
+    )
+        .into_response()
+}
+
+pub async fn root(
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Health;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::OK, "L337 Audio Server").into_response()
 }
 
 /// Endpoint for local clients to discover the auth token.
@@ -39,7 +73,18 @@ pub async fn version() -> impl IntoResponse {
 pub async fn setup(
     axum::Extension(auth_layer): axum::Extension<crate::security::AuthLayer>,
     axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Health;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if !socket_mode {
         return (
             StatusCode::NOT_FOUND,
@@ -65,7 +110,15 @@ pub async fn auth_challenge(
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Auth;
     if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "socket_mode": true})),
@@ -76,7 +129,7 @@ pub async fn auth_challenge(
     let addr = maybe_addr
         .map(|ConnectInfo(a)| a)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    if let Err(_) = rate_limiter.check(addr) {
+    if let Err(_) = rate_limiter.check_tcp(addr, endpoint) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "rate_limited"})),
@@ -112,7 +165,15 @@ pub async fn auth_redeem(
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Auth;
     if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "socket_mode": true})),
@@ -123,7 +184,7 @@ pub async fn auth_redeem(
     let addr = maybe_addr
         .map(|ConnectInfo(a)| a)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    if let Err(_) = rate_limiter.check(addr) {
+    if let Err(_) = rate_limiter.check_tcp(addr, endpoint) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "rate_limited"})),
@@ -181,7 +242,22 @@ fn track_id_missing() -> impl IntoResponse {
         .into_response()
 }
 
-pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> impl IntoResponse {
+pub async fn play(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+    Json(track): Json<Track>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Play;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -215,7 +291,21 @@ pub async fn play(State(state): State<AppState>, Json(track): Json<Track>) -> im
     }
 }
 
-pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn pause(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     match engine.state {
         crate::api::models::PlayerStateLabel::Playing => engine.pause(),
@@ -225,19 +315,61 @@ pub async fn pause(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
-pub async fn stop(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn stop(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.stop().await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
-pub async fn next(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn next(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.trigger_next().await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
-pub async fn previous(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn previous(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.trigger_previous().await;
     Json(serde_json::json!({"ok": true})).into_response()
@@ -245,8 +377,20 @@ pub async fn previous(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn cache_next(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(track): Json<Track>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Cache;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
@@ -300,8 +444,20 @@ pub async fn cache_next(
 
 pub async fn cache_previous(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(track): Json<Track>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Cache;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if !valid_track_id(&track.track_id) || track.stream_url.is_empty() {
         return track_id_missing().into_response();
     }
@@ -355,8 +511,20 @@ pub async fn cache_previous(
 
 pub async fn set_speed(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(payload): Json<SpeedPayload>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if payload.speed.is_nan()
         || payload.speed.is_infinite()
         || payload.pitch.is_nan()
@@ -377,8 +545,20 @@ pub async fn set_speed(
 
 pub async fn set_volume(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(payload): Json<VolumePayload>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     if payload.volume.is_nan() || payload.volume.is_infinite() {
         return (
             StatusCode::BAD_REQUEST,
@@ -393,8 +573,20 @@ pub async fn set_volume(
 
 pub async fn seek(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(payload): Json<SeekPayload>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Seek;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.seek(payload.position_sec);
     Json(serde_json::json!({"ok": true})).into_response()
@@ -402,15 +594,41 @@ pub async fn seek(
 
 pub async fn set_target(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(payload): Json<TargetPayload>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Control;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.set_target(payload);
     let default = engine.current_default_target_kbps();
     Json(serde_json::json!({"ok": true, "target_kbps": default})).into_response()
 }
 
-pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_status(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Status;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     // Non-blocking status poll: if the engine lock is held (e.g. during a
     // long incremental decode), return a minimal status immediately instead of
     // blocking the client's poll loop. The client's update_playback_progress
@@ -432,7 +650,21 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(status).into_response()
 }
 
-pub async fn session_connect(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn session_connect(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Session;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     match engine.warm_up() {
         Ok(()) => Json(serde_json::json!({
@@ -449,7 +681,21 @@ pub async fn session_connect(State(state): State<AppState>) -> impl IntoResponse
     }
 }
 
-pub async fn session_disconnect(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn session_disconnect(
+    State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Session;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.cool_down();
     Json(serde_json::json!({
@@ -462,8 +708,20 @@ pub async fn session_disconnect(State(state): State<AppState>) -> impl IntoRespo
 
 pub async fn set_settings(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(settings): Json<PoolSettings>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Settings;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     engine.storage.max_pool_size = settings.max_disk_pool_bytes;
     Json(serde_json::json!({"ok": true})).into_response()
@@ -472,7 +730,19 @@ pub async fn set_settings(
 /// List available PipeWire sinks. Requires authentication.
 pub async fn list_sinks(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Settings;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let engine = state.0.lock().await;
     let sinks = (*engine).list_sinks().await;
     Json(serde_json::json!({"sinks": sinks})).into_response()
@@ -481,7 +751,19 @@ pub async fn list_sinks(
 /// Get/set the PipeWire sink. Requires authentication.
 pub async fn get_sink_settings(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Settings;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let engine = state.0.lock().await;
     let sink = (*engine).get_sink_setting().await;
     Json(serde_json::json!({"sink": sink})).into_response()
@@ -489,8 +771,20 @@ pub async fn get_sink_settings(
 
 pub async fn set_sink(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(settings): Json<SinkSettings>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Settings;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let mut engine = state.0.lock().await;
     if let Err(e) = (*engine).set_sink(settings.sink).await {
         return (
@@ -506,7 +800,20 @@ pub async fn set_sink(
 ///
 /// Returns JSON so clients can also discover server capabilities (for example,
 /// whether yt-dlp is installed and available for URL resolution).
-pub async fn health() -> impl IntoResponse {
+pub async fn health(
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
+) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Health;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let has_ytdlp = std::process::Command::new("yt-dlp")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -539,10 +846,26 @@ pub async fn health() -> impl IntoResponse {
 /// `/player/cache/previous/stream`.
 pub async fn upload_stream(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
+    let endpoint = match uri.path() {
+        "/player/play/stream" => crate::rate_limit::Endpoint::PlayStream,
+        "/player/cache/next/stream" | "/player/cache/previous/stream" => crate::rate_limit::Endpoint::Cache,
+        _ => crate::rate_limit::Endpoint::Control,
+    };
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     // Derive the slot from the matched route path.
     let slot = match uri.path() {
         "/player/play/stream" => "current",
@@ -654,8 +977,20 @@ pub async fn upload_stream(
 /// Response: `{"cached": ["<sha1>", ...]}`
 pub async fn cache_lookup(
     State(state): State<AppState>,
+    axum::Extension(socket_mode): axum::Extension<bool>,
+    axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Lookup;
+    if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate_limited"})),
+            )
+                .into_response();
+        }
+    }
     let track_ids = payload
         .get("track_ids")
         .and_then(|v| v.as_array())
@@ -683,13 +1018,17 @@ pub async fn auth_challenge_qr(
     axum::Extension(challenge_state): axum::Extension<Arc<crate::auth_challenge::ChallengeState>>,
     axum::Extension(rate_limiter): axum::Extension<Arc<crate::rate_limit::RateLimiter>>,
 ) -> impl IntoResponse {
+    let endpoint = crate::rate_limit::Endpoint::Auth;
     if socket_mode {
+        if let Err(_) = rate_limiter.check_unix(endpoint) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
+        }
         return (StatusCode::OK, "socket_mode").into_response();
     }
     let addr = maybe_addr
         .map(|ConnectInfo(a)| a)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    if let Err(_) = rate_limiter.check(addr) {
+    if let Err(_) = rate_limiter.check_tcp(addr, endpoint) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     let token = match challenge_state.current_token().await {
