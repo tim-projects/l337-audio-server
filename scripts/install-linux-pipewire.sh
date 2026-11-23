@@ -833,7 +833,7 @@ ${SUDO_USER} ALL=(l337) SETENV: NOPASSWD: \\
     /usr/bin/systemctl --user stop l337-audio-server.service, \\
     /usr/bin/systemctl --user restart l337-audio-server.service, \\
     /usr/bin/systemctl --user is-active l337-audio-server.service, \
-    /usr/bin/systemctl --user status l337-audio-server.service \
+    /usr/bin/systemctl --user status l337-audio-server.service
 SUDOERS_EOF
             chmod 0440 "$sudoers_file"
             info "Created sudoers rule: $sudoers_file"
@@ -1255,7 +1255,7 @@ fi
 # Show final systemd status
 if [ -n "$TARGET_USER" ]; then
     info "Final systemd status for $TARGET_USER:"
-    run_as_user "$real_user" -- systemctl --user status l337-audio-server.service --no-pager 2>/dev/null || true
+    run_as_user "$TARGET_USER" -- systemctl --user status l337-audio-server.service --no-pager 2>/dev/null || true
 else
     info "Final systemd status for $USER_NAME:"
     run_as_user "$USER_NAME" -- systemctl --user status l337-audio-server.service --no-pager 2>/dev/null || true
