@@ -723,6 +723,8 @@ jobs:
     # selection outcome (partial releases legitimately lack the Windows asset)
     # and must not redden CI; every other failure must.
     - name: Run install.ps1 dry-run against the live release API
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       run: |
         set +e
         out=$(pwsh -NoProfile -File scripts/install.ps1 -DryRun -PreRelease 2>&1)

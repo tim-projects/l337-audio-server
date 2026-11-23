@@ -14,6 +14,9 @@ with the new version heading.
 ## [Unreleased]
 
 ### Fixed
+- CI: the Windows installer dry-run now authenticates its GitHub Releases API
+  request when `GITHUB_TOKEN` is available, preventing shared runner IPs from
+  failing the release workflow with an unauthenticated API rate-limit error.
 - Stream uploads (`/player/play/stream`, `/player/cache/{next,previous}/stream`)
   no longer fail with `{"error":"upload failed"}` when the cache directory was
   deleted while the server was running: the handlers now recreate the cache dir

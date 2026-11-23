@@ -93,8 +93,13 @@ function Get-GithubReleases {
     # same list: the prerelease filter is applied while walking, so a partial
     # release can be skipped in either mode.
     $url = "https://api.github.com/repos/$Repo/releases?per_page=100"
+    $headers = @{}
+    if ($env:GITHUB_TOKEN) {
+        $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+        $headers["User-Agent"] = "l337-audio-server-installer"
+    }
     try {
-        return @(Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop)
+        return @(Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop)
     } catch {
         Write-Fail "Failed to contact GitHub Releases API: $_"
     }
